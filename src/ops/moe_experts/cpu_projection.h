@@ -22,6 +22,7 @@ struct Activations {
 using Project = void (*)(const Weight&, const Activations&, bool, float*);
 void project_scalar(const Weight&, const Activations&, bool, float*);
 #if defined(NINFER_CPU_EXPERT_X86)
+void project_avx(const Weight&, const Activations&, bool, float*);
 void project_avx2(const Weight&, const Activations&, bool, float*);
 void project_avx512(const Weight&, const Activations&, bool, float*);
 #endif

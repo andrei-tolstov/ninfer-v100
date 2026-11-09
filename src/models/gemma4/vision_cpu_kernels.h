@@ -24,6 +24,7 @@ struct Kernels {
 
 [[nodiscard]] const Kernels& portable_kernels() noexcept;
 #if defined(NINFER_VISION_CPU_X86)
+[[nodiscard]] const Kernels& avx_kernels() noexcept;
 [[nodiscard]] const Kernels& avx2_kernels() noexcept;
 #endif
 

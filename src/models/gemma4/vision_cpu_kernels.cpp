@@ -90,6 +90,25 @@ bool avx2_fma() noexcept {
 #    else
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #    endif
+
+#endif
+}
+
+bool avx_supported() noexcept {
+#if defined(NINFER_VISION_CPU_X86)
+#    if defined(_MSC_VER)
+    int basic[4];
+    __cpuid(basic, 0);
+    if (basic[0] < 1) { return false; }
+    __cpuid(basic, 1);
+    if ((basic[2] & (1 << 27)) == 0 || (basic[2] & (1 << 28)) == 0 || (_xgetbv(0) & 6) != 6) {
+        return false;
+    }
+    return true;
+#    else
+    return __builtin_cpu_supports("avx");
+
+#    endif
 #else
     return false;
 #endif
@@ -104,7 +123,9 @@ const Kernels& portable_kernels() noexcept {
 
 const Kernels& kernels() noexcept {
 #if defined(NINFER_VISION_CPU_X86)
-    static const Kernels& chosen = avx2_fma() ? avx2_kernels() : portable_kernels();
+    static const Kernels& chosen = avx2_fma() ? avx2_kernels() :
+                                   avx_supported() ? avx_kernels() :
+                                   portable_kernels();
     return chosen;
 #else
     return portable_kernels();

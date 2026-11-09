@@ -73,6 +73,7 @@ CpuExpertBackend choose(CpuExpertBackend backend) noexcept {
     if (backend != CpuExpertBackend::Automatic) { return backend; }
     if (cpu_expert_backend_available(CpuExpertBackend::Avx512Vnni)) { return CpuExpertBackend::Avx512Vnni; }
     if (cpu_expert_backend_available(CpuExpertBackend::Avx2)) { return CpuExpertBackend::Avx2; }
+    if (cpu_expert_backend_available(CpuExpertBackend::Avx)) { return CpuExpertBackend::Avx; }
     return CpuExpertBackend::Scalar;
 }
 } // namespace
@@ -83,22 +84,29 @@ void cpu_expert_detail::project_scalar(const Weight& w, const Activations& x, bo
 
 bool cpu_expert_backend_available(CpuExpertBackend backend) noexcept {
     if (backend == CpuExpertBackend::Automatic || backend == CpuExpertBackend::Scalar) { return true; }
-    if (backend != CpuExpertBackend::Avx2 && backend != CpuExpertBackend::Avx512Vnni) { return false; }
+    if (backend != CpuExpertBackend::Avx && backend != CpuExpertBackend::Avx2 && backend != CpuExpertBackend::Avx512Vnni) { return false; }
 #if defined(NINFER_CPU_EXPERT_X86)
 #    if defined(_MSC_VER)
     int basic[4], extended[4];
     __cpuid(basic, 0);
-    if (basic[0] < 7) { return false; }
+    if (basic[0] < 1) { return false; }
     __cpuid(basic, 1);
     if ((basic[2] & (1 << 27)) == 0 || (basic[2] & (1 << 28)) == 0) { return false; }
     const auto enabled = _xgetbv(0);
     if ((enabled & 6) != 6) { return false; }
+    if (backend == CpuExpertBackend::Avx) {
+        return (basic[2] & (1 << 28)) != 0 && (basic[2] & (1 << 29)) != 0 && (basic[2] & (1 << 9)) != 0;
+    }
+    if (basic[0] < 7) { return false; }
     __cpuidex(extended, 7, 0);
     if (backend == CpuExpertBackend::Avx2) { return (extended[1] & (1 << 5)) != 0; }
     return (enabled & 0xe6) == 0xe6 && (extended[1] & (1 << 16)) != 0 &&
         (extended[1] & (1 << 30)) != 0 && (extended[1] & (int(1U << 31))) != 0 &&
         (extended[2] & (1 << 11)) != 0;
 #    else
+    if (backend == CpuExpertBackend::Avx) {
+        return __builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c") && __builtin_cpu_supports("ssse3");
+    }
     if (backend == CpuExpertBackend::Avx2) { return __builtin_cpu_supports("avx2"); }
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
         __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
@@ -110,6 +118,7 @@ bool cpu_expert_backend_available(CpuExpertBackend backend) noexcept {
 
 const char* cpu_expert_backend_name(CpuExpertBackend backend) noexcept {
     switch (choose(backend)) {
+    case CpuExpertBackend::Avx: return "avx";
     case CpuExpertBackend::Avx2: return "avx2";
     case CpuExpertBackend::Avx512Vnni: return "avx512-vnni";
     default: return "scalar";
@@ -142,6 +151,7 @@ void moe_expert_cpu(std::span<const std::uint16_t> x, const CpuExpertWeights& we
     if (!cpu_expert_backend_available(backend)) { throw std::invalid_argument("CPU expert: unsupported CPU backend"); }
     cpu_expert_detail::Project project = cpu_expert_detail::project_scalar;
 #if defined(NINFER_CPU_EXPERT_X86)
+    if (backend == CpuExpertBackend::Avx) { project = cpu_expert_detail::project_avx; }
     if (backend == CpuExpertBackend::Avx2) { project = cpu_expert_detail::project_avx2; }
     if (backend == CpuExpertBackend::Avx512Vnni) { project = cpu_expert_detail::project_avx512; }
 #endif

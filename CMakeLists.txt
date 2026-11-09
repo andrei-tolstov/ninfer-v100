@@ -186,6 +186,9 @@ if(NINFER_BF16_RESIDUAL_ADD)
 endif()
 # Windows only: disk-tier restores through Microsoft DirectStorage, for --disk-kv-directstorage.
 # dstorage.dll is delay-loaded, so a binary that never asks for DirectStorage runs without it.
+option(NINFER_ENABLE_AVX2
+       "Build host CPU components with AVX2 and FMA instructions (set OFF for AVX/F16C processors like Ivy Bridge E5-2650 v2)" ON)
+
 option(NINFER_DIRECTSTORAGE
        "On Windows, offer --disk-kv-directstorage: disk-tier restores through DirectStorage" OFF)
 if(WIN32 AND NINFER_DIRECTSTORAGE)

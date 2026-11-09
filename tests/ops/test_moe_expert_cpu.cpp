@@ -139,7 +139,7 @@ void run_case(QType gate_type, QType up_type, QType down_type, bool panel) {
         expected[variant] = oracle(gate, up, down, input[variant]);
     }
     CpuExpertWorkspace workspace(16);
-    for (const auto backend : {CpuExpertBackend::Scalar, CpuExpertBackend::Avx2, CpuExpertBackend::Avx512Vnni}) {
+    for (const auto backend : {CpuExpertBackend::Scalar, CpuExpertBackend::Avx, CpuExpertBackend::Avx2, CpuExpertBackend::Avx512Vnni}) {
         if (!cpu_expert_backend_available(backend)) { continue; }
         for (const bool a8 : {false, true}) {
             if (a8 && gate_type == QType::BF16 && up_type == QType::BF16 && down_type == QType::BF16) { continue; }
