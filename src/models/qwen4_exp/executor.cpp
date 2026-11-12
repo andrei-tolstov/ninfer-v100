@@ -1552,6 +1552,11 @@ struct Executor::Impl {
         miss.cpu_balance    = options.hybrid_experts.dma_share_auto;
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
+        if (options.hybrid_experts.cpu_ggml && !ops::gguf_ggml_cpu_available()) {
+            throw std::invalid_argument(
+                "--expert-cpu-arithmetic ggml: this build's ggml kernels need instructions "
+                "which this CPU lacks; use exact or a build with NINFER_GGML_CPU_AVX2=OFF");
+        }
         miss.cpu_ggml       = options.hybrid_experts.cpu_ggml;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;

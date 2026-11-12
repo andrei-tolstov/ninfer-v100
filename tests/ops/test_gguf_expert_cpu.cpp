@@ -275,7 +275,7 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
     const GgufCpuMatrix w{m.format, m.bytes.data(), m.row_bytes, m.rows, m.k};
     std::vector<float> scalar(oracle.size());
     gguf_cpu_rows(w, a, 0, m.rows, scalar.data(), m.rows, GgufCpuBackend::Scalar);
-    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx2}) {
+    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
         if (!gguf_cpu_backend_available(backend)) { continue; }
         std::vector<float> y(oracle.size()), again(oracle.size());
         // Two row ranges, as workers split them.
@@ -348,7 +348,7 @@ void check_silu(std::mt19937& rng) {
         const double step  = std::ldexp(1.0, std::ilogb(std::max(std::abs(exact), 1e-38)) - 7);
         require(std::abs(got - exact) <= step, "the BF16 middle strays from FP64");
     }
-    for (const auto backend : {GgufCpuBackend::Avx2}) {
+    for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
         if (!gguf_cpu_backend_available(backend)) { continue; }
         std::vector<std::uint16_t> y(gate.size());
         gguf_cpu_swiglu_bf16(gate.data(), up.data(), gate.size(), y.data(), backend);

@@ -184,11 +184,13 @@ option(NINFER_BF16_RESIDUAL_ADD
 if(NINFER_BF16_RESIDUAL_ADD)
   add_compile_definitions(NINFER_BF16_RESIDUAL_ADD=1)
 endif()
+# ggml-cpu's x86 vec-dot kernels (the --expert-cpu-arithmetic ggml route) compile for one ISA.
+# OFF builds them for AVX + F16C (Ivy Bridge, e.g. Xeon E5-2650 v2); the route then runs on any
+# AVX CPU. ON requires AVX2 + FMA at run time; without them the route is refused at startup.
+option(NINFER_GGML_CPU_AVX2 "Build the ggml CPU expert route for AVX2 + FMA (OFF: AVX + F16C)" ON)
+
 # Windows only: disk-tier restores through Microsoft DirectStorage, for --disk-kv-directstorage.
 # dstorage.dll is delay-loaded, so a binary that never asks for DirectStorage runs without it.
-option(NINFER_ENABLE_AVX2
-       "Build host CPU components with AVX2 and FMA instructions (set OFF for AVX/F16C processors like Ivy Bridge E5-2650 v2)" ON)
-
 option(NINFER_DIRECTSTORAGE
        "On Windows, offer --disk-kv-directstorage: disk-tier restores through DirectStorage" OFF)
 if(WIN32 AND NINFER_DIRECTSTORAGE)

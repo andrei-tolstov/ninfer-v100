@@ -95,7 +95,9 @@ bool cpu_expert_backend_available(CpuExpertBackend backend) noexcept {
     const auto enabled = _xgetbv(0);
     if ((enabled & 6) != 6) { return false; }
     if (backend == CpuExpertBackend::Avx) {
-        return (basic[2] & (1 << 28)) != 0 && (basic[2] & (1 << 29)) != 0 && (basic[2] & (1 << 9)) != 0;
+        // leaf 1: ecx bit 28 (AVX), bit 29 (F16C), bit 19 (SSE4.1), bit 9 (SSSE3)
+        return (basic[2] & (1 << 28)) != 0 && (basic[2] & (1 << 29)) != 0 &&
+               (basic[2] & (1 << 19)) != 0 && (basic[2] & (1 << 9)) != 0;
     }
     if (basic[0] < 7) { return false; }
     __cpuidex(extended, 7, 0);
@@ -105,7 +107,8 @@ bool cpu_expert_backend_available(CpuExpertBackend backend) noexcept {
         (extended[2] & (1 << 11)) != 0;
 #    else
     if (backend == CpuExpertBackend::Avx) {
-        return __builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c") && __builtin_cpu_supports("ssse3");
+        return __builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c") &&
+               __builtin_cpu_supports("sse4.1") && __builtin_cpu_supports("ssse3");
     }
     if (backend == CpuExpertBackend::Avx2) { return __builtin_cpu_supports("avx2"); }
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&

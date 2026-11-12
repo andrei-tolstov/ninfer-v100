@@ -18,6 +18,10 @@ enum class GgmlActLayout { Q8K, Q8_0 };
 
 [[nodiscard]] bool gguf_ggml_supported(QType format) noexcept;
 
+// Whether this build's ggml vec-dot kernels can run on this CPU (AVX2 + FMA when built with
+// NINFER_GGML_CPU_AVX2, otherwise AVX + F16C).
+[[nodiscard]] bool gguf_ggml_cpu_available() noexcept;
+
 // BF16 activations quantized into ggml's Q8_K / Q8_0 row layouts, one row per token.
 class GgmlCpuActivation {
 public:

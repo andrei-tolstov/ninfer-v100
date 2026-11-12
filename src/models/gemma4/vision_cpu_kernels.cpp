@@ -90,7 +90,8 @@ bool avx2_fma() noexcept {
 #    else
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #    endif
-
+#else
+    return false;
 #endif
 }
 
@@ -107,7 +108,6 @@ bool avx_supported() noexcept {
     return true;
 #    else
     return __builtin_cpu_supports("avx");
-
 #    endif
 #else
     return false;
