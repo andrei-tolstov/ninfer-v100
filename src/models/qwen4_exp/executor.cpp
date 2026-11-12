@@ -28,6 +28,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
+#include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 #include "ninfer/ops/ngram_rows.h"
 #include "ninfer/ops/ple_inject.h"
 #include "ninfer/ops/qsa_indexer.h"
