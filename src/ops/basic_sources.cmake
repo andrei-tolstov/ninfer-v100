@@ -83,6 +83,7 @@ if(NOT MSVC)
 endif()
 set_source_files_properties(
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx2.cpp"
   PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
