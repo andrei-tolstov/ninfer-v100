@@ -95,6 +95,9 @@ void swiglu_avx(const float*, const float*, std::size_t, std::uint16_t*);
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+void fma_avx(const float* a, const float* b, const float* c, float* out, std::size_t count);
+#endif
 // Q2_0 activations are stored in the lane order of the vector decoders: within each 64-value
 // block, position L * 16 + i holds value 4 * i + L, so a lane's first 8 positions belong to the
 // block's first 32-value slice and its last 8 to the second.

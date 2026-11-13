@@ -8,14 +8,6 @@
 #include <bit>
 #include <stdexcept>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#    if defined(__GNUC__) || defined(__clang__)
-#        include <cpuid.h>
-#    elif defined(_MSC_VER)
-#        include <intrin.h>
-#    endif
-#endif
-
 namespace ninfer::ops {
 
 // BF16 -> FP32. A BF16 value's 1/8/7 bit fields sit exactly in FP32's 1/8/23, so the
@@ -50,41 +42,13 @@ bool gguf_ggml_supported(QType format) noexcept {
 
 bool gguf_ggml_cpu_available() noexcept {
 #if defined(__x86_64__) || defined(_M_X64)
-#    if NINFER_GGML_CPU_REQUIRES_AVX2
-#        if defined(__GNUC__) || defined(__clang__)
-    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-#        elif defined(_MSC_VER)
-    int basic[4], extended[4];
-    __cpuid(basic, 0);
-    if (basic[0] < 7) { return false; }
-    __cpuid(basic, 1);
-    if ((basic[2] & (1 << 12)) == 0 || (basic[2] & (1 << 27)) == 0 ||
-        (basic[2] & (1 << 28)) == 0 || (_xgetbv(0) & 6) != 6) {
-        return false;
-    }
-    __cpuidex(extended, 7, 0);
-    return (extended[1] & (1 << 5)) != 0;
-#        else
-    return false;
-#        endif
-#    else
-#        if defined(__GNUC__) || defined(__clang__)
-    return __builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c");
-#        elif defined(_MSC_VER)
-    int basic[4];
-    __cpuid(basic, 0);
-    if (basic[0] < 1) { return false; }
-    __cpuid(basic, 1);
-    if ((basic[2] & (1 << 27)) == 0 || (basic[2] & (1 << 28)) == 0 ||
-        (basic[2] & (1 << 29)) == 0 || (_xgetbv(0) & 6) != 6) {
-        return false;
-    }
-    return true;
-#        else
-    return false;
-#        endif
-#    endif
+    // ggml-cpu's x86 kernels compile for one ISA (NINFER_GGML_CPU_AVX2); require the same
+    // instruction sets as the exact backends of that ISA.
+    return gguf_cpu_backend_available(NINFER_GGML_CPU_REQUIRES_AVX2 ? GgufCpuBackend::Avx2
+                                                                    : GgufCpuBackend::Avx);
 #else
+    // Only arch/x86/quants.c is vendored; elsewhere ggml_vec_dot_* have no definition
+    // (arch-fallback.h maps generic kernels only for GGML_CPU_GENERIC and non-ARM targets).
     return false;
 #endif
 }

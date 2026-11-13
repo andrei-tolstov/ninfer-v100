@@ -1,10 +1,10 @@
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
+#include "ops/common/silu.h"
 #include "ops/moe_experts/gguf_cpu_tables.h"
 
 #include <immintrin.h>
 
-#include <cmath>
 #include <cstring>
 
 // The scalar products' arithmetic (gguf_expert_cpu.cpp) eight slices at a time using AVX 1.0,
@@ -77,6 +77,48 @@ inline __m256 live_floats(const float* from, int live) {
     alignas(32) float to[8];
     for (int i = 0; i < 8; ++i) { to[i] = i < live ? from[i] : 0.0F; }
     return _mm256_load_ps(to);
+}
+
+// Emulated single-rounding fmaf using AVX 1.0 double-precision TwoSum + Boldo-Melquiond
+// round-to-odd (IEEE Trans. Computers 57(4), 2008). Every float product is exact in double
+// (48 <= 53 significand bits); rounding the TwoSum result to odd prevents double rounding when
+// narrowing back to float. Compiled with -ffp-contract=off.
+inline __m128 fma4(__m128 af, __m128 bf, __m128 cf) {
+    const __m256d p    = _mm256_mul_pd(_mm256_cvtps_pd(af), _mm256_cvtps_pd(bf));
+    const __m256d cd   = _mm256_cvtps_pd(cf);
+    const __m256d s    = _mm256_add_pd(p, cd);
+    const __m256d bb   = _mm256_sub_pd(s, p);
+    const __m256d e    = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(s, bb)), _mm256_sub_pd(cd, bb));
+    const __m256d zero = _mm256_setzero_pd();
+    // Adjust only finite non-zero s whose TwoSum residual e is non-zero (ordered comparisons).
+    const __m256d valid = _mm256_and_pd(
+        _mm256_and_pd(_mm256_cmp_pd(e, zero, _CMP_NEQ_OQ), _mm256_cmp_pd(s, zero, _CMP_NEQ_OQ)),
+        _mm256_cmp_pd(_mm256_sub_pd(s, s), zero, _CMP_EQ_OQ));
+    const __m256d opp = _mm256_xor_pd(s, e);
+
+    auto adjust128 = [](__m128d sd, __m128d vd, __m128d opd) {
+        const __m128i bs       = _mm_castpd_si128(sd);
+        const __m128i odd_hi   = _mm_srai_epi32(_mm_slli_epi64(bs, 63), 31);
+        const __m128i is_odd   = _mm_shuffle_epi32(odd_hi, _MM_SHUFFLE(3, 3, 1, 1));
+        const __m128i need     = _mm_andnot_si128(is_odd, _mm_castpd_si128(vd));
+        const __m128i xor_hi   = _mm_srai_epi32(_mm_castpd_si128(opd), 31);
+        const __m128i opp_sign = _mm_shuffle_epi32(xor_hi, _MM_SHUFFLE(3, 3, 1, 1));
+        const __m128i step     = _mm_or_si128(opp_sign, _mm_set1_epi64x(1));
+        return _mm_castsi128_pd(_mm_add_epi64(bs, _mm_and_si128(need, step)));
+    };
+    const __m128d lo = adjust128(_mm256_castpd256_pd128(s), _mm256_castpd256_pd128(valid),
+                                 _mm256_castpd256_pd128(opp));
+    const __m128d hi = adjust128(_mm256_extractf128_pd(s, 1), _mm256_extractf128_pd(valid, 1),
+                                 _mm256_extractf128_pd(opp, 1));
+    return _mm256_cvtpd_ps(_mm256_insertf128_pd(_mm256_castpd128_pd256(lo), hi, 1));
+}
+
+inline __m256 fma8(__m256 a, __m256 b, __m256 c) {
+    const __m128 lo = fma4(_mm256_castps256_ps128(a), _mm256_castps256_ps128(b),
+                           _mm256_castps256_ps128(c));
+    const __m128 hi = fma4(_mm256_extractf128_ps(a, 1), _mm256_extractf128_ps(b, 1),
+                           _mm256_extractf128_ps(c, 1));
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
 }
 
 constexpr int kMaxTokens = 16;
@@ -204,17 +246,13 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
         sum_hadd8(u_lo, lo0123, lo4567);
         sum_hadd8(u_hi, hi0123, hi4567);
         if constexpr (halves) {
-            alignas(32) float inner[8];
-            alignas(16) std::int32_t d0_lo[4], d0_hi[4], d1_lo[4], d1_hi[4];
-            _mm_store_si128(reinterpret_cast<__m128i*>(d0_lo), lo0123);
-            _mm_store_si128(reinterpret_cast<__m128i*>(d0_hi), lo4567);
-            _mm_store_si128(reinterpret_cast<__m128i*>(d1_lo), hi0123);
-            _mm_store_si128(reinterpret_cast<__m128i*>(d1_hi), hi4567);
-            for (int i = 0; i < 4; ++i) {
-                inner[i]     = std::fma(group.factor[0][i], float(d0_lo[i]), group.factor[1][i] * float(d1_lo[i]));
-                inner[4 + i] = std::fma(group.factor[0][4 + i], float(d0_hi[i]), group.factor[1][4 + i] * float(d1_hi[i]));
-            }
-            return _mm256_load_ps(inner);
+            const __m256 d0 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_cvtepi32_ps(lo0123)), _mm_cvtepi32_ps(lo4567), 1);
+            const __m256 d1 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_cvtepi32_ps(hi0123)), _mm_cvtepi32_ps(hi4567), 1);
+            const __m256 f0 = _mm256_load_ps(group.factor[0]);
+            const __m256 f1 = _mm256_load_ps(group.factor[1]);
+            return fma8(f0, d0, _mm256_mul_ps(f1, d1));
         } else {
             const __m128i tot_lo = _mm_add_epi32(lo0123, hi0123);
             const __m128i tot_hi = _mm_add_epi32(lo4567, hi4567);
@@ -348,8 +386,75 @@ void rows_avx(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin,
     }
 }
 
+// silu.h eight values at a time using AVX 1.0 + SSE4.1 (with emulated FMA): same operations
+// in the same order as swiglu_avx2, so the same bits.
 void swiglu_avx(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
-    swiglu_scalar(gate, up, count, out);
+    const __m256 one     = _mm256_set1_ps(1.0F);
+    const __m128i lo_126 = _mm_set1_epi32(-126);
+    const __m128i hi_127 = _mm_set1_epi32(127);
+    std::size_t i        = 0;
+    alignas(32) float products[8];
+    for (; i + 8 <= count; i += 8) {
+        const __m256 x = _mm256_loadu_ps(gate + i);
+        const __m256 v = _mm256_xor_ps(x, _mm256_set1_ps(-0.0F)); // e^v, v = -x
+        const __m256 n = _mm256_round_ps(_mm256_mul_ps(v, _mm256_set1_ps(1.44269504F)),
+                                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        __m256 r = fma8(n, _mm256_set1_ps(-0.693145751953125F), v);
+        r        = fma8(n, _mm256_set1_ps(-1.42860677e-6F), r);
+        __m256 p = fma8(_mm256_set1_ps(1.9875691500e-4F), r, _mm256_set1_ps(1.3981999507e-3F));
+        p        = fma8(p, r, _mm256_set1_ps(8.3334519073e-3F));
+        p        = fma8(p, r, _mm256_set1_ps(4.1665795894e-2F));
+        p        = fma8(p, r, _mm256_set1_ps(1.6666665459e-1F));
+        p        = fma8(p, r, _mm256_set1_ps(5.0000001201e-1F));
+        p        = fma8(p, _mm256_mul_ps(r, r), r);
+        p        = _mm256_add_ps(p, one);
+        // Split int32 exponent scaling into two 128-bit SSE4.1/SSE2 halves (no AVX2).
+        const __m256i k     = _mm256_cvttps_epi32(n);
+        const __m128i k_lo  = _mm256_castsi256_si128(k);
+        const __m128i k_hi  = _mm256_extractf128_si256(k, 1);
+        const __m128i c_lo  = _mm_min_epi32(_mm_max_epi32(k_lo, lo_126), hi_127);
+        const __m128i c_hi  = _mm_min_epi32(_mm_max_epi32(k_hi, lo_126), hi_127);
+        const __m128 p_lo   = _mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(c_lo, hi_127), 23));
+        const __m128 p_hi   = _mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(c_hi, hi_127), 23));
+        const __m256 power  = _mm256_insertf128_ps(_mm256_castps128_ps256(p_lo), p_hi, 1);
+        const __m128 b_lo   = _mm_castsi128_ps(_mm_cmpgt_epi32(k_lo, hi_127));
+        const __m128 b_hi   = _mm_castsi128_ps(_mm_cmpgt_epi32(k_hi, hi_127));
+        const __m256 beyond = _mm256_insertf128_ps(_mm256_castps128_ps256(b_lo), b_hi, 1);
+        __m256 e = _mm256_mul_ps(_mm256_mul_ps(p, power),
+                                 _mm256_blendv_ps(one, _mm256_set1_ps(2.0F), beyond));
+        e = _mm256_blendv_ps(e, _mm256_setzero_ps(),
+                             _mm256_cmp_ps(v, _mm256_set1_ps(-87.3365479F), _CMP_LT_OQ));
+        e = _mm256_blendv_ps(e, _mm256_castsi256_ps(_mm256_set1_epi32(0x7F800000)),
+                             _mm256_cmp_ps(v, _mm256_set1_ps(88.7228394F), _CMP_GE_OQ));
+        e = _mm256_blendv_ps(e, v, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
+        const __m256 silu = _mm256_div_ps(x, _mm256_add_ps(one, e));
+        _mm256_store_ps(products, _mm256_mul_ps(silu, _mm256_loadu_ps(up + i)));
+        for (int j = 0; j < 8; ++j) { out[i + j] = float_to_bf16(products[j]); }
+    }
+    for (; i < count; ++i) { out[i] = float_to_bf16(ops::silu(gate[i]) * up[i]); }
+}
+
+void fma_avx(const float* a, const float* b, const float* c, float* out, std::size_t count) {
+    std::size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        _mm256_storeu_ps(out + i, fma8(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i),
+                                       _mm256_loadu_ps(c + i)));
+    }
+    if (i < count) {
+        alignas(16) float ta[4]{}, tb[4]{}, tc[4]{}, to[4]{};
+        for (; i + 4 <= count; i += 4) {
+            _mm_storeu_ps(out + i, fma4(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i),
+                                        _mm_loadu_ps(c + i)));
+        }
+        const std::size_t rem = count - i;
+        if (rem > 0) {
+            std::memcpy(ta, a + i, rem * sizeof(float));
+            std::memcpy(tb, b + i, rem * sizeof(float));
+            std::memcpy(tc, c + i, rem * sizeof(float));
+            _mm_store_ps(to, fma4(_mm_load_ps(ta), _mm_load_ps(tb), _mm_load_ps(tc)));
+            std::memcpy(out + i, to, rem * sizeof(float));
+        }
+    }
 }
 
 } // namespace ninfer::ops::gguf_cpu_detail

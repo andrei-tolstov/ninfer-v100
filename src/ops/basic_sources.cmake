@@ -154,7 +154,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
         PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};/arch:AVX2")
     else()
       set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
-        PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx2;-mfma")
+        PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx2;-mfma;-mf16c")
     endif()
   else()
     if(MSVC)
