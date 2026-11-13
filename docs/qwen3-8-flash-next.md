@@ -273,8 +273,15 @@ slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apar
 `ops/common/silu.h` on both sides, built from correctly rounded operations only, and the middle is
 rounded to BF16 before it is quantized for the down product. No compiler fuses these steps on
 either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources build without
-floating-point contraction. Q2_0, Q8_0, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products,
-in AVX2 (with FMA and F16C), AVX (with F16C and SSSE3) where the CPU lacks AVX2, and in portable C++ elsewhere, with the same bits. For `--expert-cpu-arithmetic ggml`, configure with `-DNINFER_GGML_CPU_AVX2=OFF` on AVX-only CPUs (AVX2+FMA is the default and is refused at startup if unsupported).
+floating-point contraction. Where AVX lacks hardware FMA3, AVX-1.0 `IQ2_S` and `SwiGLU` compute
+IEEE-754 single-rounded `fmaf` bit-for-bit in registers via double-precision TwoSum and
+round-to-odd. Q2_0, Q8_0, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products,
+in AVX2 (with FMA and F16C), AVX (with F16C, SSSE3 and SSE4.1) where the CPU lacks AVX2, and in
+portable C++ elsewhere, with the same bits; requesting an AVX or AVX2 backend unsupported by the
+host CPU throws `std::invalid_argument`. For `--expert-cpu-arithmetic ggml`, configure with
+`-DNINFER_GGML_CPU_AVX2=OFF` on AVX-only x86-64 CPUs (AVX2+FMA+F16C is the default on x86-64,
+disallowed on non-x86-64 builds since only x86 kernels are vendored, and refused at startup if
+unsupported).
 
 ### The n-gram rows
 
