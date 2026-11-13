@@ -83,6 +83,7 @@ if(NOT MSVC)
 endif()
 set_source_files_properties(
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx2.cpp"
   PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
@@ -91,17 +92,26 @@ set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_c
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   set(cpu_expert_dir "${CMAKE_CURRENT_LIST_DIR}/moe_experts")
   target_sources(ninfer_ops PRIVATE
+    "${cpu_expert_dir}/moe_expert_cpu_avx.cpp"
     "${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
     "${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
+    "${cpu_expert_dir}/gguf_expert_cpu_avx.cpp"
     "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp")
   set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu.cpp" "${cpu_expert_dir}/gguf_expert_cpu.cpp"
     PROPERTIES COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   if(MSVC)
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx.cpp"
+      PROPERTIES COMPILE_OPTIONS /arch:AVX COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
       PROPERTIES COMPILE_OPTIONS /arch:AVX2 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS /arch:AVX512 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   else()
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx.cpp"
+      PROPERTIES COMPILE_OPTIONS "-mavx;-mf16c" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx.cpp"
+      PROPERTIES COMPILE_OPTIONS "-mavx;-mf16c;-mssse3;-msse4.1;-ffp-contract=off" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
     set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
@@ -124,19 +134,35 @@ target_sources(ninfer_ops PRIVATE
   "${ggml_cpu_dir}/src/ggml-quants.c"
   "${ggml_cpu_dir}/src/ggml-cpu/quants.c"
   "${ggml_cpu_dir}/src/ggml-cpu/quants_host.c")
+if(NINFER_GGML_CPU_AVX2)
+  set(ggml_avx2_def 1)
+else()
+  set(ggml_avx2_def 0)
+endif()
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_ggml.cpp"
-  PROPERTIES COMPILE_OPTIONS "${ggml_cpu_includes}")
+  PROPERTIES COMPILE_OPTIONS "${ggml_cpu_includes}"
+             COMPILE_DEFINITIONS "NINFER_GGML_CPU_REQUIRES_AVX2=${ggml_avx2_def}")
 set_source_files_properties("${ggml_cpu_dir}/src/ggml-quants.c"
   "${ggml_cpu_dir}/src/ggml-cpu/quants.c"
   "${ggml_cpu_dir}/src/ggml-cpu/quants_host.c"
   PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes}")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   target_sources(ninfer_ops PRIVATE "${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c")
-  if(MSVC)
-    set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
-      PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};/arch:AVX2")
+  if(NINFER_GGML_CPU_AVX2)
+    if(MSVC)
+      set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
+        PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};/arch:AVX2")
+    else()
+      set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
+        PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx2;-mfma;-mf16c")
+    endif()
   else()
-    set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
-      PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx2;-mfma")
+    if(MSVC)
+      set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
+        PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};/arch:AVX")
+    else()
+      set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
+        PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx;-mf16c")
+    endif()
   endif()
 endif()

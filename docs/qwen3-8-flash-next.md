@@ -205,7 +205,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, and their slots fill behind the call; `auto` (GGUF experts) gives each call the split whose copies and CPU products end soonest by the times measured on earlier calls. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. The second buffer's memory comes from the expert cache: on an RTX 3090 with Q2_0 it took the cache from 17,296 to 16,683 MiB, prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster, decoded 1.5-2.8% slower once the cache was warm (within 1.5% either way from a cold one) and answered a 37-to-39-token prompt 7.5-10.2% later warm |
-| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is half the logical CPUs the process may use (its affinity mask and container CPU quota) less two, from 1 to 16 |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is half the logical CPUs the process may use (its affinity mask and container CPU quota) less two, from 1 to 16. On Intel Xeon E5-2650 v2 (8 physical cores / 16 logical threads), the automatic default (`6`) outperformed `8` workers across every tested GGUF format and batch size in `ninfer_gguf_expert_cpu_bench` |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the host expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`) |
 | `--expert-profile-out PATH` | record every layer's expert routes after requests, for a later `--expert-profile` |
@@ -273,8 +273,15 @@ slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apar
 `ops/common/silu.h` on both sides, built from correctly rounded operations only, and the middle is
 rounded to BF16 before it is quantized for the down product. No compiler fuses these steps on
 either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources build without
-floating-point contraction. Q2_0, Q8_0, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products,
-in AVX2 (with FMA and F16C) where the CPU has it and in portable C++ elsewhere, with the same bits.
+floating-point contraction. Where AVX lacks hardware FMA3, AVX-1.0 `IQ2_S` and `SwiGLU` compute
+IEEE-754 single-rounded `fmaf` bit-for-bit in registers via double-precision TwoSum and
+round-to-odd. Q2_0, Q8_0, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products,
+in AVX2 (with FMA and F16C), AVX (with F16C, SSSE3 and SSE4.1) where the CPU lacks AVX2, and in
+portable C++ elsewhere, with the same bits; requesting an AVX or AVX2 backend unsupported by the
+host CPU throws `std::invalid_argument`. For `--expert-cpu-arithmetic ggml`, configure with
+`-DNINFER_GGML_CPU_AVX2=OFF` on AVX-only x86-64 CPUs (AVX2+FMA+F16C is the default on x86-64,
+disallowed on non-x86-64 builds since only x86 kernels are vendored, and refused at startup if
+unsupported).
 
 ### The n-gram rows
 

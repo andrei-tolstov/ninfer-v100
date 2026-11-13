@@ -138,6 +138,9 @@ int main() {
     test(cv::portable_kernels());
     std::cout << "selected kernels: " << cv::kernels().name << '\n';
 #if defined(NINFER_VISION_CPU_X86)
+    if (&cv::kernels() == &cv::avx_kernels() || &cv::kernels() == &cv::avx2_kernels()) {
+        test(cv::avx_kernels());
+    }
     if (&cv::kernels() == &cv::avx2_kernels()) { test(cv::avx2_kernels()); }
 #endif
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " gemma4 vision CPU kernels\n";

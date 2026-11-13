@@ -36,6 +36,23 @@ bool gguf_ggml_supported(QType format) noexcept {
     }
 }
 
+#ifndef NINFER_GGML_CPU_REQUIRES_AVX2
+#    define NINFER_GGML_CPU_REQUIRES_AVX2 1
+#endif
+
+bool gguf_ggml_cpu_available() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    // ggml-cpu's x86 kernels compile for one ISA (NINFER_GGML_CPU_AVX2); require the same
+    // instruction sets as the exact backends of that ISA.
+    return gguf_cpu_backend_available(NINFER_GGML_CPU_REQUIRES_AVX2 ? GgufCpuBackend::Avx2
+                                                                    : GgufCpuBackend::Avx);
+#else
+    // Only arch/x86/quants.c is vendored; elsewhere ggml_vec_dot_* have no definition
+    // (arch-fallback.h maps generic kernels only for GGML_CPU_GENERIC and non-ARM targets).
+    return false;
+#endif
+}
+
 GgmlCpuActivation::GgmlCpuActivation(int token_capacity, int k)
     : capacity_(token_capacity), k_(k) {
     if (capacity_ < 1 || k_ < 32 || k_ % 32 != 0) {

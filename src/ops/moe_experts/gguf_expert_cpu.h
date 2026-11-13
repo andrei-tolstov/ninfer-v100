@@ -27,8 +27,9 @@
 
 namespace ninfer::ops {
 
-// Automatic takes AVX2 (with FMA and F16C) where the CPU has it; both give the same bits.
-enum class GgufCpuBackend { Automatic, Scalar, Avx2 };
+// Automatic takes AVX2 (with FMA and F16C), else AVX (with F16C, SSSE3, SSE4.1) where the CPU
+// has it; all give the same bits.
+enum class GgufCpuBackend { Automatic, Scalar, Avx, Avx2 };
 [[nodiscard]] bool gguf_cpu_backend_available(GgufCpuBackend backend) noexcept;
 [[nodiscard]] const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept;
 [[nodiscard]] GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept;
@@ -89,8 +90,13 @@ using Rows = void (*)(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, 
 void rows_scalar(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
 #if defined(NINFER_CPU_EXPERT_X86)
+void rows_avx(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
+void swiglu_avx(const float*, const float*, std::size_t, std::uint16_t*);
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+void fma_avx(const float* a, const float* b, const float* c, float* out, std::size_t count);
 #endif
 // Q2_0 activations are stored in the lane order of the vector decoders: within each 64-value
 // block, position L * 16 + i holds value 4 * i + L, so a lane's first 8 positions belong to the

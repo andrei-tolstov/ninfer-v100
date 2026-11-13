@@ -432,7 +432,7 @@ processor lays them out:
 |---|---|---|---|
 | `resident` (default) | on the device | 1.07 GiB | CUDA kernels and cuBLAS |
 | `overlay` | blocks in pinned host memory, 1.07 GiB of RAM | a two-block window and the small parts, about 0.14 GiB | the same kernels; each block uploads while the one before computes |
-| `cpu` | FP32 copy in host memory, 2.1 GiB of RAM | none | CPU threads (AVX2 and FMA when the CPU has them); `--vision-max-merged` defaults to 256, so a unit takes at most 140 soft tokens |
+| `cpu` | FP32 copy in host memory, 2.1 GiB of RAM | none | CPU threads (AVX2+FMA or AVX+F16C when the CPU has them); `--vision-max-merged` defaults to 256, so a unit takes at most 140 soft tokens |
 
 The device tower multiplies BF16 matrices by BF16 inputs into FP32 results over an FP32 residual;
 the streamed tower gives the same soft tokens bit for bit. The CPU tower computes in FP32

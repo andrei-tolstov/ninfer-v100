@@ -252,19 +252,46 @@ CpuFeatures cpu_features() noexcept {
 constexpr bool all_bits(unsigned value, unsigned mask) noexcept { return (value & mask) == mask; }
 #endif
 
-bool cpu_has_avx2() noexcept {
+bool cpu_has_avx_f16c() noexcept {
+    static const bool supported = []() noexcept {
 #if defined(NINFER_CPU_EXPERT_X86) && (defined(__GNUC__) || defined(__clang__))
-    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
-           __builtin_cpu_supports("f16c");
+        return __builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c") &&
+               __builtin_cpu_supports("ssse3") && __builtin_cpu_supports("sse4.1");
 #elif defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
-    const CpuFeatures cpu = cpu_features();
-    // XCR0 SSE and AVX state; leaf 1 FMA, AVX, F16C; leaf 7 AVX2.
-    return (cpu.xcr0 & 0x6U) == 0x6U &&
-           all_bits(cpu.leaf1_ecx, (1U << 12) | (1U << 28) | (1U << 29)) &&
-           all_bits(cpu.leaf7_ebx, 1U << 5);
+        const CpuFeatures cpu = cpu_features();
+        return (cpu.xcr0 & 0x6U) == 0x6U &&
+               all_bits(cpu.leaf1_ecx, (1U << 9) | (1U << 19) | (1U << 28) | (1U << 29));
 #else
-    return false;
+        return false;
 #endif
+    }();
+    return supported;
+}
+
+bool cpu_has_avx2() noexcept {
+    static const bool supported = []() noexcept {
+#if defined(NINFER_CPU_EXPERT_X86) && (defined(__GNUC__) || defined(__clang__))
+        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+               __builtin_cpu_supports("f16c");
+#elif defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
+        const CpuFeatures cpu = cpu_features();
+        // XCR0 SSE and AVX state; leaf 1 FMA, AVX, F16C; leaf 7 AVX2.
+        return (cpu.xcr0 & 0x6U) == 0x6U &&
+               all_bits(cpu.leaf1_ecx, (1U << 12) | (1U << 28) | (1U << 29)) &&
+               all_bits(cpu.leaf7_ebx, 1U << 5);
+#else
+        return false;
+#endif
+    }();
+    return supported;
+}
+
+GgufCpuBackend resolve_backend(GgufCpuBackend requested) {
+    const GgufCpuBackend selected = gguf_cpu_backend_selected(requested);
+    if (!gguf_cpu_backend_available(selected)) {
+        throw std::invalid_argument("GGUF CPU expert: unsupported CPU backend");
+    }
+    return selected;
 }
 
 } // namespace
@@ -286,18 +313,24 @@ bool gguf_cpu_backend_available(GgufCpuBackend backend) noexcept {
     switch (backend) {
     case GgufCpuBackend::Automatic:
     case GgufCpuBackend::Scalar: return true;
+    case GgufCpuBackend::Avx: return cpu_has_avx_f16c();
     case GgufCpuBackend::Avx2: return cpu_has_avx2();
     }
     return false;
 }
 
 const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept {
-    return gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2 ? "avx2" : "scalar";
+    switch (gguf_cpu_backend_selected(backend)) {
+    case GgufCpuBackend::Avx2: return "avx2";
+    case GgufCpuBackend::Avx: return "avx";
+    default: return "scalar";
+    }
 }
 
 GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept {
     if (requested != GgufCpuBackend::Automatic) { return requested; }
     if (cpu_has_avx2()) { return GgufCpuBackend::Avx2; }
+    if (cpu_has_avx_f16c()) { return GgufCpuBackend::Avx; }
     return GgufCpuBackend::Scalar;
 }
 
@@ -358,24 +391,32 @@ void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, 
 }
 
 void gguf_cpu_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, int row_end,
-                   float* y, std::size_t y_stride, [[maybe_unused]] GgufCpuBackend backend) {
+                   float* y, std::size_t y_stride, GgufCpuBackend backend) {
     if (!gguf_cpu_supported(w.format) || w.format != x.format() || w.k != x.k() || !w.data ||
         row_begin < 0 || row_end > w.rows || row_begin > row_end) {
         throw std::invalid_argument("GGUF CPU expert: mismatched matrix, activation or rows");
     }
+    [[maybe_unused]] const GgufCpuBackend selected = resolve_backend(backend);
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+    if (selected == GgufCpuBackend::Avx2) {
         return gguf_cpu_detail::rows_avx2(w, x, row_begin, row_end, y, y_stride);
+    }
+    if (selected == GgufCpuBackend::Avx) {
+        return gguf_cpu_detail::rows_avx(w, x, row_begin, row_end, y, y_stride);
     }
 #endif
     gguf_cpu_detail::rows_scalar(w, x, row_begin, row_end, y, y_stride);
 }
 
 void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
-                          [[maybe_unused]] GgufCpuBackend backend) {
+                          GgufCpuBackend backend) {
+    [[maybe_unused]] const GgufCpuBackend selected = resolve_backend(backend);
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+    if (selected == GgufCpuBackend::Avx2) {
         return gguf_cpu_detail::swiglu_avx2(gate, up, count, out);
+    }
+    if (selected == GgufCpuBackend::Avx) {
+        return gguf_cpu_detail::swiglu_avx(gate, up, count, out);
     }
 #endif
     gguf_cpu_detail::swiglu_scalar(gate, up, count, out);

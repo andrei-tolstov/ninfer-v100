@@ -268,6 +268,7 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_TMA_STAGING=ON` | passes the NVFP4 TMA descriptors through device memory with a capturable staging kernel, as Windows builds must, so that path can be tested on Linux (`120a`) |
 | `NINFER_MULTICALL=ON` | Linux: links `ninfer`, `ninfer-serve`, `ninfer-calibrate` and `ninfer-perplexity` into one executable, `apps/ninfer-multicall`, with the four names as symlinks to it, so the kernel image (about 0.5 GB per architecture) is there once instead of four times; the container image is built this way |
 | `NINFER_MEDIA_NATIVE_PNG=ON` | decodes PNG images natively instead of through FFmpeg, as Windows builds do by default, so that decoder can be tested on Linux |
+| `NINFER_GGML_CPU_AVX2=OFF` | builds ggml-cpu's `--expert-cpu-arithmetic ggml` kernels for AVX + F16C (Ivy Bridge, e.g. Xeon E5-2650 v2) instead of AVX2 + FMA; a default `ON` build refuses `--expert-cpu-arithmetic ggml` at startup on CPUs lacking AVX2/FMA |
 | `NINFER_DIRECTSTORAGE=ON` | Windows: fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 
 The Windows option compiles against Windows headers but has not been run on this line.

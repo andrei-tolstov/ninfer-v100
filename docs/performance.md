@@ -132,10 +132,12 @@ HBM. That is the structure's floor, not the card's ceiling.
 ### CPU arithmetic for the host experts, one V100
 
 The host experts the CPU computes (the `--expert-dma-share` share of a call's missing experts)
-run on the exact q8_1 products (the default, bit for bit with the GPU) or on ggml-cpu's AVX2
-vecdot kernels (`--expert-cpu-arithmetic ggml`), which quantize the activation to q8_K for the
-i-quant gate/up and to q8_0 for the IQ4_NL and Q8_0 down; a projection ggml-cpu does not cover
-(GSQ-RCO's Q2_0) keeps the exact products, so both modes run the same artifact.
+run on the exact q8_1 products (the default, bit for bit with the GPU, dispatched to AVX2+FMA+F16C
+or AVX+F16C+SSSE3+SSE4.1 where available) or on ggml-cpu's vecdot kernels (`--expert-cpu-arithmetic ggml`,
+compiled for AVX2+FMA+F16C by default or AVX+F16C+SSSE3+SSE4.1 when configured with `-DNINFER_GGML_CPU_AVX2=OFF`),
+which quantize the activation to q8_K for the i-quant gate/up and to q8_0 for the IQ4_NL and Q8_0
+down; a projection ggml-cpu does not cover (GSQ-RCO's Q2_0) keeps the exact products, so both modes
+run the same artifact.
 
 Tesla V100-PCIE-32GB, the IQ3_S release, host experts, an 8,192-position context, INT8 KV, MTP
 with three drafts, a 512-token prompt and 128 generated tokens of a 7,051-token code corpus,
@@ -165,6 +167,23 @@ costs about 35%, because the CPU's i-quant vecdot products run at a few GB/s of 
 (compute-bound on this Xeon, ~0.6-2 GB/s effective), far slower than the 13 GB/s bus they replace,
 so the round ends up waiting on the CPU. **The all-GPU miss path (`--expert-dma-share 1`) is the
 fastest configuration on this host.**
+
+On an AVX-only Xeon E5-2650 v2 host (8 physical cores / 16 threads, AVX 1.0 + F16C + SSSE3 + SSE4.1,
+without AVX2/FMA) with `NINFER_GGML_CPU_AVX2=OFF`, the AVX-1.0 exact q8_1 kernels measured `4.64x`
+(`T=1`), `6.64x` (`T=4`), and `9.02x` (`T=8`) faster than portable scalar on IQ3_S `640x2560` at the
+default `6` worker threads (`ninfer_gguf_expert_cpu_bench`), outperforming `ggml` for `T=4`/`T=8`,
+while `ggml` led on `T=1` (`4.88x` IQ3_S, `5.59x` IQ2_S at 6 threads; `17.87x` / `26.40x`
+single-threaded). After vectorizing IEEE-754 single-rounding `fma8` and `swiglu_avx` in AVX 1.0
+registers (improving from an initial `1.71x` on `IQ2_S T=8` and `1.00x` on `SwiGLU`), `IQ2_S`
+measured `5.03x` (`T=1`), `9.91x` (`T=4`), and `13.63x` (`T=8`, `0.7573` vs `10.3203 ms`) at 6
+threads (`21.86x` single-threaded at `T=8`), and `SwiGLU n=5120` measured `26.51x` (`0.1259` vs
+`3.3362 ms`) over scalar. On every tested format and batch size in that microbenchmark, the
+automatic default (`6` workers) beat `8` workers. Prior to that AVX-1.0 FMA vectorization pass, on
+the same host with 31 GiB RAM (insufficient for the 54.2 GiB IQ3_S artifact in pinned host RAM) and
+one Tesla V100-PCIE-32GB in `--expert-residency disk` (`rk4v4` KV, 18,432 MiB expert cache,
+`--prefill-chunk 2048`), `ninfer_bench` measured `53.11` (`pp512`), `118.74` (`pp2048`), and
+`19.89` tok/s (`tg128`, `spec=none`), versus `11.32` tok/s with cold `spec=mtp --draft-tokens 3`
+(`56.7%` acceptance, where 3-draft verification stresses uncached disk misses under 31 GiB host RAM).
 
 Making the CPU skip the device cache (a CPU-computed expert is no longer re-copied into a slot)
 removes its bytes from the bus — a 50% share cuts the round's host-to-device expert traffic

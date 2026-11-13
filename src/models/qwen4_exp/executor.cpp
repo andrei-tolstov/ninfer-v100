@@ -28,6 +28,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
+#include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 #include "ninfer/ops/ngram_rows.h"
 #include "ninfer/ops/ple_inject.h"
 #include "ninfer/ops/qsa_indexer.h"
@@ -754,6 +755,11 @@ struct Executor::Impl {
         if (options.hybrid_experts.prefill_buffers != 1 &&
             (residency != ExpertResidency::Host || native_host)) {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
+        }
+        if (options.hybrid_experts.cpu_ggml && !ops::gguf_ggml_cpu_available()) {
+            throw std::invalid_argument(
+                "--expert-cpu-arithmetic ggml: this build's ggml kernels need instructions "
+                "which this CPU lacks; use exact or a build with NINFER_GGML_CPU_AVX2=OFF");
         }
         plan_segments();
         allocate_ranks();

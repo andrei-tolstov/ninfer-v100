@@ -291,6 +291,10 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
 } // namespace
 
 int main() {
+    if (!gguf_ggml_cpu_available()) {
+        std::cout << "gguf_expert_cpu_ggml: skipped (CPU lacks required instruction set)\n";
+        return 77;
+    }
     try {
         std::mt19937 rng(20261030);
         // The gate and up projections: k = 2560 (ten 256-value blocks).

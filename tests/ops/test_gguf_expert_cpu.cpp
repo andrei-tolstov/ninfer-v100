@@ -275,7 +275,7 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
     const GgufCpuMatrix w{m.format, m.bytes.data(), m.row_bytes, m.rows, m.k};
     std::vector<float> scalar(oracle.size());
     gguf_cpu_rows(w, a, 0, m.rows, scalar.data(), m.rows, GgufCpuBackend::Scalar);
-    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx2}) {
+    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
         if (!gguf_cpu_backend_available(backend)) { continue; }
         std::vector<float> y(oracle.size()), again(oracle.size());
         // Two row ranges, as workers split them.
@@ -348,7 +348,7 @@ void check_silu(std::mt19937& rng) {
         const double step  = std::ldexp(1.0, std::ilogb(std::max(std::abs(exact), 1e-38)) - 7);
         require(std::abs(got - exact) <= step, "the BF16 middle strays from FP64");
     }
-    for (const auto backend : {GgufCpuBackend::Avx2}) {
+    for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
         if (!gguf_cpu_backend_available(backend)) { continue; }
         std::vector<std::uint16_t> y(gate.size());
         gguf_cpu_swiglu_bf16(gate.data(), up.data(), gate.size(), y.data(), backend);
@@ -357,14 +357,104 @@ void check_silu(std::mt19937& rng) {
     }
 }
 
+void check_fma_avx([[maybe_unused]] std::mt19937& rng) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (!gguf_cpu_backend_available(GgufCpuBackend::Avx)) { return; }
+    std::vector<float> a, b, c;
+    auto push = [&](float x, float y, float z) {
+        a.push_back(x);
+        b.push_back(y);
+        c.push_back(z);
+    };
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float sub = std::ldexp(3.0F, -149);
+    // Exact zeros, infinities, NaNs, subnormals and exact cancellations.
+    push(0.0F, 0.0F, -0.0F);
+    push(-0.0F, 0.0F, -0.0F);
+    push(1.0F, -0.0F, 0.0F);
+    push(-1.0F, 0.0F, -0.0F);
+    push(inf, 0.0F, 1.0F);
+    push(2e38F, 2e38F, -inf);
+    push(1e38F, 1e38F, -1e38F);
+    push(nan, 1.0F, 2.0F);
+    push(sub, 0.5F, std::ldexp(1.0F, -148));
+    push(1.25F, -1.25F, 1.5625F);
+    // Midpoint / double-rounding edge cases: construct c so double(a)*double(b)+double(c) lands
+    // near or exactly on the midpoint between two adjacent float values.
+    std::uniform_real_distribution<float> base(0.5F, 4.0F);
+    for (int i = 0; i < 4096; ++i) {
+        const float x   = base(rng) * ((i & 1) ? -1.0F : 1.0F);
+        const float y   = std::ldexp(base(rng), -24);
+        const float hi  = std::nextafter(x, (x >= 0.0F) ? inf : -inf);
+        const double mid = 0.5 * (double(x) + double(hi));
+        const double gap = mid - double(x) * double(y);
+        const float z0  = static_cast<float>(gap);
+        for (int delta = -2; delta <= 2; ++delta) {
+            float z = z0;
+            if (delta < 0) {
+                for (int k = 0; k < -delta; ++k) { z = std::nextafter(z, -inf); }
+            } else {
+                for (int k = 0; k < delta; ++k) { z = std::nextafter(z, inf); }
+            }
+            push(x, y, z);
+        }
+    }
+    // 1,000,000 random triples across exponent gaps (plus odd tail length % 8 != 0).
+    std::uniform_int_distribution<int> exp_dist(-40, 20);
+    std::uniform_real_distribution<float> mant(-2.0F, 2.0F);
+    for (int i = 0; i < 1000003; ++i) {
+        push(std::ldexp(mant(rng), exp_dist(rng)), std::ldexp(mant(rng), exp_dist(rng)),
+             std::ldexp(mant(rng), exp_dist(rng)));
+    }
+    std::vector<float> got(a.size());
+    gguf_cpu_detail::fma_avx(a.data(), b.data(), c.data(), got.data(), a.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float expected = std::fma(a[i], b[i], c[i]);
+        if (std::isnan(expected)) {
+            require(std::isnan(got[i]), "fma_avx failed to preserve NaN");
+            continue;
+        }
+        require(std::bit_cast<std::uint32_t>(got[i]) == std::bit_cast<std::uint32_t>(expected),
+                "fma_avx bit mismatch vs std::fma");
+    }
+    std::cout << "fma_avx: " << a.size() << " cases match std::fma bitwise\n";
+#endif
+}
+
+void check_unavailable_backend(const Matrix& m) {
+    GgufCpuActivation a(1, m.k);
+    std::vector<std::uint16_t> x(std::size_t(m.k), 0);
+    a.prepare_bf16(m.format, x.data(), m.k, 1);
+    const GgufCpuMatrix w{m.format, m.bytes.data(), m.row_bytes, m.rows, m.k};
+    std::vector<float> y(std::size_t(m.rows), 0.0F);
+    std::vector<float> gate(32, 0.0F), up(32, 0.0F);
+    std::vector<std::uint16_t> mid(32, 0);
+    for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
+        if (gguf_cpu_backend_available(backend)) { continue; }
+        bool rows_refused = false;
+        try {
+            gguf_cpu_rows(w, a, 0, m.rows, y.data(), m.rows, backend);
+        } catch (const std::invalid_argument&) { rows_refused = true; }
+        require(rows_refused, "gguf_cpu_rows accepted an unsupported CPU backend");
+        bool swiglu_refused = false;
+        try {
+            gguf_cpu_swiglu_bf16(gate.data(), up.data(), gate.size(), mid.data(), backend);
+        } catch (const std::invalid_argument&) { swiglu_refused = true; }
+        require(swiglu_refused, "gguf_cpu_swiglu_bf16 accepted an unsupported CPU backend");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         std::mt19937 rng(20261009);
+        check_fma_avx(rng);
         check_silu(rng);
         for (const QType format : {QType::GGUF_Q2_0, QType::GGUF_Q8_0, QType::GGUF_IQ4_NL}) {
             const Matrix gate = make(format, 640, 2560, rng);
+            if (format == QType::GGUF_Q2_0) { check_unavailable_backend(gate); }
             const Matrix down = make(format, 2560, 640, rng);
             for (const int tokens : {1, 2, 3, 4, 5, 8, 9}) {
                 check(gate, tokens, rng);
