@@ -88,3 +88,13 @@ ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DI
 # The opt-in cuBLAS prefill route against the integer-activation route it would replace.
 ninfer_add_op_bench(ninfer_w4_cublas_prefill_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/w4_cublas_prefill_bench.cu")
+
+ninfer_add_op_bench(ninfer_gguf_expert_cpu_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/gguf_expert_cpu_bench.cpp")
+
+ninfer_add_bench(ninfer_cpu_avx_eval_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu_avx_eval_bench.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  target_compile_definitions(ninfer_cpu_avx_eval_bench PRIVATE NINFER_VISION_CPU_X86=1)
+endif()
