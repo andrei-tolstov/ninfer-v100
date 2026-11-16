@@ -5,7 +5,7 @@
 Адаптация и глубокая оптимизация CPU-путей движка **ninfer-v100** для процессоров без инструкций `AVX2` и `FMA3` (целевой стенд Intel Ivy Bridge-EP с `AVX 1.0 + F16C + SSSE3 + SSE4.1`):
 - **CPU**: Intel Xeon E5-2650 v2 @ 2.60 GHz (1 сокет, 8 физических ядер / 16 логических потоков, L3 20 MiB; флаги `ssse3 sse4_1 sse4_2 avx f16c`, без `avx2` и `fma`)
 - **RAM**: 31 GiB (физическая память хоста)
-- **GPU**: Tesla V100-PCIE-32GB (`sm_70`, PCIe 3.0 x16, CUDA 12.8; во время финального прогона тестов CPU/Vision GPU 1 была занята рабочим контейнером `coder390-llama-server` на 32,124 MiB из 32,768 MiB; GPU 0 — `GTX 1060 3GB`, не собирается под `sm_70`)
+- **GPU**: Tesla V100-PCIE-32GB (`sm_70`, PCIe 3.0 x16, CUDA 12.8; во время сквозных GPU+CPU тестов Фазы A рабочий контейнер `coder390-llama-server` и `deepseek-llama-swap` временно останавливались с изоляцией `--gpus '"device=1"'` и восстанавливались после завершения; GPU 0 — `GTX 1060 3GB`, не собирается под `sm_70`)
 
 Решаемые задачи:
 1. Устранить `SIGILL` при `--expert-cpu-arithmetic ggml` на CPU без `AVX2/FMA` через опцию CMake `NINFER_GGML_CPU_AVX2` (`ON` по умолчанию, `OFF` для `AVX 1.0 + F16C`) и раннюю проверку на старте (`Executor::Impl`).
@@ -121,9 +121,29 @@
 2. **`build-avx2` (`-DNINFER_GGML_CPU_AVX2=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release`)**:
    - Полная компиляция и линковка `ninfer_tests` (включая `arch/x86/quants.c` AVX2-веток, `gemma4`, `qwen3_5` AVX2 и `expert_misses.cu`) — без ошибок.
    - `ctest -R 'gguf_expert_cpu|moe_expert_cpu|vision_cpu|qwen4_exp_config'`: **5/7 Passed, 2 Skipped** (`ninfer_qwen3_5_vision_cpu_real_test` и `ninfer_gguf_expert_cpu_ggml_test` корректно пропущен на AVX-only хосте с кодом `77`), **0 Failed**.
-3. **Ограничения финальной верификации на стенде**:
+3. **Сквозные GPU+CPU тесты и замеры на `Tesla V100-PCIE-32GB` (Фаза A, `build-avx`, коммит `092383bc`)**:
+   - **CUDA и GPU+CPU автотесты на `GPU 1`**:
+     - Первая серия (12 тестов): **11/12 Passed, 0 Failed**, 1 Skipped (`ninfer_qwen4_exp_peer_copy_order_test`, требует 2 GPU): пройдены `ninfer_expert_delivery_test` (`3.60s`), `ninfer_qwen_native_expert_layout_test`, `ninfer_qwen4_exp_expert_cache_test`, `ninfer_qwen4_exp_expert_profile_test`, `ninfer_qwen4_exp_hybrid_experts_test` (`2.17s`), `ninfer_qwen4_exp_expert_cache_visibility_test`, `ninfer_qwen4_exp_expert_stream_test`, `ninfer_gemma4_vision_kernels_test`, `ninfer_moe_experts_test`, `ninfer_moe_experts_gguf_test` (`34.10s`), `ninfer_moe_experts_native_test` (`11.00s`).
+     - Вторая серия (6 тестов): **6/6 Passed, 0 Failed** (`ninfer_qwen4_exp_config_test`, `ninfer_qwen4_exp_expert_cache_test`, `ninfer_qwen4_exp_hybrid_experts_test`, `ninfer_qwen4_exp_expert_cache_visibility_test`, `ninfer_gguf_expert_cpu_test`, `ninfer_gguf_expert_cpu_ggml_test`, `9.89s`).
+   - **Полная 48-слойная модель `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (`58.2 GB`, `--expert-residency disk`, `--kv-dtype rk4v4`, `--expert-cache-mib 18432`, `--prefill-chunk 2048`)**:
+     - В `--expert-residency disk` используется `ExpertStream` ([`src/models/qwen4_exp/executor.cpp`](src/models/qwen4_exp/executor.cpp)) без `ExpertMisses` (`expert_cpu_routes = 0` при любом `--expert-dma-share`), а `--expert-residency host` для всех 48 слоёв (~51 GiB экспертов) не помещается в `31 GiB` RAM хоста.
+     - Без драфтера (`spec=none`, прогретый page cache): `pp512 = 58.21 tok/s`, `tg128 = 21.16 ± 0.09 tok/s` (`85.5%` cache hits, `74.7 GB` PCIe-трафика за `w=1, r=3`).
+     - С `--spec mtp --draft-tokens 3`: `pp512 = 52.54 ± 0.12 tok/s`, `tg128 = 14.33 ± 0.11 tok/s` (`52.6%` cache hits на `bench_corpus.ids`, acceptance rate `56.7%`, `2.70` токена/раунд).
+   - **Сквозной гибридный GPU+CPU прогон (`--expert-residency host`, `ExpertMisses`) на 8-слойном срезе реальных весов (`layers 0..7`, `11.41 GiB`, форматы `gguf_iq2_s`, `gguf_iq3_xxs`, `gguf_iq4_nl`, `gguf_q2_0`)**:
+     - `--greedy` эквивалентность: при `--expert-dma-share 0.5 --expert-cpu-arithmetic exact --expert-cpu-threads 8` вывод (`ninfer`) побитово и потоково совпал с GPU-only (`--expert-dma-share 1`) как для `spec=none` (`30.9%` CPU routes, DMA `7,749.3 -> 4,190.0 MiB`, `HOST_EXACT_TOKEN_MATCH=YES`), так и для `MTP 3` (`25.5%` CPU routes, DMA `31,061.3 -> 18,902.5 MiB`, `MTP3_HOST_EXACT_TOKEN_MATCH=YES`).
+     - Замеры `ninfer_bench` (`tg128`, `-r 3 --warmup 1`, `rk4v4`):
+
+| Кэш / Спекуляция | `GPU-only` (`1.0`) | `exact auto 6t` | `exact auto 8t` | `exact 0.5 8t` | `ggml auto 6t` | `ggml auto 8t` | `ggml 0.5 8t` | `exact / ggml 0.0 8t` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `512 MiB` (`384` эфф.), `spec=none` | `80.13 ± 1.17` | `86.19 ± 1.02` (+7.6%) | `89.35 ± 0.99` (**+11.5%**) | `88.65 ± 1.37` | `90.67 ± 0.54` | `97.80 ± 1.13` (**+22.1%**) | **`99.31 ± 0.73`** (**+23.9%**) | `56.36` / `67.95` |
+| `512 MiB`, `MTP 3` (стресс 4-tok verify, `acc=0.0-0.1%`) | `23.20 ± 0.12` | `26.70 ± 0.01` | `28.63 ± 0.02` (**+23.4%**) | `28.80 ± 0.03` (`0.7`: `29.10`, **+25.4%**) | `28.38 ± 0.43` | **`30.28 ± 0.17`** (**+30.5%**) | `30.23 ± 0.39` | — |
+| `2048 MiB` (`1920` эфф.), `spec=none` (~86% hits) | `155.78 ± 1.79` | — | `156.61 ± 1.49` | — | — | `157.58 ± 7.34` | (`0.7`: **`157.60 ± 0.80`**) | — |
+| `2048 MiB`, `MTP 3` (~75% hits, `acc=0.0-0.4%`) | `39.52 ± 0.20` | — | `44.58 ± 0.19` (**+12.8%**) | — | — | **`46.80 ± 0.78`** (**+18.4%**) | (`0.7`: `45.11 ± 0.94`) | — |
+
+     - Выводы сквозного GPU+CPU запуска: (1) оптимизированные AVX 1.0 + F16C пути позволяют слабому CPU E5-2650 v2 при совместной работе с V100 по PCIe 3.0 ускорить генерацию при частых кэш-промахах на **+11.5%..+25.4%** (`exact`) и **+18.4%..+30.5%** (`ggml`), снижая трафик DMA почти вдвое (`76.04 -> 29.95 GiB` и `235.34 -> 120.55 GiB`); (2) `8` рабочих потоков стабильно быстрее `6` в гибридном декоде (`+3.7%..+7.9%`); (3) перевод 100% промахов на CPU (`--expert-dma-share 0`) уступает GPU (`56.36` / `67.95` vs `80.13 tok/s`), подтверждая необходимость параллельного разделения доли между PCIe и CPU.
+4. **Ограничения текущей верификации**:
    - Код `AVX2=ON` (`vision_cpu_kernels_avx2` в `qwen3_5`/`gemma4` и `#else`-ветки в `arch/x86/quants.c`) проверен компиляцией в `build-avx2`, но физически на AVX2-процессоре не запускался (CPU стенда не имеет AVX2/FMA).
-   - Сквозной прогон `Flash-Next` с GPU+CPU (`expert_misses.cu`, `ninfer_expert_delivery_test`, `ninfer_qwen4_exp_*`) в финальной итерации на `192.168.50.38` не выполнялся из-за ограничения 31 GiB host RAM и занятости `GPU 1` (`coder390-llama-server`: 32,124 / 32,768 MiB VRAM); `expert_misses.cu` проверен компиляцией CUDA 12.8 `sm_70`.
+   - После всех замеров временный срез удалён, а рабочий сервис `coder390-llama-server` и `deepseek-llama-swap` восстановлены (`/health -> {"status":"ok"}`).
 
 ---
 

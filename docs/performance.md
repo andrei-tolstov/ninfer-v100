@@ -202,6 +202,35 @@ one Tesla V100-PCIE-32GB in `--expert-residency disk` (`rk4v4` KV, 18,432 MiB ex
 `--prefill-chunk 2048`), `ninfer_bench` measured `53.11` (`pp512`), `118.74` (`pp2048`), and
 `19.89` tok/s (`tg128`, `spec=none`), versus `11.32` tok/s with cold `spec=mtp --draft-tokens 3`
 (`56.7%` acceptance, where 3-draft verification stresses uncached disk misses under 31 GiB host RAM).
+On build `092383bc` in `--expert-residency disk` (`ExpertStream`, which does not invoke CPU expert
+computation so `expert_cpu_routes = 0` regardless of `--expert-dma-share`), `ninfer_bench` on the
+same 48-layer IQ3_S artifact measured `pp512 = 58.21 tok/s` (`spec=none`, warm page cache) and
+`tg128 = 21.16 ± 0.09 tok/s` (`85.5%` cache hit rate, `spec=none`), or `pp512 = 52.54 ± 0.12 tok/s`
+and `tg128 = 14.33 ± 0.11 tok/s` with `spec=mtp --draft-tokens 3` (`56.7%` acceptance, `2.70`
+tokens/round, `52.6%` hit rate on `bench_corpus.ids`).
+
+To measure the actual `ExpertMisses` GPU+CPU hybrid path (`--expert-residency host`) on this 31 GiB
+RAM / E5-2650 v2 / V100 host, an 8-layer real-weight qualification slice (`layers 0..7` copied
+verbatim from the IQ3_S artifact: `11.41 GiB`, containing `gguf_iq2_s`, `gguf_iq3_xxs`,
+`gguf_iq4_nl` and `gguf_q2_0` experts plus PLE/MTP, `rk4v4` KV, `bench_corpus.ids`, `tg128`, 3 reps
++ 1 warmup) was benchmarked across cache sizes, `--expert-dma-share` splits and thread counts.
+Under `--greedy`, `exact` matched GPU-only (`--expert-dma-share 1`) token-for-token with both
+`spec=none` (`30.9%` CPU routes) and `spec=mtp --draft-tokens 3` (`25.5%` CPU routes):
+
+| Regime (`8L host slice`) | GPU-only (`share=1`) | `exact auto 6t / 8t` | `exact 0.5 8t` | `ggml auto 6t / 8t` | `ggml 0.5 8t` | `exact / ggml 0.0 8t` |
+|---|---:|---:|---:|---:|---:|---:|
+| `cache=512 MiB`, `spec=none` (~49% hits) | `80.13 ± 1.17` | `86.19` / `89.35` (**+11.5%**) | `88.65` (+10.6%) | `90.67` / `97.80` (+22.1%) | **`99.31 ± 0.73`** (**+23.9%**) | `56.36` / `67.95` |
+| `cache=512 MiB`, `mtp 3` (~38% hits, 4-tok verify stress) | `23.20 ± 0.12` | `26.70` / `28.63` (+23.4%) | `28.80` (`0.7`: `29.10`, **+25.4%**) | `28.38` / **`30.28 ± 0.17`** (**+30.5%**) | `30.23` (+30.3%) | — |
+| `cache=2048 MiB`, `spec=none` (~86% hits) | `155.78 ± 1.79` | — / `156.61` | — | — / `157.58` (`0.7`: **`157.60`**) | — | — |
+| `cache=2048 MiB`, `mtp 3` (~75% hits, 4-tok verify stress) | `39.52 ± 0.20` | — / `44.58` (**+12.8%**) | — | — / **`46.80 ± 0.78`** (**+18.4%**) | (`0.7`: `45.11`) | — |
+
+In all miss-bound cases on this AVX-1.0 CPU + PCIe 3.0 V100 system, `auto` overlaps the CPU share
+with PCIe transfers cleanly (`dma`: `76.04 -> 29.95 GiB` for `ggml auto 8t`, `235.34 -> 120.55 GiB`
+under `mtp 3`), `8` worker threads beat `6` end-to-end (`+3.7%` to `+7.9%`), and `ggml` adds up to
+`+11%` over `exact`; on the partial 8L slice `mtp 3` acceptance is near zero (`0.0-0.4%`), so those
+rows specifically measure 4-token verification miss batching. When 100% of misses are forced onto
+the CPU (`--expert-dma-share 0`), both `exact` (`56.36 tok/s`) and `ggml` (`67.95 tok/s`) fall below
+GPU-only (`80.13 tok/s`), confirming PCIe+CPU co-execution is required rather than pure CPU misses.
 
 Making the CPU skip the device cache (a CPU-computed expert is no longer re-copied into a slot)
 removes its bytes from the bus — a 50% share cuts the round's host-to-device expert traffic
