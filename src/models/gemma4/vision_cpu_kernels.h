@@ -19,6 +19,18 @@ struct Kernels {
     void (*softmax_columns)(float* s, std::size_t stride, int rows, int cols, float* sums);
     // out[i] = gelu_tanh(gate[i]) * up[i] for i < count.
     void (*geglu)(const float* gate, const float* up, float* out, std::size_t count);
+    // Packs `width` columns [token, token + width) of [k, x_stride] row-major x into a
+    // contiguous [k, 16] zero-padded panel.
+    void (*pack_panel)(const float* x, std::size_t x_stride, int k, int token, int width,
+                       float* panel);
+    // Matrix product over all pre-packed [((tokens + 15) / 16)][k][16] panels produced by
+    // pack_panel.
+    void (*gemm_packed)(const float* w, std::size_t w_stride, int n, int k, const float* packed,
+                        int tokens, float* y, std::size_t y_stride);
+    void (*rms_accum_sq)(const float* row, int count, double* sums);
+    void (*scale_mul_row)(const float* in, const float* scale, float gamma, int count, float* out);
+    void (*add_scaled_row)(const float* in, const float* scale, float gamma, int count,
+                           float* inout);
     const char* name;
 };
 

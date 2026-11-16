@@ -73,6 +73,44 @@ void geglu(const float* gate, const float* up, float* out, std::size_t count) {
     }
 }
 
+void pack_panel(const float* x, std::size_t x_stride, int k, int token, int width, float* panel) {
+    pack(x, x_stride, k, token, width, panel);
+}
+
+void gemm_packed(const float* w, std::size_t w_stride, int n, int k, const float* packed,
+                 int tokens, float* y, std::size_t y_stride) {
+    for (int token = 0, p = 0; token < tokens; token += kTileTokens, ++p) {
+        const int width    = std::min(kTileTokens, tokens - token);
+        const float* panel = packed + std::size_t(p) * k * kTileTokens;
+        for (int row = 0; row < n; row += kTileRows) {
+            const int rows = std::min(kTileRows, n - row);
+            float acc[kTileRows][kTileTokens] = {};
+            for (int inner = 0; inner < k; ++inner) {
+                const float* xs = panel + std::size_t(inner) * kTileTokens;
+                for (int r = 0; r < rows; ++r) {
+                    const float weight = w[std::size_t(row + r) * w_stride + inner];
+                    for (int t = 0; t < kTileTokens; ++t) { acc[r][t] += weight * xs[t]; }
+                }
+            }
+            for (int r = 0; r < rows; ++r) {
+                std::copy_n(acc[r], width, y + std::size_t(row + r) * y_stride + token);
+            }
+        }
+    }
+}
+
+void rms_accum_sq(const float* row, int count, double* sums) {
+    for (int t = 0; t < count; ++t) { sums[t] += double(row[t]) * row[t]; }
+}
+
+void scale_mul_row(const float* in, const float* scale, float gamma, int count, float* out) {
+    for (int t = 0; t < count; ++t) { out[t] = in[t] * scale[t] * gamma; }
+}
+
+void add_scaled_row(const float* in, const float* scale, float gamma, int count, float* inout) {
+    for (int t = 0; t < count; ++t) { inout[t] += in[t] * scale[t] * gamma; }
+}
+
 bool avx2_fma() noexcept {
 #if defined(NINFER_VISION_CPU_X86)
 #    if defined(_MSC_VER)
@@ -117,7 +155,9 @@ bool avx_supported() noexcept {
 } // namespace
 
 const Kernels& portable_kernels() noexcept {
-    static const Kernels kernels{gemm, softmax_columns, geglu, "portable"};
+    static const Kernels kernels{gemm,        softmax_columns, geglu,         pack_panel,
+                                 gemm_packed, rms_accum_sq,    scale_mul_row, add_scaled_row,
+                                 "portable"};
     return kernels;
 }
 

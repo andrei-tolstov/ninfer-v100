@@ -8,6 +8,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -157,8 +158,8 @@ struct Matrix {
     }
 };
 
-// y = W x, W row-major [n, k], x feature-major [k, T], y feature-major [n, T]: the rows of W split
-// over the team, four at a time.
+// y = W x, W row-major [n, k], x feature-major [k, T], y feature-major [n, T]: pack panels of x
+// once across the team and split rows of W in 12-row tiles (LCM of 4x16 and 6x16 microkernels).
 void linear(const std::vector<float>& w, std::int32_t n, const Matrix& x, Matrix& y, Team& team) {
     const std::int32_t k = x.rows;
     if (w.size() != static_cast<std::size_t>(n) * static_cast<std::size_t>(k) || y.rows != n ||
@@ -166,28 +167,40 @@ void linear(const std::vector<float>& w, std::int32_t n, const Matrix& x, Matrix
         throw std::logic_error("CPU vision: projection extents do not match");
     }
     const auto& kernels = cpu_vision::kernels();
-    const std::int32_t groups = (n + 3) / 4;
-    team.run(static_cast<std::size_t>(groups), 4, [&](std::size_t begin, std::size_t end) {
-        const auto row  = static_cast<std::int32_t>(begin) * 4;
-        const auto rows = std::min(n, static_cast<std::int32_t>(end) * 4) - row;
-        kernels.gemm(w.data() + std::size_t(row) * k, std::size_t(k), rows, k, x.row(0),
-                     std::size_t(x.cols), x.cols, y.row(row), std::size_t(y.cols));
+    const int panels = (x.cols + 15) / 16;
+    const std::size_t panel_floats = std::size_t(k) * 16;
+    std::vector<float> packed(std::size_t(panels) * panel_floats + 16);
+    float* packed_aligned = reinterpret_cast<float*>(
+        (reinterpret_cast<std::uintptr_t>(packed.data()) + 63U) & ~std::uintptr_t(63U));
+    team.run(std::size_t(panels), 1, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t p = begin; p < end; ++p) {
+            const int token = int(p) * 16;
+            const int width = std::min(16, x.cols - token);
+            kernels.pack_panel(x.row(0), std::size_t(x.cols), k, token, width,
+                               packed_aligned + p * panel_floats);
+        }
+    });
+    const std::int32_t groups = (n + 11) / 12;
+    team.run(static_cast<std::size_t>(groups), 2, [&](std::size_t begin, std::size_t end) {
+        const auto row  = static_cast<std::int32_t>(begin) * 12;
+        const auto rows = std::min(n, static_cast<std::int32_t>(end) * 12) - row;
+        kernels.gemm_packed(w.data() + std::size_t(row) * k, std::size_t(k), rows, k,
+                            packed_aligned, x.cols, y.row(row), std::size_t(y.cols));
     });
 }
 
 // Per-patch RMS statistics over the feature rows: 1 / sqrt(mean x^2 + eps).
 std::vector<float> rms_scales(const Matrix& x, float eps, Team& team) {
+    const auto& kernels = cpu_vision::kernels();
     std::vector<float> out(static_cast<std::size_t>(x.cols));
     team.run(static_cast<std::size_t>(x.cols), 64, [&](std::size_t begin, std::size_t end) {
-        std::vector<double> sums(end - begin, 0.0);
+        const int count = int(end - begin);
+        std::vector<double> sums(std::size_t(count), 0.0);
         for (std::int32_t r = 0; r < x.rows; ++r) {
-            const float* values = x.row(r);
-            for (std::size_t t = begin; t < end; ++t) {
-                sums[t - begin] += double(values[t]) * values[t];
-            }
+            kernels.rms_accum_sq(x.row(r) + begin, count, sums.data());
         }
-        for (std::size_t t = begin; t < end; ++t) {
-            out[t] = 1.0F / std::sqrt(float(sums[t - begin] / x.rows) + eps);
+        for (int i = 0; i < count; ++i) {
+            out[begin + std::size_t(i)] = 1.0F / std::sqrt(float(sums[i] / x.rows) + eps);
         }
     });
     return out;
@@ -196,12 +209,11 @@ std::vector<float> rms_scales(const Matrix& x, float eps, Team& team) {
 // y[r][t] = x[r][t] * scale[t] * gamma[r] (gamma empty: 1).
 void apply_norm(const Matrix& x, const std::vector<float>& scale, const std::vector<float>& gamma,
                 Matrix& y, Team& team) {
+    const auto& kernels = cpu_vision::kernels();
     team.run(static_cast<std::size_t>(x.rows), 8, [&](std::size_t begin, std::size_t end) {
         for (auto r = static_cast<std::int32_t>(begin); r < static_cast<std::int32_t>(end); ++r) {
             const float g = gamma.empty() ? 1.0F : gamma[static_cast<std::size_t>(r)];
-            const float* in = x.row(r);
-            float* out      = y.row(r);
-            for (std::int32_t t = 0; t < x.cols; ++t) { out[t] = in[t] * scale[t] * g; }
+            kernels.scale_mul_row(x.row(r), scale.data(), g, x.cols, y.row(r));
         }
     });
 }
@@ -387,10 +399,8 @@ std::vector<std::uint16_t> CpuVisionTower::encode(std::span<const std::uint16_t>
         const auto attention_scale = rms_scales(o, eps, team);
         team.run(std::size_t(h), 8, [&](std::size_t begin, std::size_t end) {
             for (auto c = int(begin); c < int(end); ++c) {
-                for (int p = 0; p < total; ++p) {
-                    residual.row(c)[p] += o.row(c)[p] * attention_scale[p] *
-                                          layer.post_attention_norm[c];
-                }
+                kernels.add_scaled_row(o.row(c), attention_scale.data(),
+                                       layer.post_attention_norm[c], total, residual.row(c));
             }
         });
         apply_norm(residual, rms_scales(residual, eps, team), layer.ffn_norm, normed, team);
@@ -404,9 +414,8 @@ std::vector<std::uint16_t> CpuVisionTower::encode(std::span<const std::uint16_t>
         const auto mlp_scale = rms_scales(o, eps, team);
         team.run(std::size_t(h), 8, [&](std::size_t begin, std::size_t end) {
             for (auto c = int(begin); c < int(end); ++c) {
-                for (int p = 0; p < total; ++p) {
-                    residual.row(c)[p] += o.row(c)[p] * mlp_scale[p] * layer.post_ffn_norm[c];
-                }
+                kernels.add_scaled_row(o.row(c), mlp_scale.data(),
+                                       layer.post_ffn_norm[c], total, residual.row(c));
             }
         });
     }

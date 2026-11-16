@@ -74,6 +74,86 @@ void gemm(const float* w, std::size_t w_stride, int n, int k, const float* x, st
     }
 }
 
+void gemm_packed(const float* w, std::size_t w_stride, int n, int k, const float* packed,
+                 int tokens, float* y, std::size_t y_stride) {
+    for (int token = 0, p = 0; token < tokens; token += kTileTokens, ++p) {
+        const int width    = std::min(kTileTokens, tokens - token);
+        const float* panel = packed + std::size_t(p) * k * kTileTokens;
+        for (int row = 0; row < n; row += kTileRows) {
+            const int rows  = std::min(kTileRows, n - row);
+            const float* w0 = w + std::size_t(row) * w_stride;
+            const float* w1 = w + std::size_t(row + std::min(1, rows - 1)) * w_stride;
+            const float* w2 = w + std::size_t(row + std::min(2, rows - 1)) * w_stride;
+            const float* w3 = w + std::size_t(row + std::min(3, rows - 1)) * w_stride;
+            __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps();
+            __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps();
+            __m256 a20 = _mm256_setzero_ps(), a21 = _mm256_setzero_ps();
+            __m256 a30 = _mm256_setzero_ps(), a31 = _mm256_setzero_ps();
+            const float* xs = panel;
+            for (int inner = 0; inner < k; ++inner, xs += kTileTokens) {
+                const __m256 x0 = _mm256_loadu_ps(xs), x1 = _mm256_loadu_ps(xs + 8);
+                __m256 v = _mm256_broadcast_ss(w0 + inner);
+                a00      = _mm256_fmadd_ps(v, x0, a00);
+                a01      = _mm256_fmadd_ps(v, x1, a01);
+                v        = _mm256_broadcast_ss(w1 + inner);
+                a10      = _mm256_fmadd_ps(v, x0, a10);
+                a11      = _mm256_fmadd_ps(v, x1, a11);
+                v        = _mm256_broadcast_ss(w2 + inner);
+                a20      = _mm256_fmadd_ps(v, x0, a20);
+                a21      = _mm256_fmadd_ps(v, x1, a21);
+                v        = _mm256_broadcast_ss(w3 + inner);
+                a30      = _mm256_fmadd_ps(v, x0, a30);
+                a31      = _mm256_fmadd_ps(v, x1, a31);
+            }
+            alignas(32) float out[kTileRows][kTileTokens];
+            _mm256_store_ps(out[0], a00);
+            _mm256_store_ps(out[0] + 8, a01);
+            _mm256_store_ps(out[1], a10);
+            _mm256_store_ps(out[1] + 8, a11);
+            _mm256_store_ps(out[2], a20);
+            _mm256_store_ps(out[2] + 8, a21);
+            _mm256_store_ps(out[3], a30);
+            _mm256_store_ps(out[3] + 8, a31);
+            for (int r = 0; r < rows; ++r) {
+                std::copy_n(out[r], width, y + std::size_t(row + r) * y_stride + token);
+            }
+        }
+    }
+}
+
+void rms_accum_sq(const float* row, int count, double* sums) {
+    int t = 0;
+    for (; t + 8 <= count; t += 8) {
+        const __m256 x   = _mm256_loadu_ps(row + t);
+        const __m256d d0 = _mm256_cvtps_pd(_mm256_castps256_ps128(x));
+        const __m256d d1 = _mm256_cvtps_pd(_mm256_extractf128_ps(x, 1));
+        _mm256_storeu_pd(sums + t,     _mm256_fmadd_pd(d0, d0, _mm256_loadu_pd(sums + t)));
+        _mm256_storeu_pd(sums + t + 4, _mm256_fmadd_pd(d1, d1, _mm256_loadu_pd(sums + t + 4)));
+    }
+    for (; t < count; ++t) { sums[t] += double(row[t]) * row[t]; }
+}
+
+void scale_mul_row(const float* in, const float* scale, float gamma, int count, float* out) {
+    const __m256 vg = _mm256_set1_ps(gamma);
+    int t = 0;
+    for (; t + 8 <= count; t += 8) {
+        const __m256 v = _mm256_mul_ps(_mm256_loadu_ps(in + t), _mm256_loadu_ps(scale + t));
+        _mm256_storeu_ps(out + t, _mm256_mul_ps(v, vg));
+    }
+    for (; t < count; ++t) { out[t] = in[t] * scale[t] * gamma; }
+}
+
+void add_scaled_row(const float* in, const float* scale, float gamma, int count, float* inout) {
+    const __m256 vg = _mm256_set1_ps(gamma);
+    int t = 0;
+    for (; t + 8 <= count; t += 8) {
+        const __m256 s = _mm256_mul_ps(_mm256_loadu_ps(scale + t), vg);
+        _mm256_storeu_ps(inout + t,
+                         _mm256_fmadd_ps(_mm256_loadu_ps(in + t), s, _mm256_loadu_ps(inout + t)));
+    }
+    for (; t < count; ++t) { inout[t] += in[t] * scale[t] * gamma; }
+}
+
 // exp(x) for x <= 0 as Cephes' expf computes it: x = n ln2 + f with |f| <= ln2 / 2, a degree-6
 // polynomial for e^f and 2^n built in the exponent bits, a relative error of about 1e-7; below
 // -87.3 the result is about the smallest normal, which a softmax sum cannot notice.
@@ -154,7 +234,9 @@ void geglu(const float* gate, const float* up, float* out, std::size_t count) {
 } // namespace
 
 const Kernels& avx2_kernels() noexcept {
-    static const Kernels kernels{gemm, softmax_columns, geglu, "avx2"};
+    static const Kernels kernels{gemm,        softmax_columns, geglu,         pack,
+                                 gemm_packed, rms_accum_sq,    scale_mul_row, add_scaled_row,
+                                 "avx2"};
     return kernels;
 }
 
