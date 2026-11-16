@@ -169,16 +169,34 @@ so the round ends up waiting on the CPU. **The all-GPU miss path (`--expert-dma-
 fastest configuration on this host.**
 
 On an AVX-only Xeon E5-2650 v2 host (8 physical cores / 16 threads, AVX 1.0 + F16C + SSSE3 + SSE4.1,
-without AVX2/FMA) with `NINFER_GGML_CPU_AVX2=OFF`, the AVX-1.0 exact q8_1 kernels measured `4.64x`
-(`T=1`), `6.64x` (`T=4`), and `9.02x` (`T=8`) faster than portable scalar on IQ3_S `640x2560` at the
-default `6` worker threads (`ninfer_gguf_expert_cpu_bench`), outperforming `ggml` for `T=4`/`T=8`,
-while `ggml` led on `T=1` (`4.88x` IQ3_S, `5.59x` IQ2_S at 6 threads; `17.87x` / `26.40x`
-single-threaded). After vectorizing IEEE-754 single-rounding `fma8` and `swiglu_avx` in AVX 1.0
-registers (improving from an initial `1.71x` on `IQ2_S T=8` and `1.00x` on `SwiGLU`), `IQ2_S`
-measured `5.03x` (`T=1`), `9.91x` (`T=4`), and `13.63x` (`T=8`, `0.7573` vs `10.3203 ms`) at 6
-threads (`21.86x` single-threaded at `T=8`), and `SwiGLU n=5120` measured `26.51x` (`0.1259` vs
-`3.3362 ms`) over scalar. On every tested format and batch size in that microbenchmark, the
-automatic default (`6` workers) beat `8` workers. Prior to that AVX-1.0 FMA vectorization pass, on
+without AVX2/FMA) with `NINFER_GGML_CPU_AVX2=OFF` (using the persistent worker pool in
+`ninfer_gguf_expert_cpu_bench`), the exact q8_1 (`Avx`) and `ggml` kernels measured on
+`640x2560` projections (`iters=15`):
+
+- `IQ3_S`: `Avx` `0.5754 ms` (`19.75x`) at `T=1 thr=1` -> `0.0743 ms` (`15.38x` vs scalar) at
+  `thr=8`, and `1.3649 -> 0.1760 ms` (`18.68x`) at `T=8`; `ggml` (with AVX1 `quantize_row_q8_K`,
+  direct BF16->q8_K and batched `*_rows`) measured `0.5039 -> 0.0696 ms` (`T=1`, `22.56x / 16.41x`)
+  and `1.1047 -> 0.1547 ms` (`T=8`, `23.80x / 21.25x`).
+- `IQ4_NL`: `Avx` with precomputed abs-LUT and `T==1` streaming measured `0.2172 -> 0.0288 ms` at
+  `T=1` and `1.0915 -> 0.1462 ms` (`18.91x`) at `T=8 thr=8`, faster than `ggml` (`0.0339 / 0.1576 ms`)
+  at 8 threads.
+- `Q8_0`: `Avx` measured `0.1787 -> 0.0240 ms` (`T=1`) and `1.0688 -> 0.1425 ms` (`T=8`).
+- `IQ2_S`: `Avx` with register IEEE-754 `fma8` measured `0.4681 -> 0.0613 ms` (`T=1`) and
+  `2.1237 -> 0.2843 ms` (`22.79x`) at `T=8`, while batched multi-token `ggml` (`*_rows`) reached
+  `1.0190 -> 0.1448 ms` (`50.43x / 44.74x`).
+- `Q2_0`: `Avx` measured `0.2748 -> 0.0357 ms` (`T=1`, `26.71x` at `thr=8`).
+- `SwiGLU n=5120`: `swiglu_avx` measured `0.0963 ms` (`32.45x` vs `3.1254 ms` scalar).
+- With the persistent barrier pool removing per-iteration `std::thread` creation overhead, `8`
+  workers (1 per physical core) beat `6` across exact formats (`~25%` lower latency) and most multi-token
+  `ggml` cases, while the engine default remains `6` to avoid SMT contention alongside GPU serving.
+
+Additional AVX 1.0 (`no AVX2/FMA`) CPU paths measured on the same E5-2650 v2 host:
+`moe_expert_cpu` (`Q4_G64 a8=1 T=1`) improved from `9.3887 ms` to `0.7026 ms` (`13.06x` vs scalar),
+Gemma 4 CPU vision `6x16` `gemm` reached `17.56 ms` (`1152x1152x256`, `16.26x` vs portable) and
+`67.51 ms` (`4320x1152x256`, `15.91x`), and Qwen3.5 CPU vision (2 layers, 256 patches) dropped
+from `4100.95 -> 606.82 ms` (`6.76x`, 1 thread) and `242.62 -> 94.46 ms` (`2.57x`, 8 threads).
+
+Prior to the post-`e2dc1705` AVX-1.0 passes above, on
 the same host with 31 GiB RAM (insufficient for the 54.2 GiB IQ3_S artifact in pinned host RAM) and
 one Tesla V100-PCIE-32GB in `--expert-residency disk` (`rk4v4` KV, 18,432 MiB expert cache,
 `--prefill-chunk 2048`), `ninfer_bench` measured `53.11` (`pp512`), `118.74` (`pp2048`), and

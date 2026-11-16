@@ -2,123 +2,128 @@
 
 ## 1. Цель и контекст
 
-Адаптация CPU-путей движка **ninfer-v100** для процессоров архитектуры Intel Ivy Bridge-EP (без `AVX2` и `FMA3`) и аналогичных CPU с набором инструкций `AVX 1.0 + F16C + SSSE3 + SSE4.1` на стенде:
-- **CPU**: Intel Xeon E5-2650 v2 @ 2.60 GHz (1 сокет, 8 физических ядер / 16 потоков, L3 20 MiB; флаги `ssse3 sse4_1 sse4_2 avx f16c`, без `avx2` и `fma`)
+Адаптация и глубокая оптимизация CPU-путей движка **ninfer-v100** для процессоров без инструкций `AVX2` и `FMA3` (целевой стенд Intel Ivy Bridge-EP с `AVX 1.0 + F16C + SSSE3 + SSE4.1`):
+- **CPU**: Intel Xeon E5-2650 v2 @ 2.60 GHz (1 сокет, 8 физических ядер / 16 логических потоков, L3 20 MiB; флаги `ssse3 sse4_1 sse4_2 avx f16c`, без `avx2` и `fma`)
 - **RAM**: 31 GiB (физическая память хоста)
-- **GPU**: NVIDIA Tesla V100-PCIE-32GB (`sm_70`), CUDA 12.8
+- **GPU**: Tesla V100-PCIE-32GB (`sm_70`, PCIe 3.0 x16, CUDA 12.8; во время финального прогона тестов CPU/Vision GPU 1 была занята рабочим контейнером `coder390-llama-server` на 32,124 MiB из 32,768 MiB; GPU 0 — `GTX 1060 3GB`, не собирается под `sm_70`)
 
 Решаемые задачи:
-1. Устранить падение `SIGILL` при использовании `--expert-cpu-arithmetic ggml` на CPU без AVX2/FMA, дав явный выбор конфигурации при сборке (`NINFER_GGML_CPU_AVX2`) и безопасный runtime-отказ при несовместимом CPU.
-2. Обеспечить векторизованный `AVX 1.0 + F16C + SSSE3/SSE4.1` путь для точной CPU-арифметики GGUF-экспертов (`GgufCpuBackend::Avx`, побитово эквивалентный GPU и `Scalar`) и нативных MoE CPU-экспертов (`CpuExpertBackend::Avx`).
-3. Добавить `AVX 1.0` ядра для энкодера изображений Gemma 4 CPU Vision (`gemma4::cpu_vision::avx_kernels()`).
-4. Измерить реальный эффект на микробенчмарках и сквозном запуске на E5-2650 v2 + Tesla V100 и актуализировать документацию без неподтверждённых предположений.
+1. Устранить `SIGILL` при `--expert-cpu-arithmetic ggml` на CPU без `AVX2/FMA` через опцию CMake `NINFER_GGML_CPU_AVX2` (`ON` по умолчанию, `OFF` для `AVX 1.0 + F16C`) и раннюю проверку на старте (`Executor::Impl`).
+2. Реализовать быстрый `AVX 1.0 + F16C + SSSE3 + SSE4.1` путь для точной CPU-арифметики GGUF-экспертов (`GgufCpuBackend::Avx`, побитово эквивалентный GPU и `Scalar`), для режима `ggml` (`quantize_row_q8_K`, прямой `BF16 -> Q8`, батчевые `*_rows` кернелы), и для нативных MoE-экспертов (`CpuExpertBackend::Avx`).
+3. Оптимизировать многопоточный runtime CPU-миссов в `Qwen3.8-Flash-Next` (`src/models/qwen4_exp/expert_misses.cu`).
+4. Оптимизировать CPU-энкодеры зрения для **Gemma 4** и **Qwen3.5** на `AVX 1.0` (и `AVX2+FMA`).
+5. Исправить методику микробенчмарка `ninfer_gguf_expert_cpu_bench` (заменив создание/join `std::thread` на каждой итерации на постоянный spin-barrier пул) и обновить документацию строго по проверенным замерам.
 
 ---
 
-## 2. Реализованные изменения
+## 2. Реализованные изменения и оптимизации
 
 ### 2.1. Точная CPU-арифметика GGUF-экспертов (`GgufCpuBackend::Avx`)
-- [`src/ops/moe_experts/gguf_expert_cpu.h`](src/ops/moe_experts/gguf_expert_cpu.h), [`src/ops/moe_experts/gguf_expert_cpu.cpp`](src/ops/moe_experts/gguf_expert_cpu.cpp), [`src/ops/moe_experts/gguf_expert_cpu_avx.cpp`](src/ops/moe_experts/gguf_expert_cpu_avx.cpp):
-  - Добавлен бэкенд `GgufCpuBackend::Avx` (автовыбор при наличии `avx`, `f16c`, `ssse3`, `sse4_1` и ОС-поддержки `XCR0`, когда `AVX2` отсутствует); флаги `cpu_has_avx_f16c()` и `cpu_has_avx2()` кэшируются через `static const bool`.
-  - Явный запрос недоступного бэкенда (`Avx` или `Avx2`) через `gguf_cpu_rows()` и `gguf_cpu_swiglu_bf16()` проверяется в `resolve_backend()` и бросает `std::invalid_argument("GGUF CPU expert: unsupported CPU backend")` (без риска `SIGILL`), по аналогии с `moe_expert_cpu`.
-  - Целочисленные dot-product для форматов `Q2_0`, `Q8_0`, `IQ4_NL`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS` реализованы через 128-битные SSSE3/SSE4.1 примитивы (`_mm_maddubs_epi16`, `_mm_madd_epi16`, `_mm_shuffle_epi8`, `_mm_abs_epi8`, `_mm_sign_epi8`, `_mm_cvtepi8_epi16`) и пошаговое округление FMA/multiplication с директивой `-ffp-contract=off` на единицу трансляции.
-  - По замечаниям ревью PR #1 устранена программная эмуляция скалярного `std::fma` в `IQ2_S` (`halves == true`) и делегирование `swiglu_avx` в `swiglu_scalar`: в AVX 1.0 добавлены векторизованные регистровые эмуляторы `fma4` / `fma8` (на базе двойной точности `TwoSum` + round-to-odd по Болдо–Мелькионду), побитово эквивалентные IEEE-754 `std::fma`, а также полноценный `swiglu_avx` на `AVX 1.0 + SSE4.1` с единой `ops/common/silu.h`.
-- Проверка корректности (`ninfer_gguf_expert_cpu_test`, сборка `5e8a74dc`): [`tests/ops/test_gguf_expert_cpu.cpp`](tests/ops/test_gguf_expert_cpu.cpp) — побитовое совпадение `fma_avx` со `std::fma` на 1,020,493 тест-кейсах (краевые случаи ±0/±Inf/NaN/субнормалы/точное взаимное уничтожение, 4096×5 точек double-rounding midpoint, 1,000,003 случайных троек с нечётным хвостом), побитовое совпадение `avx` со `scalar` по всем форматам (`27`, `10`, `23`, `18`, `19`, `20`, `24`), промежуточным `BF16` словам (`avx middle: 100003 words equal`), проверка исключения `std::invalid_argument` для неподдерживаемого `Avx2` и совпадение с GPU в `ninfer_moe_experts_gguf_test`.
+[`src/ops/moe_experts/gguf_expert_cpu.h`](src/ops/moe_experts/gguf_expert_cpu.h), [`src/ops/moe_experts/gguf_expert_cpu.cpp`](src/ops/moe_experts/gguf_expert_cpu.cpp), [`src/ops/moe_experts/gguf_expert_cpu_avx.cpp`](src/ops/moe_experts/gguf_expert_cpu_avx.cpp):
+- **ISA и защита**: автовыбор `Avx` при наличии `avx`, `f16c`, `ssse3`, `sse4_1` и ОС-поддержки `XCR0`, явный отказ (`std::invalid_argument`) при запросе неподдерживаемого бэкенда.
+- **IEEE-754 побитовая точность (`-ffp-contract=off`)**:
+  - Векторные эмуляторы `fma4` / `fma8` в AVX 1.0 регистрах (Boldo–Melquiond `TwoSum` + round-to-odd) для `IQ2_S` (`halves == true`) и `swiglu_avx`.
+  - Векторизованный `prepare_bf16_avx`: за один проход проверяет конечность входных BF16-слов через битовую маску `(raw & 0x7F80) == 0x7F80` (не проглатывая `NaN`), находит максимум модуля по блокам 32/256, вычисляет масштаб `d` с аппаратным F16C `_mm_cvtps_ph` и округляет `round_ties_away` (`q + copysign(0.49999997F, q)` -> `_mm256_cvttps_epi32`) в int8-коды.
+  - Предвычисленная таблица `table_iq4_abs` (`iq4_values_and_abs`) убирает runtime `_mm_sign_epi8(v, v)` при вычислении `IQ4_NL` / `IQ4_XS`.
+  - Замена горизонтальных сумм `_mm_hadd_epi32` (12 инструкций суммарно с высоким латенси на Ivy Bridge) на схему `hsum4_epi32` (`unpacklo/hi` + `paddd`).
+  - Быстрый потоковый путь для `T == 1` в `iq_rows` и `block32_rows`: исключает 576-байтный буфер `Group` на стеке при одиночном декодировании, сохраняя побитовый порядок `butterfly8`.
+  - Векторизованная редукция dot-to-float в `q2_rows` и оптимизированный путь `live == 4` в `live_floats`.
+  - Быстрый не-Деккер `swiglu_fast_avx` / `gguf_cpu_swiglu_bf16_fast` для режима `--expert-cpu-arithmetic ggml` и раздельные потокобезопасные методы `prepare_bf16_start` / `prepare_bf16_token` / `copy_token_from`.
 
-### 2.2. Управление ISA и runtime-защита для `--expert-cpu-arithmetic ggml`
-- [`CMakeLists.txt`](CMakeLists.txt) и [`src/ops/basic_sources.cmake`](src/ops/basic_sources.cmake):
-  - Добавлена опция `NINFER_GGML_CPU_AVX2` (по умолчанию `ON`). При `ON` `third_party/ggml-quants/src/ggml-cpu/arch/x86/quants.c` компилируется с `-mavx2;-mfma;-mf16c` (добавлен `-mf16c` для согласования с проверками CPUID и MSVC `/arch:AVX2`), при `OFF` — с `-mavx;-mf16c` (под MSVC `/arch:AVX2` vs `/arch:AVX`), передавая `NINFER_GGML_CPU_REQUIRES_AVX2=1|0` в `gguf_expert_cpu_ggml.cpp`. *(Примечание: на стенде E5-2650 v2 без AVX2 флаг `-mf16c` в `AVX2`-ветке проверен сборкой, но runtime-выполнение `AVX2+FMA+F16C` на данном CPU физически не запускалось.)*
-- [`src/ops/moe_experts/gguf_expert_cpu_ggml.h`](src/ops/moe_experts/gguf_expert_cpu_ggml.h), [`src/ops/moe_experts/gguf_expert_cpu_ggml.cpp`](src/ops/moe_experts/gguf_expert_cpu_ggml.cpp), [`src/models/qwen4_exp/executor.cpp`](src/models/qwen4_exp/executor.cpp):
-  - В `gguf_ggml_cpu_available()` на `x86_64` дублирующийся разбор CPUID/XGETBV удалён и унифицирован через `gguf_cpu_backend_available(NINFER_GGML_CPU_REQUIRES_AVX2 ? GgufCpuBackend::Avx2 : GgufCpuBackend::Avx)` (`AVX2+FMA+F16C` vs `AVX+F16C+SSSE3+SSE4.1`).
-  - Вне `x86_64` сохраняется `return false;` с явным комментарием: вендоризована только директория `third_party/ggml-quants/src/ggml-cpu/arch/x86/quants.c`, а `arch-fallback.h` не мапит `ggml_vec_dot_*` на ARM (`__aarch64__`).
-  - Конструктор `Executor::Impl` проверяет `options.hybrid_experts.cpu_ggml && !ops::gguf_ggml_cpu_available()` на старте и завершается с понятным диагностическим сообщением (`--expert-cpu-arithmetic ggml: this build's ggml kernels need instructions which this CPU lacks; use exact or a build with NINFER_GGML_CPU_AVX2=OFF`) без `SIGILL`.
-  - В [`tests/ops/test_gguf_expert_cpu_ggml.cpp`](tests/ops/test_gguf_expert_cpu_ggml.cpp) при `!gguf_ggml_cpu_available()` тест завершается кодом возврата `77` (CTest `Skipped`).
+### 2.2. Кернелы `ggml` без AVX2 (`NINFER_GGML_CPU_AVX2=OFF`) и многотокенные матрицы
+[`CMakeLists.txt`](CMakeLists.txt), [`src/ops/basic_sources.cmake`](src/ops/basic_sources.cmake), [`third_party/ggml-quants/`](third_party/ggml-quants/), [`src/ops/moe_experts/gguf_expert_cpu_ggml.h`](src/ops/moe_experts/gguf_expert_cpu_ggml.h), [`src/ops/moe_experts/gguf_expert_cpu_ggml.cpp`](src/ops/moe_experts/gguf_expert_cpu_ggml.cpp), [`src/models/qwen4_exp/executor.cpp`](src/models/qwen4_exp/executor.cpp):
+- **Компиляция и runtime-проверка**: `NINFER_GGML_CPU_AVX2=ON` (по умолчанию) собирает `arch/x86/quants.c` с `-mavx2;-mfma;-mf16c` (`/arch:AVX2`), а `OFF` — с `-mavx;-mf16c` (`/arch:AVX`). `gguf_ggml_cpu_available()` проверяет требуемый набор ISA; `Executor::Impl` выдаёт диагностическую ошибку на старте без `SIGILL`, а `ninfer_gguf_expert_cpu_ggml_test` корректно пропускается (`77`, `Skipped`).
+- **Аппаратный F16C на запись, LUT на чтение (`simd-mappings.h`)**:
+  - Под `#elif defined(__F16C__)` активирован `GGML_CPU_FP32_TO_FP16` (`_cvtss_sh`).
+  - Для скалярного `GGML_CPU_FP16_TO_FP32` осознанно **сохранён** LUT `ggml_table_f32_f16` (256 KiB): A/B-эксперимент на E5-2650 v2 показал, что переключение скалярного `FP16->FP32` на `_cvtsh_ss` вызывает переходы GPR<->XMM в горячих циклах и даёт регрессию **10–21%** на `IQ4_NL` и `Q8_0` при `T=1`.
+- **AVX1/SSSE3/SSE4.1 `quantize_row_q8_K` и прямой `BF16 -> Q8`** (`quants.h`, `arch/x86/quants.c`, `gguf_expert_cpu_ggml.cpp`):
+  - На ветке AVX без AVX2 `quantize_row_q8_K` больше не падает на скалярный `_ref`: реализована векторизованная квантизация блоками по 256 (с `bsums[16]` на `_mm_madd_epi16`).
+  - Добавлены `ggml_quantize_bf16_q8_0` и `ggml_quantize_bf16_q8_K` с прямым AVX-распаковыванием BF16 -> FP32 и квантованием без промежуточного буфера `scratch_`.
+- **Батчевые многотокенные матричные кернелы `*_rows`**:
+  - Для `iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_xs` (`q8_K`, группы до `tc = 8` токенов на одну распаковку субблока весов) и `iq4_nl`, `q8_0` (`q8_0`, 2-блочные `__m256` с `tc = 4/2` и делегированием `rem == 1` обратно в однотокенный `ggml_vec_dot_*` без потерь на `T=1`).
 
-### 2.3. Нативные MoE CPU-эксперты (`CpuExpertBackend::Avx`)
-- [`include/ninfer/ops/moe_expert_cpu.h`](include/ninfer/ops/moe_expert_cpu.h), [`src/ops/moe_experts/cpu_projection.h`](src/ops/moe_experts/cpu_projection.h), [`src/ops/moe_experts/moe_expert_cpu.cpp`](src/ops/moe_experts/moe_expert_cpu.cpp), [`src/ops/moe_experts/moe_expert_cpu_avx.cpp`](src/ops/moe_experts/moe_expert_cpu_avx.cpp):
-  - Добавлен `CpuExpertBackend::Avx` (`project_avx` / `AvxDot`) с проверкой AVX+F16C+SSSE3+SSE4.1 и XCR0 через CPUID.
-  - Для `int8` активаций применяется сдвоенный 128-битный `_mm_maddubs_epi16` / `_mm_madd_epi16`; для FP32-активаций — распаковка `_mm_cvtepi8_epi32` + `_mm256_mul_ps`/`_mm256_add_ps`.
-  - Добавлен в цикл проверки против FP64-оракула в [`tests/ops/test_moe_expert_cpu.cpp`](tests/ops/test_moe_expert_cpu.cpp).
+### 2.3. Многопоточное исполнение промахов кэша в Flash-Next (`expert_misses.cu`)
+[`src/models/qwen4_exp/expert_misses.cu`](src/models/qwen4_exp/expert_misses.cu):
+- Привязка потоков `SpinPool` (worker threads и service thread) к **различным физическим ядрам** Linux (`physical_cpus()` через sysfs `thread_siblings_list`) при `phys.size() >= threads`, устраняя конкуренцию SMT-собратьев.
+- Дедупликация и распараллеливание входного BF16-квантования по токенам (`prepare_bf16_start` / `prepare_bf16_token` через `pool->run`), исключение копирования буферов активации (`job.use_shared_input`), совместное переиспользование квантованного входа между `gate` и `up` при совпадающем точном формате/раскладке (`same_up_act`), а также параллельное вычисление `SwiGLU` + промежуточного квантования (`middle.prepare_bf16_token`, с `gguf_cpu_swiglu_bf16_fast` при `--expert-cpu-arithmetic ggml`).
 
-### 2.4. Gemma 4 CPU Vision (`gemma4::cpu_vision::avx_kernels`)
-- [`src/models/gemma4/vision_cpu_kernels.h`](src/models/gemma4/vision_cpu_kernels.h), [`src/models/gemma4/vision_cpu_kernels.cpp`](src/models/gemma4/vision_cpu_kernels.cpp), [`src/models/gemma4/vision_cpu_kernels_avx.cpp`](src/models/gemma4/vision_cpu_kernels_avx.cpp), [`src/models/gemma4/sources.cmake`](src/models/gemma4/sources.cmake):
-  - Реализованы ядра `gemm`, `softmax`, `geglu` на 256-битном AVX 1.0 без инструкций FMA и добавлен runtime-диспатч `avx2_supported() -> avx_supported() -> portable_kernels()`.
-  - Протестировано в [`tests/models/gemma4/test_vision_cpu_kernels.cpp`](tests/models/gemma4/test_vision_cpu_kernels.cpp) (`selected kernels: avx`).
+### 2.4. Нативные MoE CPU-эксперты (`CpuExpertBackend::Avx`)
+[`src/ops/moe_experts/cpu_projection.h`](src/ops/moe_experts/cpu_projection.h), [`src/ops/moe_experts/moe_expert_cpu.cpp`](src/ops/moe_experts/moe_expert_cpu.cpp), [`src/ops/moe_experts/moe_expert_cpu_avx.cpp`](src/ops/moe_experts/moe_expert_cpu_avx.cpp):
+- Полностью переписан `moe_expert_cpu_avx.cpp`:
+  - Векторные SIMD-декодеры в регистрах для `Q2_G64_FP16`, `Q4_G64_FP16`, `Q5_G64_FP16`, `Q6_G64_FP16` (группы по 64 элемента без буфера `codes[32]` на стеке), `Q8_G32_FP16` и `BF16` с поддержкой обеих раскладок (`RowSplit` и `RowSplitPanel`), режимов `a8=true` (SSSE3 `maddubs`) и `a8=false` (FP32) и переиспользованием весов по чанкам до 16 токенов при `T > 1`.
+  - `prepare_input_avx`: слитный проход BF16 -> FP32, проверка конечности `(raw & 0x7F80) == 0x7F80` и квантование `a8` (`_mm256_cvtps_epi32` + `_mm_packs_epi32/16`).
+  - `swiglu_quantize_avx`: векторный `exp256_ps` + `SiLU * up` на `__m256` со слитной проверкой конечности и `a8`-квантованием.
 
-### 2.5. Бенчмарки и документация
-- [`bench/ops/gguf_expert_cpu_bench.cpp`](bench/ops/gguf_expert_cpu_bench.cpp) + [`bench/ops/benchmarks.cmake`](bench/ops/benchmarks.cmake): постоянный микробенчмарк для сравнения `Scalar` / `Avx` / `Avx2` / `ggml` и SwiGLU на формах Flash-Next (`640x2560`, `2560x640`).
-- Обновлены [`docs/build-linux.md`](docs/build-linux.md), [`docs/maintainer/build-system.md`](docs/maintainer/build-system.md), [`docs/cli.md`](docs/cli.md), [`docs/serving.md`](docs/serving.md), [`docs/qwen3-8-flash-next.md`](docs/qwen3-8-flash-next.md), [`docs/gemma4.md`](docs/gemma4.md), [`docs/performance.md`](docs/performance.md).
+### 2.5. Энкодеры зрения на CPU (Gemma 4 и Qwen3.5)
+- **Gemma 4 CPU Vision** ([`src/models/gemma4/vision_cpu_kernels.h`](src/models/gemma4/vision_cpu_kernels.h), [`vision_cpu_kernels.cpp`](src/models/gemma4/vision_cpu_kernels.cpp), [`vision_cpu_kernels_avx.cpp`](src/models/gemma4/vision_cpu_kernels_avx.cpp), [`vision_cpu_kernels_avx2.cpp`](src/models/gemma4/vision_cpu_kernels_avx2.cpp), [`vision_cpu.cpp`](src/models/gemma4/vision_cpu.cpp)):
+  - AVX 1.0 микроядро `gemm` расширено с `4×16` до **`6×16`** (`12` YMM-аккумуляторов в 15 регистрах без спиллов) с 64-байтным выравниванием `panel` и бесхвостовыми `4×16`/`2×16`/`1×16` остатками; в `linear()` упаковка `x` (`pack_panel`) вынесена из рабочих потоков и параллельно выполняется 1 раз по панелям, а строки `W` распределяются тайлами кратно `12` (`LCM(4, 6)` -> без частичных тайлов ни на AVX 1.0, ни на AVX2).
+  - Векторизованы `rms_accum_sq` (в точном FP64 через `_mm256_cvtps_pd`), `scale_mul_row` и `add_scaled_row`.
+- **Qwen3.5 CPU Vision** ([`src/models/qwen3_5/execution/vision_cpu_kernels.h`](src/models/qwen3_5/execution/vision_cpu_kernels.h), [`vision_cpu_kernels.cpp`](src/models/qwen3_5/execution/vision_cpu_kernels.cpp), [`vision_cpu_kernels_x86.inl`](src/models/qwen3_5/execution/vision_cpu_kernels_x86.inl), [`vision_cpu_kernels_avx.cpp`](src/models/qwen3_5/execution/vision_cpu_kernels_avx.cpp), [`vision_cpu_kernels_avx2.cpp`](src/models/qwen3_5/execution/vision_cpu_kernels_avx2.cpp), [`vision_cpu.cpp`](src/models/qwen3_5/execution/vision_cpu.cpp), [`execution_sources.cmake`](src/models/qwen3_5/execution_sources.cmake)):
+  - Векторизованы с нуля на `AVX 1.0` и `AVX2+FMA` (через общий шаблонный `.inl` с `-ffp-contract=off`): `pack_panel`, `gemm_packed_bias` (`6×16`), `layer_norm_cols`, `add_into`, `gelu_tanh`, `rope_pair`, и 3-проходный `segment_attention_block` (`4×16` QK^T в регистрах + `exp_nonpositive` softmax + PV).
+  - Границы параллельных срезов в 1D-проходах выровнены по 8 элементов, сохраняя строгий контракт **побитовой детерминированности `single == parallel`** при любом числе потоков.
 
 ---
 
-## 3. Результаты замеров и верификации на `192.168.50.38`
+## 3. Проверенные замеры на `192.168.50.38` (Intel Xeon E5-2650 v2)
 
-### 3.1. Микробенчмарк GGUF CPU-экспертов (`ninfer_gguf_expert_cpu_bench`, сборка `5e8a74dc`, `NINFER_GGML_CPU_AVX2=OFF`, `iters=15`)
-Сравнение медианного времени одного матричного умножения (`T` токенов, `thr` потоков; формы `640x2560` и `2560x640`):
+### 3.1. Исправление бенчмарка `ninfer_gguf_expert_cpu_bench` (`PersistentPool`)
+В [`bench/ops/gguf_expert_cpu_bench.cpp`](bench/ops/gguf_expert_cpu_bench.cpp) создание `std::thread` на каждую итерацию (~`0.3–0.5 мс` оверхеда ОС, искажавшего `thr=6` vs `thr=8`) заменено на постоянный пул с spin-barrier на `_mm_pause()`. В чистых замерах с `PersistentPool` **`thr=8` (8 физических ядер) быстрее `thr=6` на большинстве форматов** (например, на `IQ3_S T=1`: `0.0696`/`0.0743 ms` против `0.0861`/`0.0986 ms`), тогда как автоматическое значение по умолчанию в движке (`6 = логические/2 - 2`) остаётся консервативным выбором для совместной работы с GPU-потоками serving.
 
-| Формат | Форма | `T` | `thr` | `scalar`, мс | `avx`, мс (ускор.) | `ggml` (без AVX2), мс (ускор.) |
+### 3.2. GGUF CPU-эксперты: `PersistentPool` до vs после (`ninfer_gguf_expert_cpu_bench`, `NINFER_GGML_CPU_AVX2=OFF`, `iters=15`)
+Сравнение медианного времени одного матричного умножения (база `c3a42018` перемеряна с `PersistentPool` до изменений кернелов vs финальная сборка):
+
+| Формат | Форма | `T` | `thr` | `avx` (база -> финал) | `ggml` без AVX2 (база -> финал) | Ускор. к `scalar` (финал) |
 |---|---|---:|---:|---:|---:|---:|
-| `IQ3_S` | `640x2560` | 1 | 1 | 6.9996 | 0.5024 (`13.93x`) | **0.3916 (`17.87x`)** |
-| `IQ3_S` | `640x2560` | 1 | 6 | 1.5908 | 0.3430 (`4.64x`) | **0.3260 (`4.88x`)** |
-| `IQ3_S` | `640x2560` | 1 | 8 | 1.4583 | 0.5921 (`2.46x`) | **0.5786 (`2.52x`)** |
-| `IQ3_S` | `640x2560` | 4 | 6 | 3.3353 | **0.5019 (`6.64x`)** | 0.6443 (`5.18x`) |
-| `IQ3_S` | `640x2560` | 4 | 8 | 2.8308 | **0.6482 (`4.37x`)** | 0.7693 (`3.68x`) |
-| `IQ3_S` | `640x2560` | 8 | 6 | 5.3226 | **0.5904 (`9.02x`)** | 0.9773 (`5.45x`) |
-| `IQ3_S` | `640x2560` | 8 | 8 | 4.3504 | **0.7253 (`6.00x`)** | 1.0325 (`4.21x`) |
-| `IQ4_NL` | `640x2560` | 1 | 6 | 1.0734 | 0.3514 (`3.06x`) | **0.3271 (`3.28x`)** |
-| `IQ4_NL` | `640x2560` | 8 | 6 | 4.5138 | **0.5413 (`8.34x`)** | 0.5693 (`7.93x`) |
-| `IQ2_S` | `640x2560` | 1 | 1 | 10.2726 | 0.6721 (`15.28x`) | **0.3892 (`26.40x`)** |
-| `IQ2_S` | `640x2560` | 1 | 6 | 2.0036 | 0.3982 (`5.03x`) | **0.3585 (`5.59x`)** |
-| `IQ2_S` | `640x2560` | 4 | 6 | 5.6109 | **0.5664 (`9.91x`)** | 0.5793 (`9.69x`) |
-| `IQ2_S` | `640x2560` | 8 | 1 | 60.0830 | **2.7491 (`21.86x`)** | 3.1426 (`19.12x`) |
-| `IQ2_S` | `640x2560` | 8 | 6 | 10.3203 | **0.7573 (`13.63x`)** | 0.8325 (`12.40x`) |
-| `Q2_0` | `640x2560` | 1 | 6 | 1.7573 | **0.3454 (`5.09x`)** | — (покрыт `avx`) |
-| `Q2_0` | `640x2560` | 8 | 6 | 6.1604 | **0.5682 (`10.84x`)** | — (покрыт `avx`) |
-| `Q8_0` | `2560x640` | 8 | 6 | 4.5123 | 0.5934 (`7.60x`) | **0.5608 (`8.05x`)** |
-| `SwiGLU` | `n=5120` | — | — | 3.3362 | **0.1259 (`26.51x`)** | — |
+| `IQ3_S` | `640x2560` | 1 | 1 | `0.5547 -> 0.5754 ms` | `0.4340 -> 0.5039 ms` | `19.75x` / `22.56x` |
+| `IQ3_S` | `640x2560` | 1 | 8 | `0.0730 -> 0.0743 ms` | `0.0591 -> 0.0696 ms` | `15.38x` / `16.41x` |
+| `IQ3_S` | `640x2560` | 8 | 1 | `1.4821 -> 1.3649 ms` | `3.5969 -> 1.1047 ms` (**3.26x**) | `19.26x` / **`23.80x`** |
+| `IQ3_S` | `640x2560` | 8 | 8 | `0.2743 -> 0.1760 ms` (**1.56x**) | `0.4538 -> 0.1547 ms` (**2.93x**) | `18.68x` / **`21.25x`** |
+| `IQ4_NL` | `640x2560` | 1 | 1 | `0.3144 -> 0.2172 ms` (**1.45x**) | `0.1943 -> 0.1926 ms` | `18.43x` / `20.79x` |
+| `IQ4_NL` | `640x2560` | 1 | 8 | `0.0407 -> 0.0288 ms` (**1.41x**) | `— -> 0.0339 ms` | **`17.40x`** / `14.79x` |
+| `IQ4_NL` | `640x2560` | 8 | 1 | `1.2112 -> 1.0915 ms` | `1.5869 -> 1.1897 ms` (**1.33x**) | **`20.20x`** / `18.53x` |
+| `IQ4_NL` | `640x2560` | 8 | 8 | `0.1819 -> 0.1462 ms` (**1.24x**) | `— -> 0.1576 ms` | **`18.91x`** / `17.53x` |
+| `Q8_0` | `640x2560` | 1 | 1 | `0.2907 -> 0.1787 ms` (**1.63x**) | `0.1680 ms` | `17.34x` / `18.45x` |
+| `Q8_0` | `640x2560` | 1 | 8 | `0.0240 ms` | `0.0316 ms` | **`16.21x`** / `12.30x` |
+| `Q8_0` | `2560x640` | 1 | 1 | `0.3901 -> 0.2190 ms` (**1.78x**) | `0.1755 -> 0.1706 ms` | `14.42x` / `18.51x` |
+| `IQ2_S` | `640x2560` | 1 | 1 | `0.5720 -> 0.4681 ms` (**1.22x**) | `0.3342 ms` | `19.13x` / `26.80x` |
+| `IQ2_S` | `640x2560` | 8 | 1 | `2.3687 -> 2.1237 ms` | `2.7238 -> 1.0190 ms` (**2.67x**) | `24.20x` / **`50.43x`** |
+| `IQ2_S` | `640x2560` | 8 | 8 | `0.2843 ms` | `0.3600 -> 0.1448 ms` (**2.49x**) | `22.79x` / **`44.74x`** |
+| `Q2_0` | `640x2560` | 1 | 8 | `0.0357 ms` | — | `26.71x` |
+| `SwiGLU` | `n=5120` | — | — | `0.1067 -> 0.0963 ms` | — | **`32.45x`** |
 
-Наблюдения по GGUF-микробенчмарку (`5e8a74dc` vs база `e2dc1705`):
-- **Эффект векторизованного `fma8` в `IQ2_S`**: до оптимизации (на сборке `e2dc1705` со скалярным `std::fma`) `IQ2_S avx` давал `1.0806 ms` (`1.89x`) при `T=1, thr=6` и `5.9582 ms` (`1.71x`) при `T=8, thr=6`. После замены на регистровый `fma8` время сократилось до `0.3982 ms` (`5.03x`) и `0.7573 ms` (`13.63x`), и на `T=4`/`T=8` точный путь `avx` **вышел вперёд и относительно `ggml`** (`0.5664` vs `0.5793 ms` на `T=4`; `0.7573` vs `0.8325 ms` на `T=8`; `2.7491` vs `3.1426 ms` однопоточно при `T=8`).
-- **Эффект векторизованного `swiglu_avx`**: вместо делегирования в `swiglu_scalar` (`3.2291 -> 3.2272 ms`, `1.00x` на `e2dc1705`) достигнуто `3.3362 -> 0.1259 ms` (**`26.51x`**).
-- На `T=1` быстрее всех по-прежнему путь `ggml` (`-DNINFER_GGML_CPU_AVX2=OFF`); на `T=4` и `T=8` точный путь `avx` опережает и `scalar`, и `ggml` на `IQ3_S`, `IQ4_NL` (`T=8`) и `IQ2_S`.
-- **`thr=6` (текущее значение `auto`: `16 / 2 - 2 = 6`) во всех без исключения замерах быстрее `thr=8`**, поэтому рекомендация `--expert-cpu-threads 8` не возвращается.
+### 3.3. Квантование входа (`prepare_bf16`), Native MoE CPU (`moe_expert_cpu`) и CPU Vision (`/tmp/baseline_eval`)
+| Компонент / Кейс | До оптимизации (база) | После оптимизации (финал) | Ускорение |
+|---|---|---|---|
+| `prepare_bf16` (`k=2560, T=1`): `exact_iq3/4` | `0.0163 ms` | `0.0045 ms` | **`3.62x`** (в пике до `0.0032 ms` / `5.1x`) |
+| `prepare_bf16` (`k=2560, T=8`): `exact_iq3/4` | `0.1250 ms` | `0.0256 ms` | **`4.88x`** |
+| `prepare_bf16` (`k=2560, T=1`): `ggml_q8k` / `ggml_q80` | `0.0068` / `0.0148 ms` | `0.0031` / `0.0029 ms` | **`2.19x`** / **`5.10x`** |
+| `prepare_bf16` (`k=2560, T=8`): `ggml_q8k` / `ggml_q80` | `0.0478` / `0.1159 ms` | `0.0152` / `0.0136 ms` | **`3.14x`** / **`8.52x`** |
+| `moe_expert_cpu` (`Q4_G64, a8=1, T=1`, `Avx`) | `9.3887 ms` (`0.96x` к scalar) | `0.7026 ms` (`13.06x` к scalar) | **`13.36x` (vs старый AVX)** |
+| `moe_expert_cpu` (`Q2_G64, a8=1, T=1`, `Avx`) | `7.8638 ms` (`1.02x` к scalar) | `0.7065 ms` (`11.38x` к scalar) | **`11.13x` (vs старый AVX)** |
+| `moe_expert_cpu` (`Q8_G32, a8=1, T=1`, `Avx`) | `1.2701 ms` (`1.47x` к scalar) | `0.5740 ms` (`3.25x` к scalar) | **`2.21x` (vs старый AVX)** |
+| `moe_expert_cpu` (`Q4_G64, a8=0, T=1`, `Avx`) | не векторизован в декоде (`~9 ms`) | `1.2387 ms` (`10.07x` к scalar) | **`~7.3x`** |
+| `Gemma 4 Vision`: `gemm 1152x1152x256` (`avx` `4x16 -> 6x16`) | `19.2894 ms` | `17.5564 ms` (`16.26x` к portable) | `+9.9%` (~40 GFLOPS, ~96% пика Ivy Bridge) |
+| `Gemma 4 Vision`: `gemm 4320x1152x256` (`avx` `4x16 -> 6x16`) | `76.3242 ms` | `67.5055 ms` (`15.91x` к portable) | `+13.1%` |
+| `Qwen3.5 Vision CPU` (`2L, 256 patches`, `thr=1`) | `4100.9523 ms` (scalar) | `606.8229 ms` (AVX 1.0) | **`6.76x`** |
+| `Qwen3.5 Vision CPU` (`2L, 256 patches`, `thr=6`) | `273.9930 ms` (scalar) | `122.4711 ms` (AVX 1.0) | **`2.24x`** |
+| `Qwen3.5 Vision CPU` (`2L, 256 patches`, `thr=8`) | `242.6221 ms` (scalar) | `94.4602 ms` (AVX 1.0) | **`2.57x`** |
 
-### 3.2. Оценка целесообразности Native MoE CPU (`CpuExpertBackend::Avx`) и Gemma 4 CPU Vision AVX (порог >= 10%)
-По замерам временного оценочного бенчмарка `ninfer_cpu_avx_eval_bench` (сборка `e2dc1705`, затем удалённого из дерева):
-- **Native MoE (`CpuExpertBackend::Avx` vs `Scalar`)**:
-  - `Q4_A16`: `T=1` `12.7167 -> 9.6003 ms (1.32x)`, `T=8` `46.0972 -> 14.9393 ms (3.09x)`
-  - `Q8_A8`: `T=1` `2.1641 -> 1.5363 ms (1.41x)`, `T=8` `10.3112 -> 6.0471 ms (1.71x)`
-  - `Q4_A8`: `T=1` `10.5246 -> 10.0060 ms (1.05x)`, `T=8` `17.3785 -> 13.3138 ms (1.31x)`
-  - `Q2_A8`: `T=1` `10.5698 -> 10.2961 ms (1.03x)`, `T=8` `20.4506 -> 15.8937 ms (1.29x)`
-  - `Q5_A8`: `T=1` `19.4506 -> 19.0894 ms (1.02x)`, `T=8` `26.6194 -> 22.9701 ms (1.16x)`
-  - `BF16`: `T=1` `13.0633 -> 13.2209 ms (0.99x)`, `T=8` `38.0693 -> 38.5332 ms (0.99x)` (ускорения нет)
-  -> Все квантованные форматы дают ускорение **от 16% до 209%** при `T=8` (`Q4_A16` и `Q8_A8` — `+32%`/`+41%` уже на `T=1`), что превышает порог `10%`. Реализация оставлена.
-- **Gemma 4 CPU Vision (`avx_kernels` vs `portable_kernels`)**:
-  - `gemm 72x2340x128`: `18.2645 -> 1.4412 ms (12.67x)`
-  - `gemm 1152x1152x128`: `142.3476 -> 10.2733 ms (13.86x)`
-  - `gemm 4608x1152x64`: `285.0626 -> 20.2626 ms (14.07x)`
-  - `softmax 256x256`: `0.4058 -> 0.1163 ms (3.49x)`
-  - `geglu n=294912`: `8.7504 -> 0.6550 ms (13.36x)`
-  -> Ускорение **3.49x–14.07x**. Реализация оставлена.
-
-### 3.3. Сквозной бенчмарк `ninfer_bench` и Docker-сервер `ninfer-serve`
-Условия стенда: `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (58.24 GB / 54.2 GiB) + companion `Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer` (28.91 GB), `--kv-dtype rk4v4 --expert-residency disk --expert-cache-mib 18432 --prefill-chunk 2048`, `Tesla V100-PCIE-32GB`, сборка `e2dc1705` (`NINFER_GGML_CPU_AVX2=OFF`):
-- **Ограничение стенда**: на хосте доступно 31 GiB физической RAM, поэтому режим `--expert-residency host` (требующий размещения 54.2 GiB в pinned RAM) и гибридное CPU+GPU исполнение на полной модели Flash-Next IQ3_S в этом окружении **не запускались** (`disk` residency выполняет экспертов на GPU через `ExpertStream`). Гибридный путь CPU+GPU верифицирован тестами `ninfer_qwen4_exp_hybrid_experts_test` и `ninfer_moe_experts_gguf_test`.
-- **Сквозной `ninfer_bench`** (`warmup=1`, `repetitions=3`, корпус `bench/fixtures/bench_corpus.ids`, сборка `e2dc1705` до векторизации FMA8/SwiGLU):
-  - Без `--spec` (`max_context=2048`, `cuda_graph`): `pp512 = 53.11 ± 0.35 tok/s`, `pp2048 = 118.74 ± 0.19 tok/s`, `tg128 = 19.89 ± 1.55 tok/s`.
-  - С `--spec mtp --draft-tokens 3` (`max_context=518`, `mtp_cuda_graph`): `pp512 = 60.62 ± 0.22 tok/s`, `tg128 = 11.32 ± 0.64 tok/s` (`spec acc = 0.5674`, `141/3` раундов; на холодном прогоне при 31 GiB RAM 3-токенная верификация вызывает больше чтений недостающих экспертов с диска).
-- **Docker-образ (`ninfer-v100:e5-2650v2-avx`)**:
-  - На ревизии `5e8a74dc` образ пересобран и проверен командой `ninfer-serve --version` -> `ninfer-serve 1.7.2+5e8a74dc`. Живой запрос `/v1/chat/completions` (`test_request.py`, порт `8087`) выполнялся ранее на образе `54457d2c` (`predicted_n=20`, `draft_n=18`, `draft_n_accepted=12`, `predicted_per_second=9.19`) и после обновления до `5e8a74dc` повторно не прогонялся.
-
-### 3.4. Тесты (`ctest`, ревизия `5e8a74dc`, E5-2650 v2 + Tesla V100)
-1. **Конфигурация `build-avx` (`-DNINFER_GGML_CPU_AVX2=OFF -DCMAKE_CUDA_ARCHITECTURES=70`)**:
-   - `-R _expert`: **13/13 Passed** (`ninfer_expert_delivery_test`, `ninfer_qwen_native_expert_layout_test`, `ninfer_qwen4_exp_expert_cache_test`, `ninfer_qwen4_exp_expert_profile_test`, `ninfer_qwen4_exp_hybrid_experts_test`, `ninfer_qwen4_exp_expert_cache_visibility_test`, `ninfer_qwen4_exp_expert_stream_test`, `ninfer_moe_experts_test`, `ninfer_moe_experts_gguf_test`, `ninfer_moe_experts_native_test`, `ninfer_moe_expert_cpu_test`, `ninfer_gguf_expert_cpu_test`, `ninfer_gguf_expert_cpu_ggml_test`).
-   - `-R vision_cpu`: **2 Passed, 1 Skipped** (`ninfer_qwen3_5_vision_cpu_real_test` пропущен без real fixture).
-   - *(Примечание: расширенный фильтр `-R qwen4_exp` прогонялся на `54457d2c`: 10 Passed, 5 Skipped, 1 Failed у Python-теста `ninfer_qwen4_exp_ngram_writer_interop_test` из-за отсутствия `pytest` в контейнере.)*
-2. **Конфигурация `build-avx2` (`-DNINFER_GGML_CPU_AVX2=ON -DCMAKE_CUDA_ARCHITECTURES=70`)**:
-   - `-R _expert`: **12 Passed, 1 Skipped** (`ninfer_gguf_expert_cpu_ggml_test` корректно завершился кодом `77`), **0 Failed**.
-   - `-R vision_cpu`: **2 Passed, 1 Skipped**, **0 Failed**.
-   - Проверка старта CLI `ninfer` с `--expert-cpu-arithmetic ggml` на `build-avx2` (`5e8a74dc`): чистый отказ с ненулевым кодом и сообщением `error: --expert-cpu-arithmetic ggml: this build's ggml kernels need instructions which this CPU lacks; use exact or a build with NINFER_GGML_CPU_AVX2=OFF` без `SIGILL`.
+### 3.4. Тесты и сборки на `192.168.50.38` (финальная ревизия)
+1. **`build-avx` (`-DNINFER_GGML_CPU_AVX2=OFF -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release`)**:
+   - Сборка `ninfer_tests`, `ninfer_benches` и `expert_misses.cu` — без ошибок.
+   - `ctest -R 'gguf_expert_cpu|moe_expert_cpu|vision_cpu|qwen4_exp_config'`: **6/7 Passed, 1 Skipped** (`ninfer_qwen3_5_vision_cpu_real_test` пропущен без real-модели), **0 Failed**:
+     - `ninfer_qwen3_5_vision_cpu_test` (0.15s) — проверка побитового равенства `single == parallel` и точности против FP64-оракула
+     - `ninfer_qwen4_exp_config_test` (0.11s)
+     - `ninfer_gemma4_vision_cpu_kernels_test` (0.29s) — включая тесты `gemm_packed`, `rms_accum_sq`, `scale_mul_row`, `add_scaled_row`
+     - `ninfer_moe_expert_cpu_test` (2.70s) — все форматы Q2/Q4/Q5/Q6/Q8/BF16, `a8=false/true`, `RowSplit/RowSplitPanel`, отмена/восстановление и сравнение с FP64
+     - `ninfer_gguf_expert_cpu_test` (4.81s) — побитовое совпадение `Avx` и `Scalar` (включая `prepare_bf16` и `swiglu`)
+     - `ninfer_gguf_expert_cpu_ggml_test` (1.14s) — проверка квантования и батчевых `ggml` кернелов против FP64-оракула
+2. **`build-avx2` (`-DNINFER_GGML_CPU_AVX2=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release`)**:
+   - Полная компиляция и линковка `ninfer_tests` (включая `arch/x86/quants.c` AVX2-веток, `gemma4`, `qwen3_5` AVX2 и `expert_misses.cu`) — без ошибок.
+   - `ctest -R 'gguf_expert_cpu|moe_expert_cpu|vision_cpu|qwen4_exp_config'`: **5/7 Passed, 2 Skipped** (`ninfer_qwen3_5_vision_cpu_real_test` и `ninfer_gguf_expert_cpu_ggml_test` корректно пропущен на AVX-only хосте с кодом `77`), **0 Failed**.
+3. **Ограничения финальной верификации на стенде**:
+   - Код `AVX2=ON` (`vision_cpu_kernels_avx2` в `qwen3_5`/`gemma4` и `#else`-ветки в `arch/x86/quants.c`) проверен компиляцией в `build-avx2`, но физически на AVX2-процессоре не запускался (CPU стенда не имеет AVX2/FMA).
+   - Сквозной прогон `Flash-Next` с GPU+CPU (`expert_misses.cu`, `ninfer_expert_delivery_test`, `ninfer_qwen4_exp_*`) в финальной итерации на `192.168.50.38` не выполнялся из-за ограничения 31 GiB host RAM и занятости `GPU 1` (`coder390-llama-server`: 32,124 / 32,768 MiB VRAM); `expert_misses.cu` проверен компиляцией CUDA 12.8 `sm_70`.
 
 ---
 
