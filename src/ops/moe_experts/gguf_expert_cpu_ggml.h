@@ -31,6 +31,10 @@ public:
     // Quantizes `tokens` BF16 columns, `stride` values apart, into the given layout.
     void prepare_bf16(GgmlActLayout layout, const std::uint16_t* values, std::size_t stride,
                       int tokens);
+    // Split preparation for parallel/deduplicated callers across disjoint token indices.
+    void prepare_bf16_start(GgmlActLayout layout, int tokens);
+    void prepare_bf16_token(int token, const std::uint16_t* values);
+    void copy_token_from(int dst_token, const GgmlCpuActivation& src, int src_token);
 
     [[nodiscard]] int tokens() const noexcept { return tokens_; }
     [[nodiscard]] int k() const noexcept { return k_; }

@@ -1,4 +1,8 @@
 // Microbenchmark for host GGUF MoE CPU experts (gguf_expert_cpu and gguf_expert_cpu_ggml)
+// across Flash-Next projection shapes, token counts (T=1,4,8), and persistent worker threads.
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 // across Flash-Next projection shapes, token counts (T=1,4,8), and worker thread counts.
 
 #include "core/weight.h"
@@ -6,10 +10,12 @@
 #include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -87,47 +93,98 @@ double measure_median_ms(Fn&& fn, int warmup, int iters) {
     return samples[samples.size() / 2];
 }
 
-void run_parallel_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, float* y, int threads,
-                       GgufCpuBackend backend) {
+class PersistentPool {
+public:
+    explicit PersistentPool(int max_threads) {
+        threads_.reserve(std::max(0, max_threads - 1));
+        for (int tid = 1; tid < max_threads; ++tid) {
+            threads_.emplace_back([this, tid] {
+                std::uint64_t seen = 0;
+                while (true) {
+                    std::uint64_t next = gen_.load(std::memory_order_acquire);
+                    while (next == seen) {
+#if defined(__x86_64__) || defined(_M_X64)
+                        _mm_pause();
+#else
+                        std::this_thread::yield();
+#endif
+                        next = gen_.load(std::memory_order_acquire);
+                    }
+                    seen = next;
+                    if (stop_.load(std::memory_order_relaxed)) { return; }
+                    if (tid < active_threads_) { (*task_)(tid); }
+                    done_.fetch_add(1, std::memory_order_release);
+                }
+            });
+        }
+    }
+
+    ~PersistentPool() {
+        stop_.store(true, std::memory_order_relaxed);
+        active_threads_ = 0;
+        gen_.fetch_add(1, std::memory_order_release);
+        for (auto& t : threads_) { t.join(); }
+    }
+
+    template <class Fn>
+    void run(int threads, Fn&& fn) {
+        if (threads <= 1) {
+            fn(0);
+            return;
+        }
+        std::function<void(int)> job = [&](int tid) { fn(tid); };
+        task_ = &job;
+        active_threads_ = threads;
+        done_.store(0, std::memory_order_relaxed);
+        gen_.fetch_add(1, std::memory_order_release);
+        fn(0);
+        while (done_.load(std::memory_order_acquire) < static_cast<int>(threads_.size())) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        task_ = nullptr;
+    }
+
+private:
+    std::vector<std::thread> threads_;
+    std::atomic<std::uint64_t> gen_{0};
+    std::atomic<int> done_{0};
+    std::atomic<bool> stop_{false};
+    int active_threads_ = 1;
+    std::function<void(int)>* task_ = nullptr;
+};
+
+void run_parallel_rows(PersistentPool& pool, const GgufCpuMatrix& w, const GgufCpuActivation& x,
+                       float* y, int threads, GgufCpuBackend backend) {
     if (threads <= 1) {
         gguf_cpu_rows(w, x, 0, w.rows, y, std::size_t(w.rows), backend);
         return;
     }
-    std::vector<std::thread> workers;
-    workers.reserve(threads - 1);
     const int chunk = (w.rows + threads - 1) / threads;
-    for (int t = 1; t < threads; ++t) {
-        const int begin = t * chunk;
+    pool.run(threads, [&](int tid) {
+        const int begin = tid * chunk;
         const int end = std::min(w.rows, begin + chunk);
         if (begin < end) {
-            workers.emplace_back([&, begin, end] {
-                gguf_cpu_rows(w, x, begin, end, y, std::size_t(w.rows), backend);
-            });
+            gguf_cpu_rows(w, x, begin, end, y, std::size_t(w.rows), backend);
         }
-    }
-    gguf_cpu_rows(w, x, 0, std::min(w.rows, chunk), y, std::size_t(w.rows), backend);
-    for (auto& worker : workers) { worker.join(); }
+    });
 }
 
-void run_parallel_ggml(const GgufCpuMatrix& w, const GgmlCpuActivation& x, float* y, int threads) {
+void run_parallel_ggml(PersistentPool& pool, const GgufCpuMatrix& w, const GgmlCpuActivation& x,
+                       float* y, int threads) {
     if (threads <= 1) {
         gguf_cpu_rows_ggml(w, x, 0, w.rows, y, std::size_t(w.rows));
         return;
     }
-    std::vector<std::thread> workers;
-    workers.reserve(threads - 1);
     const int chunk = (w.rows + threads - 1) / threads;
-    for (int t = 1; t < threads; ++t) {
-        const int begin = t * chunk;
+    pool.run(threads, [&](int tid) {
+        const int begin = tid * chunk;
         const int end = std::min(w.rows, begin + chunk);
         if (begin < end) {
-            workers.emplace_back([&, begin, end] {
-                gguf_cpu_rows_ggml(w, x, begin, end, y, std::size_t(w.rows));
-            });
+            gguf_cpu_rows_ggml(w, x, begin, end, y, std::size_t(w.rows));
         }
-    }
-    gguf_cpu_rows_ggml(w, x, 0, std::min(w.rows, chunk), y, std::size_t(w.rows));
-    for (auto& worker : workers) { worker.join(); }
+    });
 }
 
 }  // namespace
@@ -161,6 +218,8 @@ int main(int argc, char** argv) {
     const bool has_avx2 = gguf_cpu_backend_available(GgufCpuBackend::Avx2);
     const bool has_ggml = gguf_ggml_cpu_available();
 
+    PersistentPool pool(8);
+
     std::cout << "GGUF CPU Expert Benchmark (avx=" << has_avx
               << ", avx2=" << has_avx2 << ", ggml=" << has_ggml
               << ", iters=" << iters << ")\n";
@@ -181,12 +240,12 @@ int main(int argc, char** argv) {
 
             for (int threads : {1, 6, 8}) {
                 const double ms_scalar = measure_median_ms(
-                    [&] { run_parallel_rows(w, act, y.data(), threads, GgufCpuBackend::Scalar); },
+                    [&] { run_parallel_rows(pool, w, act, y.data(), threads, GgufCpuBackend::Scalar); },
                     warmup, iters);
                 double ms_avx = 0.0;
                 if (has_avx) {
                     ms_avx = measure_median_ms(
-                        [&] { run_parallel_rows(w, act, y.data(), threads, GgufCpuBackend::Avx); },
+                        [&] { run_parallel_rows(pool, w, act, y.data(), threads, GgufCpuBackend::Avx); },
                         warmup, iters);
                 }
                 double ms_ggml = 0.0;
@@ -199,7 +258,7 @@ int main(int argc, char** argv) {
                         GgmlCpuActivation gact(tokens, s.k);
                         gact.prepare_bf16(layout, x_bf16.data(), s.k, tokens);
                         ms_ggml = measure_median_ms(
-                            [&] { run_parallel_ggml(w, gact, y.data(), threads); }, warmup, iters);
+                            [&] { run_parallel_ggml(pool, w, gact, y.data(), threads); }, warmup, iters);
                     }
                 }
                 std::cout << std::left << std::setw(7) << s.name

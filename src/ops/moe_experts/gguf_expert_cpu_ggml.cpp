@@ -6,6 +6,7 @@
 #include "quants.h"       // NInfer: vendored (ggml_vec_dot_*)
 
 #include <bit>
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::ops {
@@ -60,30 +61,65 @@ GgmlCpuActivation::GgmlCpuActivation(int token_capacity, int k)
     }
 }
 
-void GgmlCpuActivation::prepare_bf16(GgmlActLayout layout, const std::uint16_t* values,
-                                     std::size_t stride, int tokens) {
+void GgmlCpuActivation::prepare_bf16_start(GgmlActLayout layout, int tokens) {
     if (tokens > capacity_) { throw std::invalid_argument("GGUF ggml CPU activation: too many tokens"); }
     if (layout == GgmlActLayout::Q8K && k_ % 256 != 0) {
         throw std::invalid_argument("GGUF ggml CPU activation: k must be a multiple of 256 for Q8_K");
     }
     layout_    = layout;
-    // The vecdot kernels read the in-memory block layouts: block_q8_K keeps a float d and
-    // int16 bsums (292 bytes per 256 values), block_q8_0 its FP16 d (36 bytes per 32).
     row_bytes_ = layout == GgmlActLayout::Q8K ? std::size_t(k_) / 256 * sizeof(block_q8_K)
                                               : std::size_t(k_) / 32 * sizeof(block_q8_0);
     data_.resize(std::size_t(capacity_) * row_bytes_);
-    scratch_.resize(k_);
-    for (int t = 0; t < tokens; ++t) {
-        float* x = scratch_.data();
-        const std::uint16_t* v = values + std::size_t(t) * stride;
-        for (int i = 0; i < k_; ++i) { x[i] = bf16_to_float(v[i]); }
-        if (layout == GgmlActLayout::Q8K) {
-            quantize_row_q8_K_ref(x, reinterpret_cast<block_q8_K*>(data_.data() + std::size_t(t) * row_bytes_), k_);
+    tokens_ = tokens;
+}
+
+void GgmlCpuActivation::prepare_bf16_token(int token, const std::uint16_t* values) {
+    void* out = data_.data() + std::size_t(token) * row_bytes_;
+    if (gguf_ggml_cpu_available()) {
+        if (layout_ == GgmlActLayout::Q8K) {
+            ggml_quantize_bf16_q8_K(values, out, k_);
         } else {
-            quantize_row_q8_0_ref(x, reinterpret_cast<block_q8_0*>(data_.data() + std::size_t(t) * row_bytes_), k_);
+            ggml_quantize_bf16_q8_0(values, out, k_);
+        }
+        return;
+    }
+    std::vector<float> local_scratch(static_cast<std::size_t>(k_));
+    for (int i = 0; i < k_; ++i) { local_scratch[i] = bf16_to_float(values[i]); }
+    if (layout_ == GgmlActLayout::Q8K) {
+        quantize_row_q8_K_ref(local_scratch.data(), reinterpret_cast<block_q8_K*>(out), k_);
+    } else {
+        quantize_row_q8_0_ref(local_scratch.data(), reinterpret_cast<block_q8_0*>(out), k_);
+    }
+}
+
+void GgmlCpuActivation::copy_token_from(int dst_token, const GgmlCpuActivation& src, int src_token) {
+    std::memcpy(data_.data() + std::size_t(dst_token) * row_bytes_, src.codes(src_token), row_bytes_);
+}
+
+void GgmlCpuActivation::prepare_bf16(GgmlActLayout layout, const std::uint16_t* values,
+                                     std::size_t stride, int tokens) {
+    prepare_bf16_start(layout, tokens);
+    const bool use_simd = gguf_ggml_cpu_available();
+    if (!use_simd) { scratch_.resize(k_); }
+    for (int t = 0; t < tokens; ++t) {
+        const std::uint16_t* v = values + std::size_t(t) * stride;
+        void* out = data_.data() + std::size_t(t) * row_bytes_;
+        if (use_simd) {
+            if (layout == GgmlActLayout::Q8K) {
+                ggml_quantize_bf16_q8_K(v, out, k_);
+            } else {
+                ggml_quantize_bf16_q8_0(v, out, k_);
+            }
+        } else {
+            float* x = scratch_.data();
+            for (int i = 0; i < k_; ++i) { x[i] = bf16_to_float(v[i]); }
+            if (layout == GgmlActLayout::Q8K) {
+                quantize_row_q8_K_ref(x, reinterpret_cast<block_q8_K*>(out), k_);
+            } else {
+                quantize_row_q8_0_ref(x, reinterpret_cast<block_q8_0*>(out), k_);
+            }
         }
     }
-    tokens_ = tokens;
 }
 
 const void* GgmlCpuActivation::codes(int token) const noexcept {
@@ -100,78 +136,34 @@ void gguf_cpu_rows_ggml(const GgufCpuMatrix& w, const GgmlCpuActivation& x, int 
     }
     const int rows = row_end - row_begin;
     const int ntok = x.tokens();
+    const void* vx = w.data + std::size_t(row_begin) * w.row_bytes;
+    const void* vy = x.codes(0);
+    const std::size_t by = x.row_bytes();
+    float* out = y + row_begin;
     switch (w.format) {
     case QType::GGUF_IQ2_XXS:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq2_xxs_q8_K(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                          w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq2_xxs_q8_K_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_IQ2_XS:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq2_xs_q8_K(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                         w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq2_xs_q8_K_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_IQ2_S:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq2_s_q8_K(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                        w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq2_s_q8_K_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_IQ3_XXS:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq3_xxs_q8_K(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                          w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq3_xxs_q8_K_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_IQ3_S:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq3_s_q8_K(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                        w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq3_s_q8_K_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_IQ4_XS:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq4_xs_q8_K(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                         w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq4_xs_q8_K_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_IQ4_NL:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_iq4_nl_q8_0(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                         w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_iq4_nl_q8_0_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     case QType::GGUF_Q8_0:
-        for (int t = 0; t < ntok; ++t) {
-            const void* act = x.codes(t);
-            for (int r = 0; r < rows; ++r) {
-                ggml_vec_dot_q8_0_q8_0(w.k, y + (std::size_t(t) * y_stride + row_begin + r), 1,
-                                       w.data + std::size_t(row_begin + r) * w.row_bytes, 1, act, 1, 1);
-            }
-        }
+        ggml_vec_dot_q8_0_q8_0_rows(w.k, rows, ntok, out, y_stride, vx, w.row_bytes, vy, by);
         break;
     default:
         throw std::invalid_argument("GGUF ggml CPU expert: unsupported format");

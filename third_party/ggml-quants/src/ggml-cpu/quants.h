@@ -101,6 +101,19 @@ void ggml_vec_dot_iq1_m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// Batched multi-token / multi-row host-expert helpers (defined in arch/x86/quants.c).
+void ggml_quantize_bf16_q8_0(const uint16_t * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
+void ggml_quantize_bf16_q8_K(const uint16_t * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+
+void ggml_vec_dot_iq2_xxs_q8_K_rows(int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_iq2_xs_q8_K_rows (int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_iq2_s_q8_K_rows  (int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_iq3_xxs_q8_K_rows(int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_iq3_s_q8_K_rows  (int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_iq4_xs_q8_K_rows (int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_iq4_nl_q8_0_rows (int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_q8_0_q8_0_rows   (int n, int rows, int ntok, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+
 #ifdef __cplusplus
 }
 #endif
