@@ -159,23 +159,42 @@ void moe_expert_cpu(std::span<const std::uint16_t> x, const CpuExpertWeights& we
     if (backend == CpuExpertBackend::Avx512Vnni) { project = cpu_expert_detail::project_avx512; }
 #endif
     const int tokens = static_cast<int>(x.size() / kHidden);
-    for (std::size_t i = 0; i < x.size(); ++i) {
-        workspace.input_[i] = std::bit_cast<float>(std::uint32_t(x[i]) << 16);
-    }
-    if (weights.gate.integer_a8 || weights.up.integer_a8) {
-        quantize(workspace.input_.data(), x.size(), workspace.input_codes_.data(), workspace.input_scales_.data());
+    const bool any_in_a8 = weights.gate.integer_a8 || weights.up.integer_a8;
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (backend == CpuExpertBackend::Avx) {
+        cpu_expert_detail::prepare_input_avx(x.data(), x.size(), workspace.input_.data(),
+                                             workspace.input_codes_.data(), workspace.input_scales_.data(),
+                                             any_in_a8);
+    } else
+#endif
+    {
+        for (std::size_t i = 0; i < x.size(); ++i) {
+            workspace.input_[i] = std::bit_cast<float>(std::uint32_t(x[i]) << 16);
+        }
+        if (any_in_a8) {
+            quantize(workspace.input_.data(), x.size(), workspace.input_codes_.data(), workspace.input_scales_.data());
+        }
     }
     const cpu_expert_detail::Activations input{workspace.input_.data(), workspace.input_codes_.data(),
                                                workspace.input_scales_.data(), tokens, cancelled};
     project(weights.gate.weight, input, weights.gate.integer_a8, workspace.gate_.data());
     project(weights.up.weight, input, weights.up.integer_a8, workspace.middle_.data());
     const std::size_t middle_count = std::size_t(tokens) * kWidth;
-    for (std::size_t i = 0; i < middle_count; ++i) {
-        const float gate = workspace.gate_[i];
-        workspace.middle_[i] *= gate / (1.0F + std::exp(-gate));
-    }
-    if (weights.down.integer_a8) {
-        quantize(workspace.middle_.data(), middle_count, workspace.middle_codes_.data(), workspace.middle_scales_.data());
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (backend == CpuExpertBackend::Avx) {
+        cpu_expert_detail::swiglu_quantize_avx(workspace.gate_.data(), workspace.middle_.data(), middle_count,
+                                               workspace.middle_codes_.data(), workspace.middle_scales_.data(),
+                                               weights.down.integer_a8);
+    } else
+#endif
+    {
+        for (std::size_t i = 0; i < middle_count; ++i) {
+            const float gate = workspace.gate_[i];
+            workspace.middle_[i] *= gate / (1.0F + std::exp(-gate));
+        }
+        if (weights.down.integer_a8) {
+            quantize(workspace.middle_.data(), middle_count, workspace.middle_codes_.data(), workspace.middle_scales_.data());
+        }
     }
     const cpu_expert_detail::Activations middle{workspace.middle_.data(), workspace.middle_codes_.data(),
                                                 workspace.middle_scales_.data(), tokens, cancelled};

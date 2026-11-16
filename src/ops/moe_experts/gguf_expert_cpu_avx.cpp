@@ -5,7 +5,9 @@
 
 #include <immintrin.h>
 
+#include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 // The scalar products' arithmetic (gguf_expert_cpu.cpp) eight slices at a time using AVX 1.0,
 // F16C, SSSE3 and SSE4.1 without AVX2 or FMA instructions. Group g holds slices 8 g .. 8 g + 7,
@@ -43,12 +45,24 @@ inline void sign_bytes(std::uint32_t bits, __m128i& out_lo, __m128i& out_hi) {
     out_hi = _mm_or_si128(_mm_cmpeq_epi8(set_hi, select), _mm_set1_epi8(1));
 }
 
-inline void iq4_values(const std::uint8_t* q, __m128i& out_lo, __m128i& out_hi) {
-    const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+inline void iq4_values(const std::uint8_t* q, __m128i table, __m128i& out_lo, __m128i& out_hi) {
     const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
     const __m128i nib   = _mm_set1_epi8(15);
     out_lo = _mm_shuffle_epi8(table, _mm_and_si128(bytes, nib));
     out_hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), nib));
+}
+
+inline void iq4_values_and_abs(const std::uint8_t* q, __m128i table, __m128i table_abs,
+                               __m128i& sign_lo, __m128i& sign_hi, __m128i& mag_lo,
+                               __m128i& mag_hi) {
+    const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
+    const __m128i nib   = _mm_set1_epi8(15);
+    const __m128i lo    = _mm_and_si128(bytes, nib);
+    const __m128i hi    = _mm_and_si128(_mm_srli_epi16(bytes, 4), nib);
+    sign_lo = _mm_shuffle_epi8(table, lo);
+    sign_hi = _mm_shuffle_epi8(table, hi);
+    mag_lo  = _mm_shuffle_epi8(table_abs, lo);
+    mag_hi  = _mm_shuffle_epi8(table_abs, hi);
 }
 
 struct Group {
@@ -56,13 +70,21 @@ struct Group {
     alignas(32) float factor[2][8];
 };
 
+inline __m128i hsum4_epi32(__m128i a, __m128i b, __m128i c, __m128i d) {
+    const __m128i t0  = _mm_unpacklo_epi32(a, b);
+    const __m128i t1  = _mm_unpackhi_epi32(a, b);
+    const __m128i t2  = _mm_unpacklo_epi32(c, d);
+    const __m128i t3  = _mm_unpackhi_epi32(c, d);
+    const __m128i s01 = _mm_add_epi32(t0, t1);
+    const __m128i s23 = _mm_add_epi32(t2, t3);
+    const __m128i lo  = _mm_unpacklo_epi64(s01, s23);
+    const __m128i hi  = _mm_unpackhi_epi64(s01, s23);
+    return _mm_add_epi32(lo, hi);
+}
+
 inline void sum_hadd8(const __m128i* u, __m128i& out0123, __m128i& out4567) {
-    const __m128i h01 = _mm_hadd_epi32(u[0], u[1]);
-    const __m128i h23 = _mm_hadd_epi32(u[2], u[3]);
-    out0123 = _mm_hadd_epi32(h01, h23);
-    const __m128i h45 = _mm_hadd_epi32(u[4], u[5]);
-    const __m128i h67 = _mm_hadd_epi32(u[6], u[7]);
-    out4567 = _mm_hadd_epi32(h45, h67);
+    out0123 = hsum4_epi32(u[0], u[1], u[2], u[3]);
+    out4567 = hsum4_epi32(u[4], u[5], u[6], u[7]);
 }
 
 inline float butterfly8(const __m256* lanes) {
@@ -74,6 +96,7 @@ inline float butterfly8(const __m256* lanes) {
 
 inline __m256 live_floats(const float* from, int live) {
     if (live == 8) { return _mm256_loadu_ps(from); }
+    if (live == 4) { return _mm256_castps128_ps256(_mm_loadu_ps(from)); }
     alignas(32) float to[8];
     for (int i = 0; i < 8; ++i) { to[i] = i < live ? from[i] : 0.0F; }
     return _mm256_load_ps(to);
@@ -159,69 +182,76 @@ void rows_in_lane_order(const GgufCpuMatrix& w, const GgufCpuActivation& x, int 
 }
 
 template <QType F>
-inline void decode_iq(const std::uint8_t* block, Group& out) {
+inline void decode_iq_slice(const std::uint8_t* block, int sub, float d, std::uint16_t iq4_high,
+                            __m128i table_iq4, __m128i table_iq4_abs, __m128i& mag_lo,
+                            __m128i& mag_hi, __m128i& sgn_lo, __m128i& sgn_hi, float& f0,
+                            float& f1) {
+    if constexpr (F == QType::GGUF_IQ2_S) {
+        const std::uint8_t* qs = block + 2 + 4 * sub;
+        const unsigned qh      = block[66 + sub];
+        const unsigned scale   = block[74 + sub];
+        mag_lo = _mm_set_epi64x(
+            static_cast<long long>(iq2s_grid[qs[1] | ((qh << 6) & 0x300U)]),
+            static_cast<long long>(iq2s_grid[qs[0] | ((qh << 8) & 0x300U)]));
+        mag_hi = _mm_set_epi64x(
+            static_cast<long long>(iq2s_grid[qs[3] | ((qh << 2) & 0x300U)]),
+            static_cast<long long>(iq2s_grid[qs[2] | ((qh << 4) & 0x300U)]));
+        sign_bytes(load32(block + 34 + 4 * sub), sgn_lo, sgn_hi);
+        f0 = d * float(2 * (scale & 15U) + 1) * 0.125F;
+        f1 = d * float(2 * (scale >> 4) + 1) * 0.125F;
+    } else if constexpr (F == QType::GGUF_IQ3_XXS) {
+        const std::uint8_t* qs  = block + 2 + 8 * sub;
+        const std::uint32_t aux = load32(block + 66 + 4 * sub);
+        mag_lo = _mm_set_epi32(
+            static_cast<int>(iq3xxs_grid[qs[3]]), static_cast<int>(iq3xxs_grid[qs[2]]),
+            static_cast<int>(iq3xxs_grid[qs[1]]), static_cast<int>(iq3xxs_grid[qs[0]]));
+        mag_hi = _mm_set_epi32(
+            static_cast<int>(iq3xxs_grid[qs[7]]), static_cast<int>(iq3xxs_grid[qs[6]]),
+            static_cast<int>(iq3xxs_grid[qs[5]]), static_cast<int>(iq3xxs_grid[qs[4]]));
+        const std::uint32_t bits = std::uint32_t(ksigns_iq2xs[aux & 127U]) |
+                                   std::uint32_t(ksigns_iq2xs[(aux >> 7) & 127U]) << 8 |
+                                   std::uint32_t(ksigns_iq2xs[(aux >> 14) & 127U]) << 16 |
+                                   std::uint32_t(ksigns_iq2xs[(aux >> 21) & 127U]) << 24;
+        sign_bytes(bits, sgn_lo, sgn_hi);
+        f0 = d * float(2 * (aux >> 28) + 1) * 0.25F;
+        f1 = 0.0F;
+    } else if constexpr (F == QType::GGUF_IQ3_S) {
+        const std::uint8_t* qs = block + 2 + 8 * sub;
+        const unsigned qh      = block[66 + sub];
+        const unsigned scale   = (block[106 + sub / 2] >> (4 * (sub & 1))) & 15U;
+        mag_lo = _mm_set_epi32(
+            static_cast<int>(iq3s_grid[qs[3] | ((qh << 5) & 256U)]),
+            static_cast<int>(iq3s_grid[qs[2] | ((qh << 6) & 256U)]),
+            static_cast<int>(iq3s_grid[qs[1] | ((qh << 7) & 256U)]),
+            static_cast<int>(iq3s_grid[qs[0] | ((qh << 8) & 256U)]));
+        mag_hi = _mm_set_epi32(
+            static_cast<int>(iq3s_grid[qs[7] | ((qh << 1) & 256U)]),
+            static_cast<int>(iq3s_grid[qs[6] | ((qh << 2) & 256U)]),
+            static_cast<int>(iq3s_grid[qs[5] | ((qh << 3) & 256U)]),
+            static_cast<int>(iq3s_grid[qs[4] | ((qh << 4) & 256U)]));
+        sign_bytes(load32(block + 74 + 4 * sub), sgn_lo, sgn_hi);
+        f0 = d * float(2 * scale + 1);
+        f1 = 0.0F;
+    } else {
+        static_assert(F == QType::GGUF_IQ4_XS);
+        const unsigned low = (block[4 + sub / 2] >> (4 * (sub & 1))) & 15U;
+        iq4_values_and_abs(block + 8 + 16 * sub, table_iq4, table_iq4_abs, sgn_lo, sgn_hi, mag_lo,
+                           mag_hi);
+        f0 = d * float(int(low | (((unsigned(iq4_high) >> (2 * sub)) & 3U) << 4)) - 32);
+        f1 = 0.0F;
+    }
+}
+
+template <QType F>
+inline void decode_iq(const std::uint8_t* block, __m128i table_iq4, __m128i table_iq4_abs,
+                      Group& out) {
     const float d = half_at(block);
+    std::uint16_t iq4_high = 0;
+    if constexpr (F == QType::GGUF_IQ4_XS) { std::memcpy(&iq4_high, block + 2, 2); }
     for (int sub = 0; sub < 8; ++sub) {
-        if constexpr (F == QType::GGUF_IQ2_S) {
-            const std::uint8_t* qs = block + 2 + 4 * sub;
-            const unsigned qh      = block[66 + sub];
-            const unsigned scale   = block[74 + sub];
-            out.magnitude[sub][0]  = _mm_set_epi64x(
-                static_cast<long long>(iq2s_grid[qs[1] | ((qh << 6) & 0x300U)]),
-                static_cast<long long>(iq2s_grid[qs[0] | ((qh << 8) & 0x300U)]));
-            out.magnitude[sub][1]  = _mm_set_epi64x(
-                static_cast<long long>(iq2s_grid[qs[3] | ((qh << 2) & 0x300U)]),
-                static_cast<long long>(iq2s_grid[qs[2] | ((qh << 4) & 0x300U)]));
-            sign_bytes(load32(block + 34 + 4 * sub), out.sign[sub][0], out.sign[sub][1]);
-            out.factor[0][sub] = d * float(2 * (scale & 15U) + 1) * 0.125F;
-            out.factor[1][sub] = d * float(2 * (scale >> 4) + 1) * 0.125F;
-        } else if constexpr (F == QType::GGUF_IQ3_XXS) {
-            const std::uint8_t* qs  = block + 2 + 8 * sub;
-            const std::uint32_t aux = load32(block + 66 + 4 * sub);
-            out.magnitude[sub][0]   = _mm_set_epi32(
-                static_cast<int>(iq3xxs_grid[qs[3]]), static_cast<int>(iq3xxs_grid[qs[2]]),
-                static_cast<int>(iq3xxs_grid[qs[1]]), static_cast<int>(iq3xxs_grid[qs[0]]));
-            out.magnitude[sub][1]   = _mm_set_epi32(
-                static_cast<int>(iq3xxs_grid[qs[7]]), static_cast<int>(iq3xxs_grid[qs[6]]),
-                static_cast<int>(iq3xxs_grid[qs[5]]), static_cast<int>(iq3xxs_grid[qs[4]]));
-            const std::uint32_t bits = std::uint32_t(ksigns_iq2xs[aux & 127U]) |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 7) & 127U]) << 8 |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 14) & 127U]) << 16 |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 21) & 127U]) << 24;
-            sign_bytes(bits, out.sign[sub][0], out.sign[sub][1]);
-            out.factor[0][sub] = d * float(2 * (aux >> 28) + 1) * 0.25F;
-            out.factor[1][sub] = 0.0F;
-        } else if constexpr (F == QType::GGUF_IQ3_S) {
-            const std::uint8_t* qs = block + 2 + 8 * sub;
-            const unsigned qh      = block[66 + sub];
-            const unsigned scale   = (block[106 + sub / 2] >> (4 * (sub & 1))) & 15U;
-            out.magnitude[sub][0]  = _mm_set_epi32(
-                static_cast<int>(iq3s_grid[qs[3] | ((qh << 5) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[2] | ((qh << 6) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[1] | ((qh << 7) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[0] | ((qh << 8) & 256U)]));
-            out.magnitude[sub][1]  = _mm_set_epi32(
-                static_cast<int>(iq3s_grid[qs[7] | ((qh << 1) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[6] | ((qh << 2) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[5] | ((qh << 3) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[4] | ((qh << 4) & 256U)]));
-            sign_bytes(load32(block + 74 + 4 * sub), out.sign[sub][0], out.sign[sub][1]);
-            out.factor[0][sub] = d * float(2 * scale + 1);
-            out.factor[1][sub] = 0.0F;
-        } else {
-            static_assert(F == QType::GGUF_IQ4_XS);
-            std::uint16_t high;
-            std::memcpy(&high, block + 2, 2);
-            const unsigned low  = (block[4 + sub / 2] >> (4 * (sub & 1))) & 15U;
-            __m128i value_lo, value_hi;
-            iq4_values(block + 8 + 16 * sub, value_lo, value_hi);
-            out.magnitude[sub][0] = _mm_sign_epi8(value_lo, value_lo);
-            out.magnitude[sub][1] = _mm_sign_epi8(value_hi, value_hi);
-            out.sign[sub][0]      = value_lo;
-            out.sign[sub][1]      = value_hi;
-            out.factor[0][sub]    = d * float(int(low | (((unsigned(high) >> (2 * sub)) & 3U) << 4)) - 32);
-            out.factor[1][sub]    = 0.0F;
-        }
+        decode_iq_slice<F>(block, sub, d, iq4_high, table_iq4, table_iq4_abs, out.magnitude[sub][0],
+                           out.magnitude[sub][1], out.sign[sub][0], out.sign[sub][1],
+                           out.factor[0][sub], out.factor[1][sub]);
     }
 }
 
@@ -230,8 +260,81 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
              float* y, std::size_t y_stride) {
     constexpr int bytes   = gguf_block_shape(F).bytes;
     constexpr bool halves = F == QType::GGUF_IQ2_S;
-    const auto decode     = [](const std::uint8_t* row, int g, int, Group& group) {
-        decode_iq<F>(row + std::size_t(g) * bytes, group);
+    const __m128i table_iq4 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i table_iq4_abs = _mm_abs_epi8(table_iq4);
+
+    if (x.tokens() == 1) {
+        const int slices = w.k / 32;
+        const int groups = (slices + 7) / 8;
+        const std::int8_t* act_codes = x.codes(0);
+        const float* act_scales      = x.scales(0);
+        for (int row = row_begin; row < row_end; ++row) {
+            const std::uint8_t* r = w.data + std::size_t(row) * w.row_bytes;
+            __m256 acc[4]         = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+                                     _mm256_setzero_ps()};
+            for (int g = 0; g < groups; ++g) {
+                const std::uint8_t* block = r + std::size_t(g) * bytes;
+                const float d             = half_at(block);
+                std::uint16_t iq4_high    = 0;
+                if constexpr (F == QType::GGUF_IQ4_XS) { std::memcpy(&iq4_high, block + 2, 2); }
+                const std::int8_t* a = act_codes + g * 256;
+                alignas(32) float factor0[8], factor1[8];
+                __m128i lo0123, lo4567, hi0123, hi4567;
+                auto run_half = [&](int base, __m128i& out_lo, __m128i& out_hi) {
+                    __m128i u_lo[4], u_hi[4];
+                    for (int k = 0; k < 4; ++k) {
+                        const int sub = base + k;
+                        __m128i mag_lo, mag_hi, sgn_lo, sgn_hi;
+                        decode_iq_slice<F>(block, sub, d, iq4_high, table_iq4, table_iq4_abs,
+                                           mag_lo, mag_hi, sgn_lo, sgn_hi, factor0[sub],
+                                           factor1[sub]);
+                        const __m128i v_lo = _mm_loadu_si128(
+                            reinterpret_cast<const __m128i*>(a + 32 * sub));
+                        const __m128i v_hi = _mm_loadu_si128(
+                            reinterpret_cast<const __m128i*>(a + 32 * sub + 16));
+                        u_lo[k] = dot_u8s8_128(mag_lo, _mm_sign_epi8(v_lo, sgn_lo));
+                        u_hi[k] = dot_u8s8_128(mag_hi, _mm_sign_epi8(v_hi, sgn_hi));
+                    }
+                    if constexpr (halves) {
+                        out_lo = hsum4_epi32(u_lo[0], u_lo[1], u_lo[2], u_lo[3]);
+                        out_hi = hsum4_epi32(u_hi[0], u_hi[1], u_hi[2], u_hi[3]);
+                    } else {
+                        out_lo = hsum4_epi32(_mm_add_epi32(u_lo[0], u_hi[0]),
+                                             _mm_add_epi32(u_lo[1], u_hi[1]),
+                                             _mm_add_epi32(u_lo[2], u_hi[2]),
+                                             _mm_add_epi32(u_lo[3], u_hi[3]));
+                        out_hi = _mm_setzero_si128();
+                    }
+                };
+                run_half(0, lo0123, hi0123);
+                run_half(4, lo4567, hi4567);
+
+                const __m256 scale = _mm256_loadu_ps(act_scales + 8 * g);
+                const __m256 f0    = _mm256_load_ps(factor0);
+                __m256 product;
+                if constexpr (halves) {
+                    const __m256 d0 = _mm256_insertf128_ps(
+                        _mm256_castps128_ps256(_mm_cvtepi32_ps(lo0123)), _mm_cvtepi32_ps(lo4567), 1);
+                    const __m256 d1 = _mm256_insertf128_ps(
+                        _mm256_castps128_ps256(_mm_cvtepi32_ps(hi0123)), _mm_cvtepi32_ps(hi4567), 1);
+                    const __m256 f1    = _mm256_load_ps(factor1);
+                    const __m256 inner = fma8(f0, d0, _mm256_mul_ps(f1, d1));
+                    product            = _mm256_mul_ps(scale, inner);
+                } else {
+                    const __m256 dots = _mm256_insertf128_ps(
+                        _mm256_castps128_ps256(_mm_cvtepi32_ps(lo0123)), _mm_cvtepi32_ps(lo4567), 1);
+                    product = _mm256_mul_ps(_mm256_mul_ps(f0, scale), dots);
+                }
+                acc[g & 3] = _mm256_add_ps(acc[g & 3], product);
+            }
+            y[row] = butterfly8(acc);
+        }
+        return;
+    }
+
+    const auto decode = [table_iq4, table_iq4_abs](const std::uint8_t* row, int g, int, Group& group) {
+        decode_iq<F>(row + std::size_t(g) * bytes, table_iq4, table_iq4_abs, group);
     };
     const auto dot = [&x](int t, int g, int, const Group& group) {
         const std::int8_t* a = x.codes(t) + g * 256;
@@ -299,22 +402,19 @@ void q2_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
             const __m128i p2 = dot_u8s8_128(group.magnitude[2 * b + 1][0], a2);
             const __m128i p3 = dot_u8s8_128(group.magnitude[2 * b + 1][1], a3);
 
-            const __m128i lo = _mm_add_epi32(p0, p2);
-            const __m128i hi = _mm_add_epi32(p1, p3);
-
-            alignas(16) std::int32_t d_lo[4], d_hi[4];
-            _mm_store_si128(reinterpret_cast<__m128i*>(d_lo), lo);
-            _mm_store_si128(reinterpret_cast<__m128i*>(d_hi), hi);
-
-            const std::int32_t s0 = (d_lo[0] + d_lo[1]) + (d_hi[0] + d_hi[1]);
-            const std::int32_t s1 = (d_lo[2] + d_lo[3]) + (d_hi[2] + d_hi[3]);
-
-            dots_arr[2 * b]     = s0 - (2 * b < live ? sums[2 * b] : 0);
-            dots_arr[2 * b + 1] = s1 - (2 * b + 1 < live ? sums[2 * b + 1] : 0);
+            const __m128i s    = _mm_add_epi32(_mm_add_epi32(p0, p2), _mm_add_epi32(p1, p3));
+            const __m128i pair = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+            // pair = [s0, s0, s1, s1]; pack into dots_arr[2*b], dots_arr[2*b+1] cleanly:
+            const __m128i p01  = _mm_shuffle_epi32(pair, _MM_SHUFFLE(2, 0, 2, 0));
+            const __m128i off  = _mm_set_epi32(0, 0,
+                                               (2 * b + 1 < live) ? sums[2 * b + 1] : 0,
+                                               (2 * b < live) ? sums[2 * b] : 0);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dots_arr + 2 * b), _mm_sub_epi32(p01, off));
         }
-        alignas(32) float fdots[8];
-        for (int i = 0; i < 8; ++i) { fdots[i] = float(dots_arr[i]); }
-        return _mm256_load_ps(fdots);
+        const __m128i dv_lo = _mm_load_si128(reinterpret_cast<const __m128i*>(dots_arr));
+        const __m128i dv_hi = _mm_load_si128(reinterpret_cast<const __m128i*>(dots_arr + 4));
+        return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(dv_lo)),
+                                    _mm_cvtepi32_ps(dv_hi), 1);
     };
     rows_in_lane_order<false>(w, x, row_begin, row_end, y, y_stride, decode, dot);
 }
@@ -323,27 +423,82 @@ template <bool kNl>
 void block32_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, int row_end,
                   float* y, std::size_t y_stride) {
     constexpr int bytes = kNl ? 18 : 34;
-    const auto decode   = [](const std::uint8_t* row, int g, int live, Group& group) {
+    const __m128i table_iq4 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i table_iq4_abs = _mm_abs_epi8(table_iq4);
+
+    if (x.tokens() == 1) {
+        const int slices             = w.k / 32;
+        const int groups             = (slices + 7) / 8;
+        const std::int8_t* act_codes = x.codes(0);
+        const float* act_scales      = x.scales(0);
+        for (int row = row_begin; row < row_end; ++row) {
+            const std::uint8_t* r = w.data + std::size_t(row) * w.row_bytes;
+            __m256 acc[4]         = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+                                     _mm256_setzero_ps()};
+            for (int g = 0; g < groups; ++g) {
+                const int live       = slices - 8 * g < 8 ? slices - 8 * g : 8;
+                const std::int8_t* a = act_codes + g * 256;
+                alignas(32) float factor0[8];
+                __m128i u[8];
+                for (int i = 0; i < 8; ++i) {
+                    if (i >= live) {
+                        factor0[i] = 0.0F;
+                        u[i]       = _mm_setzero_si128();
+                        continue;
+                    }
+                    const std::uint8_t* block = r + std::size_t(8 * g + i) * bytes;
+                    __m128i mag_lo, mag_hi, sgn_lo, sgn_hi;
+                    if constexpr (kNl) {
+                        iq4_values_and_abs(block + 2, table_iq4, table_iq4_abs, sgn_lo, sgn_hi,
+                                           mag_lo, mag_hi);
+                    } else {
+                        sgn_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2));
+                        sgn_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 18));
+                        mag_lo = _mm_abs_epi8(sgn_lo);
+                        mag_hi = _mm_abs_epi8(sgn_hi);
+                    }
+                    factor0[i] = half_at(block);
+                    const __m128i v_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 32 * i));
+                    const __m128i v_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 32 * i + 16));
+                    u[i] = _mm_add_epi32(dot_u8s8_128(mag_lo, _mm_sign_epi8(v_lo, sgn_lo)),
+                                         dot_u8s8_128(mag_hi, _mm_sign_epi8(v_hi, sgn_hi)));
+                }
+                const __m128i tot_lo = hsum4_epi32(u[0], u[1], u[2], u[3]);
+                const __m128i tot_hi = hsum4_epi32(u[4], u[5], u[6], u[7]);
+                const __m256 dots    = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_mm_cvtepi32_ps(tot_lo)), _mm_cvtepi32_ps(tot_hi), 1);
+                const __m256 f0      = _mm256_load_ps(factor0);
+                const __m256 scale   = live_floats(act_scales + 8 * g, live);
+                acc[g & 3]           = _mm256_add_ps(acc[g & 3], _mm256_mul_ps(_mm256_mul_ps(f0, scale), dots));
+            }
+            y[row] = butterfly8(acc);
+        }
+        return;
+    }
+
+    const auto decode = [table_iq4, table_iq4_abs](const std::uint8_t* row, int g, int live,
+                                                   Group& group) {
         for (int i = 0; i < 8; ++i) {
             if (i >= live) {
-                group.factor[0][i] = 0.0F;
+                group.factor[0][i]    = 0.0F;
                 group.magnitude[i][0] = group.magnitude[i][1] = _mm_setzero_si128();
                 group.sign[i][0] = group.sign[i][1] = _mm_setzero_si128();
                 continue;
             }
             const std::uint8_t* block = row + std::size_t(8 * g + i) * bytes;
-            __m128i codes_lo, codes_hi;
             if constexpr (kNl) {
-                iq4_values(block + 2, codes_lo, codes_hi);
+                iq4_values_and_abs(block + 2, table_iq4, table_iq4_abs, group.sign[i][0],
+                                   group.sign[i][1], group.magnitude[i][0], group.magnitude[i][1]);
             } else {
-                codes_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2));
-                codes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 18));
+                const __m128i codes_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2));
+                const __m128i codes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 18));
+                group.magnitude[i][0]  = _mm_abs_epi8(codes_lo);
+                group.magnitude[i][1]  = _mm_abs_epi8(codes_hi);
+                group.sign[i][0]       = codes_lo;
+                group.sign[i][1]       = codes_hi;
             }
-            group.magnitude[i][0] = _mm_sign_epi8(codes_lo, codes_lo);
-            group.magnitude[i][1] = _mm_sign_epi8(codes_hi, codes_hi);
-            group.sign[i][0]      = codes_lo;
-            group.sign[i][1]      = codes_hi;
-            group.factor[0][i]    = half_at(block);
+            group.factor[0][i] = half_at(block);
         }
     };
     const auto dot = [&x](int t, int g, int live, const Group& group) {
@@ -386,29 +541,52 @@ void rows_avx(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin,
     }
 }
 
-// silu.h eight values at a time using AVX 1.0 + SSE4.1 (with emulated FMA): same operations
-// in the same order as swiglu_avx2, so the same bits.
-void swiglu_avx(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
+inline __m128i pack_bf16_8(__m256 val) {
+    const __m128i abs_mask = _mm_set1_epi32(0x7FFFFFFF);
+    const __m128i nan_lim  = _mm_set1_epi32(0x7F800000);
+    const __m128i nan_qbit = _mm_set1_epi32(0x00400000);
+    const __m128i rne_bias = _mm_set1_epi32(0x7FFF);
+    const __m128i one_i32  = _mm_set1_epi32(1);
+    auto conv4             = [&](__m128 f) {
+        const __m128i u      = _mm_castps_si128(f);
+        const __m128i is_nan = _mm_cmpgt_epi32(_mm_and_si128(u, abs_mask), nan_lim);
+        const __m128i lsb    = _mm_and_si128(_mm_srli_epi32(u, 16), one_i32);
+        const __m128i rne    = _mm_add_epi32(u, _mm_add_epi32(rne_bias, lsb));
+        const __m128i qnan   = _mm_or_si128(u, nan_qbit);
+        return _mm_srli_epi32(_mm_blendv_epi8(rne, qnan, is_nan), 16);
+    };
+    const __m128i lo = conv4(_mm256_castps256_ps128(val));
+    const __m128i hi = conv4(_mm256_extractf128_ps(val, 1));
+    return _mm_packus_epi32(lo, hi);
+}
+
+template <bool kExactFma>
+inline void swiglu_impl(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
     const __m256 one     = _mm256_set1_ps(1.0F);
     const __m128i lo_126 = _mm_set1_epi32(-126);
     const __m128i hi_127 = _mm_set1_epi32(127);
-    std::size_t i        = 0;
-    alignas(32) float products[8];
+    auto fm              = [&](__m256 a, __m256 b, __m256 c) {
+        if constexpr (kExactFma) {
+            return fma8(a, b, c);
+        } else {
+            return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+        }
+    };
+    std::size_t i = 0;
     for (; i + 8 <= count; i += 8) {
         const __m256 x = _mm256_loadu_ps(gate + i);
         const __m256 v = _mm256_xor_ps(x, _mm256_set1_ps(-0.0F)); // e^v, v = -x
         const __m256 n = _mm256_round_ps(_mm256_mul_ps(v, _mm256_set1_ps(1.44269504F)),
                                          _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-        __m256 r = fma8(n, _mm256_set1_ps(-0.693145751953125F), v);
-        r        = fma8(n, _mm256_set1_ps(-1.42860677e-6F), r);
-        __m256 p = fma8(_mm256_set1_ps(1.9875691500e-4F), r, _mm256_set1_ps(1.3981999507e-3F));
-        p        = fma8(p, r, _mm256_set1_ps(8.3334519073e-3F));
-        p        = fma8(p, r, _mm256_set1_ps(4.1665795894e-2F));
-        p        = fma8(p, r, _mm256_set1_ps(1.6666665459e-1F));
-        p        = fma8(p, r, _mm256_set1_ps(5.0000001201e-1F));
-        p        = fma8(p, _mm256_mul_ps(r, r), r);
+        __m256 r = fm(n, _mm256_set1_ps(-0.693145751953125F), v);
+        r        = fm(n, _mm256_set1_ps(-1.42860677e-6F), r);
+        __m256 p = fm(_mm256_set1_ps(1.9875691500e-4F), r, _mm256_set1_ps(1.3981999507e-3F));
+        p        = fm(p, r, _mm256_set1_ps(8.3334519073e-3F));
+        p        = fm(p, r, _mm256_set1_ps(4.1665795894e-2F));
+        p        = fm(p, r, _mm256_set1_ps(1.6666665459e-1F));
+        p        = fm(p, r, _mm256_set1_ps(5.0000001201e-1F));
+        p        = fm(p, _mm256_mul_ps(r, r), r);
         p        = _mm256_add_ps(p, one);
-        // Split int32 exponent scaling into two 128-bit SSE4.1/SSE2 halves (no AVX2).
         const __m256i k     = _mm256_cvttps_epi32(n);
         const __m128i k_lo  = _mm256_castsi256_si128(k);
         const __m128i k_hi  = _mm256_extractf128_si256(k, 1);
@@ -428,10 +606,103 @@ void swiglu_avx(const float* gate, const float* up, std::size_t count, std::uint
                              _mm256_cmp_ps(v, _mm256_set1_ps(88.7228394F), _CMP_GE_OQ));
         e = _mm256_blendv_ps(e, v, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
         const __m256 silu = _mm256_div_ps(x, _mm256_add_ps(one, e));
-        _mm256_store_ps(products, _mm256_mul_ps(silu, _mm256_loadu_ps(up + i)));
-        for (int j = 0; j < 8; ++j) { out[i + j] = float_to_bf16(products[j]); }
+        const __m256 prod = _mm256_mul_ps(silu, _mm256_loadu_ps(up + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), pack_bf16_8(prod));
     }
     for (; i < count; ++i) { out[i] = float_to_bf16(ops::silu(gate[i]) * up[i]); }
+}
+
+// silu.h eight values at a time using AVX 1.0 + SSE4.1 (with emulated FMA): same operations
+// in the same order as swiglu_avx2, so the same bits.
+void swiglu_avx(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
+    swiglu_impl<true>(gate, up, count, out);
+}
+
+void swiglu_fast_avx(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
+    swiglu_impl<false>(gate, up, count, out);
+}
+
+void prepare_bf16_avx(QType, const std::uint16_t* values, std::size_t stride, int tokens, int k,
+                      std::int8_t* all_codes, float* all_scales, std::int32_t* all_sums) {
+    const int groups          = k / 32;
+    const __m128i zero128     = _mm_setzero_si128();
+    const __m128i inf_mask    = _mm_set1_epi16(0x7F80);
+    const __m128i ones_u8     = _mm_set1_epi8(1);
+    const __m128i ones_i16    = _mm_set1_epi16(1);
+    const __m256 sign_bit     = _mm256_set1_ps(-0.0F);
+    const __m256 half_minus   = _mm256_set1_ps(0.49999997F);
+    auto bf16x8_to_ps = [&](__m128i raw) {
+        const __m128i lo = _mm_unpacklo_epi16(zero128, raw);
+        const __m128i hi = _mm_unpackhi_epi16(zero128, raw);
+        return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_castsi128_ps(lo)),
+                                    _mm_castsi128_ps(hi), 1);
+    };
+
+    for (int t = 0; t < tokens; ++t) {
+        const std::uint16_t* column = values + std::size_t(t) * stride;
+        std::int8_t* codes          = all_codes + std::size_t(t) * k;
+        float* scales               = all_scales + std::size_t(t) * groups;
+        std::int32_t* sums          = all_sums + std::size_t(t) * groups;
+        for (int g = 0; g < groups; ++g) {
+            const std::uint16_t* src = column + 32 * g;
+            const __m128i r0         = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 0));
+            const __m128i r1         = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 8));
+            const __m128i r2         = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
+            const __m128i r3         = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 24));
+            const __m128i bad0 = _mm_cmpeq_epi16(_mm_and_si128(r0, inf_mask), inf_mask);
+            const __m128i bad1 = _mm_cmpeq_epi16(_mm_and_si128(r1, inf_mask), inf_mask);
+            const __m128i bad2 = _mm_cmpeq_epi16(_mm_and_si128(r2, inf_mask), inf_mask);
+            const __m128i bad3 = _mm_cmpeq_epi16(_mm_and_si128(r3, inf_mask), inf_mask);
+            const __m128i any_bad = _mm_or_si128(_mm_or_si128(bad0, bad1), _mm_or_si128(bad2, bad3));
+            if (!_mm_testz_si128(any_bad, any_bad)) {
+                throw std::runtime_error("GGUF CPU expert: nonfinite activation");
+            }
+            const __m256 v0 = bf16x8_to_ps(r0);
+            const __m256 v1 = bf16x8_to_ps(r1);
+            const __m256 v2 = bf16x8_to_ps(r2);
+            const __m256 v3 = bf16x8_to_ps(r3);
+            __m256 max_v    = _mm256_max_ps(
+                _mm256_max_ps(_mm256_andnot_ps(sign_bit, v0), _mm256_andnot_ps(sign_bit, v1)),
+                _mm256_max_ps(_mm256_andnot_ps(sign_bit, v2), _mm256_andnot_ps(sign_bit, v3)));
+            __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(max_v, 1), _mm256_castps256_ps128(max_v));
+            max4        = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+            max4        = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+            const float amax = _mm_cvtss_f32(max4);
+            if (amax == 0.0F) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(codes + 32 * g + 0), zero128);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(codes + 32 * g + 16), zero128);
+                scales[g] = 0.0F;
+                sums[g]   = 0;
+                continue;
+            }
+            const float d  = amax / 127.0F;
+            scales[g]      = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtps_ph(_mm_set_ss(d),
+                                                                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
+            const __m256 vd = _mm256_set1_ps(d);
+            auto q8         = [&](__m256 v) {
+                const __m256 q    = _mm256_div_ps(v, vd);
+                const __m256 bias = _mm256_or_ps(_mm256_and_ps(q, sign_bit), half_minus);
+                return _mm256_cvttps_epi32(_mm256_add_ps(q, bias));
+            };
+            const __m256i i0 = q8(v0);
+            const __m256i i1 = q8(v1);
+            const __m256i i2 = q8(v2);
+            const __m256i i3 = q8(v3);
+            const __m128i p0 = _mm_packs_epi32(_mm256_castsi256_si128(i0), _mm256_extractf128_si256(i0, 1));
+            const __m128i p1 = _mm_packs_epi32(_mm256_castsi256_si128(i1), _mm256_extractf128_si256(i1, 1));
+            const __m128i p2 = _mm_packs_epi32(_mm256_castsi256_si128(i2), _mm256_extractf128_si256(i2, 1));
+            const __m128i p3 = _mm_packs_epi32(_mm256_castsi256_si128(i3), _mm256_extractf128_si256(i3, 1));
+            const __m128i c0 = _mm_packs_epi16(p0, p1);
+            const __m128i c1 = _mm_packs_epi16(p2, p3);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(codes + 32 * g + 0), c0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(codes + 32 * g + 16), c1);
+            const __m128i s2 = _mm_add_epi16(_mm_maddubs_epi16(ones_u8, c0), _mm_maddubs_epi16(ones_u8, c1));
+            const __m128i s4 = _mm_madd_epi16(s2, ones_i16);
+            const __m128i s8 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, _MM_SHUFFLE(1, 0, 3, 2)));
+            const __m128i s16 = _mm_add_epi32(s8, _mm_shuffle_epi32(s8, _MM_SHUFFLE(2, 3, 0, 1)));
+            sums[g] = _mm_cvtsi128_si32(s16);
+        }
+    }
 }
 
 void fma_avx(const float* a, const float* b, const float* c, float* out, std::size_t count) {

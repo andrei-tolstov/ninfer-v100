@@ -53,6 +53,11 @@ public:
     GgufCpuActivation(int token_capacity, int k);
     // Quantizes `tokens` BF16 columns of k values (column-major, `stride` apart) for `format`.
     void prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride, int tokens);
+    // Split preparation for parallel/deduplicated callers: start() configures metadata, then
+    // prepare_bf16_token() or copy_token_from() fills disjoint token indices safely across threads.
+    void prepare_bf16_start(QType format, int tokens);
+    void prepare_bf16_token(int token, const std::uint16_t* values);
+    void copy_token_from(int dst_token, const GgufCpuActivation& src, int src_token);
     [[nodiscard]] int tokens() const noexcept { return tokens_; }
     [[nodiscard]] int k() const noexcept { return k_; }
     [[nodiscard]] QType format() const noexcept { return format_; }
@@ -83,6 +88,9 @@ void gguf_cpu_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_b
 // out[i] = BF16(silu(gate[i]) * up[i]) for i < count, as the GPU's up kernels store the middle.
 void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                           GgufCpuBackend backend);
+// Fast non-exact AVX1/AVX2 SwiGLU for ggml host-expert mode (standard mul+add without Dekker FMA).
+void gguf_cpu_swiglu_bf16_fast(const float* gate, const float* up, std::size_t count,
+                               std::uint16_t* out, GgufCpuBackend backend);
 
 namespace gguf_cpu_detail {
 using Rows = void (*)(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*,
@@ -92,6 +100,9 @@ void swiglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
 #if defined(NINFER_CPU_EXPERT_X86)
 void rows_avx(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx(const float*, const float*, std::size_t, std::uint16_t*);
+void swiglu_fast_avx(const float*, const float*, std::size_t, std::uint16_t*);
+void prepare_bf16_avx(QType format, const std::uint16_t* values, std::size_t stride, int tokens,
+                      int k, std::int8_t* codes, float* scales, std::int32_t* sums);
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
 #endif

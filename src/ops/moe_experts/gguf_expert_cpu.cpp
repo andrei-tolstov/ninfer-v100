@@ -371,8 +371,7 @@ void GgufCpuActivation::quantize(QType format, int token, const float* values) {
     }
 }
 
-void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride,
-                                     int tokens) {
+void GgufCpuActivation::prepare_bf16_start(QType format, int tokens) {
     if (tokens <= 0 || tokens > capacity_) {
         throw std::invalid_argument("GGUF CPU activation: token count exceeds capacity");
     }
@@ -381,6 +380,43 @@ void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, 
     }
     format_ = format;
     tokens_ = tokens;
+}
+
+void GgufCpuActivation::prepare_bf16_token(int token, const std::uint16_t* values) {
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (cpu_has_avx_f16c() && format_ != QType::GGUF_Q2_0) {
+        gguf_cpu_detail::prepare_bf16_avx(format_, values, std::size_t(k_), 1, k_,
+                                          codes_.data() + std::size_t(token) * k_,
+                                          scales_.data() + std::size_t(token) * groups_,
+                                          sums_.data() + std::size_t(token) * groups_);
+        return;
+    }
+#endif
+    std::vector<float> local_scratch(static_cast<std::size_t>(k_));
+    for (int i = 0; i < k_; ++i) {
+        local_scratch[i] = std::bit_cast<float>(std::uint32_t(values[i]) << 16);
+    }
+    quantize(format_, token, local_scratch.data());
+}
+
+void GgufCpuActivation::copy_token_from(int dst_token, const GgufCpuActivation& src, int src_token) {
+    std::memcpy(codes_.data() + std::size_t(dst_token) * k_, src.codes(src_token), std::size_t(k_));
+    std::memcpy(scales_.data() + std::size_t(dst_token) * groups_, src.scales(src_token),
+                std::size_t(groups_) * sizeof(float));
+    std::memcpy(sums_.data() + std::size_t(dst_token) * groups_, src.sums(src_token),
+                std::size_t(groups_) * sizeof(std::int32_t));
+}
+
+void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride,
+                                     int tokens) {
+    prepare_bf16_start(format, tokens);
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (cpu_has_avx_f16c() && format != QType::GGUF_Q2_0) {
+        gguf_cpu_detail::prepare_bf16_avx(format, values, stride, tokens, k_, codes_.data(),
+                                          scales_.data(), sums_.data());
+        return;
+    }
+#endif
     for (int t = 0; t < tokens; ++t) {
         const std::uint16_t* column = values + std::size_t(t) * stride;
         for (int i = 0; i < k_; ++i) {
@@ -417,6 +453,20 @@ void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count,
     }
     if (selected == GgufCpuBackend::Avx) {
         return gguf_cpu_detail::swiglu_avx(gate, up, count, out);
+    }
+#endif
+    gguf_cpu_detail::swiglu_scalar(gate, up, count, out);
+}
+
+void gguf_cpu_swiglu_bf16_fast(const float* gate, const float* up, std::size_t count,
+                               std::uint16_t* out, GgufCpuBackend backend) {
+    [[maybe_unused]] const GgufCpuBackend selected = resolve_backend(backend);
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (selected == GgufCpuBackend::Avx2) {
+        return gguf_cpu_detail::swiglu_avx2(gate, up, count, out);
+    }
+    if (selected == GgufCpuBackend::Avx) {
+        return gguf_cpu_detail::swiglu_fast_avx(gate, up, count, out);
     }
 #endif
     gguf_cpu_detail::swiglu_scalar(gate, up, count, out);
