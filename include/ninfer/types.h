@@ -502,6 +502,21 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
+// Host NUMA placement and multi-socket execution policy on multi-socket systems.
+enum class NumaPolicy : std::uint8_t {
+    // Isolate host allocations and worker pools to the active GPU's local NUMA node when its
+    // available RAM holds the weights and requested CPU threads fit on that node; otherwise use
+    // Sharded (or Mirror when abundant free host RAM allows remote read-only mirrors).
+    Auto,
+    // Pin host weights and worker pools strictly to the active GPU's local NUMA node.
+    Isolate,
+    // Shard host weights across NUMA nodes and run per-node worker pools on node-local experts.
+    Sharded,
+    // Pin host weights on the active GPU's NUMA node and allocate per-remote-node read-only mirrors
+    // for CPU workers on remote sockets.
+    Mirror,
+};
+
 // Flash-Next host and disk experts: how a decode or verification call gets the routed experts the
 // device cache lacks. By default every miss executes on the GPU; a DMA share below one lets the CPU
 // compute the rest: for GGUF banks the GPU's results bit for bit, for native banks different
@@ -529,6 +544,8 @@ struct HybridExpertOptions {
     // ggml-cpu's vecdot kernels (q8_K / q8_0 activations) -- faster, not bit for bit. Projections
     // ggml-cpu does not cover (e.g. GSQ-RCO's Q2_0) keep the exact products.
     bool cpu_ggml = false;
+    // Multi-socket NUMA placement and CPU pool scheduling policy.
+    NumaPolicy numa_policy = NumaPolicy::Auto;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
 };

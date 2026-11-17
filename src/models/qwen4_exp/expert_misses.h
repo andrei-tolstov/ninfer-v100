@@ -15,6 +15,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/numa.h"
 #include "core/weight.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/model.h"
@@ -65,7 +66,8 @@ struct MissOptions {
     std::uint32_t tail_skip_rank = 0;
     // The CPU's host experts run on ggml-cpu's vecdot kernels (faster, not bit for bit) where its
     // kernels cover the stored format; other stored formats keep the exact q8_1 products.
-    bool cpu_ggml           = false;
+    bool cpu_ggml          = false;
+    NumaPolicy numa_policy = NumaPolicy::Auto;
 };
 
 struct MissStats {

@@ -92,6 +92,23 @@ int run_tests() {
                               fixed_after.hybrid_experts.dma_share == 0.5F,
                           "CLI did not preserve an automatic hybrid DMA share");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                              .hybrid_experts.numa_policy == ninfer::NumaPolicy::Auto &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--numa-policy", "isolate"})
+                                  .hybrid_experts.numa_policy == ninfer::NumaPolicy::Isolate &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--numa-policy", "sharded"})
+                                  .hybrid_experts.numa_policy == ninfer::NumaPolicy::Sharded &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--numa-policy", "mirror"})
+                                  .hybrid_experts.numa_policy == ninfer::NumaPolicy::Mirror,
+                      "CLI did not parse --numa-policy");
+    for (const auto* bad_numa : {"", "local", "distribute", "AUTO"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--numa-policy", bad_numa});
+        }), "CLI accepted an invalid --numa-policy");
+    }
     for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});

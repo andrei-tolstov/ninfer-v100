@@ -65,6 +65,9 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
                              "--expert-dma-share", "auto"}).hybrid_experts.dma_share_auto,
                       "server did not preserve an automatic hybrid DMA share");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--numa-policy", "sharded"})
+                              .hybrid_experts.numa_policy == ninfer::NumaPolicy::Sharded,
+                      "server did not preserve --numa-policy");
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});

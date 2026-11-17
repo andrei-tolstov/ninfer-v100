@@ -11,6 +11,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -18,7 +19,7 @@ namespace ninfer::models::qwen4_exp {
 
 class ReadPool {
 public:
-    explicit ReadPool(std::size_t threads);
+    explicit ReadPool(std::size_t threads, std::span<const int> cpu_ids = {});
     ~ReadPool();
     ReadPool(const ReadPool&)            = delete;
     ReadPool& operator=(const ReadPool&) = delete;
@@ -30,7 +31,7 @@ public:
     void run(std::size_t count, std::function<void(std::size_t)> read);
 
 private:
-    void work();
+    void work(int cpu_id);
     void drain();
 
     std::mutex mutex_;

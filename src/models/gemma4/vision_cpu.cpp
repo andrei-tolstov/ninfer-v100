@@ -1,5 +1,6 @@
 #include "models/gemma4/vision_cpu.h"
 
+#include "core/numa.h"
 #include "core/weight_view.h"
 #include "models/gemma4/vision_cpu_kernels.h"
 
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -57,10 +59,12 @@ std::vector<float> host_values(const Model& model, WeightId id, std::size_t colu
 // threads.
 class Team {
 public:
-    explicit Team(unsigned threads) : size_(std::max(1U, threads)) {
+    explicit Team(unsigned threads, std::span<const int> worker_cpus = {})
+        : size_(std::max(1U, threads)) {
         workers_.reserve(size_ - 1);
         for (unsigned index = 1; index < size_; ++index) {
-            workers_.emplace_back([this, index] { serve(index); });
+            const int cpu_id = index < worker_cpus.size() ? worker_cpus[index] : -1;
+            workers_.emplace_back([this, index, cpu_id] { serve(index, cpu_id); });
         }
     }
 
@@ -106,7 +110,8 @@ public:
     }
 
 private:
-    void serve(unsigned index) {
+    void serve(unsigned index, int cpu_id) {
+        if (cpu_id >= 0) { (void)bind_thread_to_cpu(cpu_id); }
         std::uint64_t seen = 0;
         for (;;) {
             std::function<void(unsigned)> job;
@@ -222,10 +227,16 @@ void apply_norm(const Matrix& x, const std::vector<float>& scale, const std::vec
 
 CpuVisionTower::CpuVisionTower(const Model& model, unsigned threads)
     : config_(*model.vision_config()),
-      threads_(threads != 0 ? threads : std::max(1U, std::thread::hardware_concurrency())) {
+      threads_(threads != 0
+                   ? threads
+                   : static_cast<unsigned>(
+                         std::max<std::size_t>(1, select_worker_cpus(device_numa_node(0), 0).size()))) {
     if (!model.vision() || model.vision_placement() != VisionPlacement::Host) {
         throw std::invalid_argument("gemma4 CPU vision: the model holds no host vision tower");
     }
+    const int vision_node = device_numa_node(0);
+    ScopedThreadMemPolicy mem_scope(vision_node,
+                                    vision_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
     const VisionWeights& w = *model.vision();
     const std::size_t h = config_.hidden_size, width = config_.intermediate_size;
     const std::size_t d = config_.head_dim;
@@ -279,7 +290,8 @@ std::vector<std::uint16_t> CpuVisionTower::encode(std::span<const std::uint16_t>
         throw std::invalid_argument("gemma4 CPU vision: invalid encode batch");
     }
     const float eps = config_.rms_norm_eps;
-    Team team(threads_);
+    const auto worker_cpus = select_worker_cpus(device_numa_node(0), threads_);
+    Team team(threads_, worker_cpus);
 
     Matrix x(features, total);
     for (int p = 0; p < total; ++p) {

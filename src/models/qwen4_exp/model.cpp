@@ -3,6 +3,7 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
+#include "core/numa.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
@@ -485,7 +486,25 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
-    auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+    artifact::MaterializeOptions mat_options;
+    if (options.experts == ExpertResidency::Host) {
+        const auto& topo        = host_numa_topology();
+        const int gpu_node      = device_numa_node(device.rank(0).device);
+        const auto numa_plan    = plan_host_numa(topo, gpu_node, materialization.pinned_capacity_bytes,
+                                                 options.cpu_threads, options.numa_policy);
+        mat_options.pinned_numa_node = numa_plan.primary_node;
+        mat_options.pinned_numa_placement =
+            numa_plan.primary_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default;
+        for (const auto& s : numa_plan.pinned_shards) {
+            mat_options.pinned_shards.push_back(
+                PinnedShardRange{s.offset, s.bytes, s.numa_node});
+        }
+    } else if (const int gpu_node = device_numa_node(device.rank(0).device); gpu_node >= 0) {
+        mat_options.pinned_numa_node      = gpu_node;
+        mat_options.pinned_numa_placement = NumaPlacement::Bind;
+    }
+    auto backing = artifact::materialize(reader, std::move(materialization), device, observer,
+                                         nullptr, mat_options);
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     auto model           = std::unique_ptr<Model>(
         new Model(std::move(config), options, std::move(weights), std::move(stages),

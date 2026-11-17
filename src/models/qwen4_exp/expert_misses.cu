@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/expert_misses.h"
 
 #include "core/file_read_error.h"
+#include "core/numa.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 #include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 
@@ -15,13 +16,13 @@
 #include <condition_variable>
 #include <cstring>
 #include <exception>
-#include <type_traits>
-#include <utility>
 #include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 #ifdef _WIN32
 #    ifndef NOMINMAX
@@ -34,73 +35,81 @@
 #    include <unistd.h>
 #endif
 #ifdef __linux__
-#    include <fstream>
-#    include <pthread.h>
-#    include <sched.h>
+#    include <sys/mman.h>
 #endif
 
 namespace ninfer::models::qwen4_exp {
 namespace {
 
-// Logical CPUs this process may keep busy: std::thread's count, bounded on Linux by the affinity
-// mask and by a container's CPU quota (cgroup v2 cpu.max, v1 cpu.cfs_quota_us), so spinning
-// workers do not exhaust the quota and stall the executor's thread.
-unsigned usable_cpus() {
-    unsigned count = std::max(1U, std::thread::hardware_concurrency());
-#ifdef __linux__
-    cpu_set_t set;
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        count = std::min(count, unsigned(std::max(1, CPU_COUNT(&set))));
+// Page-aligned NUMA-bound read-only copy of host expert matrices for multi-socket Mirror mode.
+class MirrorBuffer {
+public:
+    MirrorBuffer() = default;
+    ~MirrorBuffer() { reset(); }
+    MirrorBuffer(const MirrorBuffer&)            = delete;
+    MirrorBuffer& operator=(const MirrorBuffer&) = delete;
+    MirrorBuffer(MirrorBuffer&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)),
+          bytes_(std::exchange(other.bytes_, 0)),
+          mmap_backed_(std::exchange(other.mmap_backed_, false)) {}
+    MirrorBuffer& operator=(MirrorBuffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            data_        = std::exchange(other.data_, nullptr);
+            bytes_       = std::exchange(other.bytes_, 0);
+            mmap_backed_ = std::exchange(other.mmap_backed_, false);
+        }
+        return *this;
     }
-    double quota = -1, period = 0;
-    if (std::ifstream v2("/sys/fs/cgroup/cpu.max"); v2) {
-        std::string limit;
-        if (v2 >> limit >> period && limit != "max") { quota = std::strtod(limit.c_str(), nullptr); }
-    } else if (std::ifstream q("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), p("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
-               q && p) {
-        if (!(q >> quota && p >> period)) { quota = -1; }
-    }
-    if (quota > 0 && period > 0) { count = std::min(count, std::max(1U, unsigned(quota / period))); }
-#endif
-    return count;
-}
 
+    void allocate(std::size_t bytes, int numa_node) {
+        reset();
+        if (bytes == 0) { return; }
 #ifdef __linux__
-std::vector<int> physical_cpus() {
-    std::vector<int> out;
-    cpu_set_t set;
-    if (sched_getaffinity(0, sizeof(set), &set) != 0) { return out; }
-    std::vector<std::pair<int, int>> seen;
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (!CPU_ISSET(cpu, &set)) { continue; }
-        int pkg = 0, core = cpu;
-        if (std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-                            "/topology/physical_package_id");
-            f) {
-            f >> pkg;
+        void* ptr = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                           -1, 0);
+        if (ptr != MAP_FAILED) {
+            mmap_backed_ = true;
+            data_        = static_cast<std::byte*>(ptr);
+            bytes_       = bytes;
+            if (numa_node >= 0) {
+                (void)bind_memory_to_node(data_, bytes_, numa_node, /*move_pages=*/false);
+            }
+            return;
         }
-        if (std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-                            "/topology/core_id");
-            f) {
-            f >> core;
-        }
-        const std::pair<int, int> key{pkg, core};
-        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
-            seen.push_back(key);
-            out.push_back(cpu);
-        }
-    }
-    return out;
-}
-
-void pin_current_thread(int cpu_id) noexcept {
-    if (cpu_id < 0) { return; }
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu_id, &set);
-    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-}
+#else
+        (void)numa_node;
 #endif
+        data_        = static_cast<std::byte*>(::operator new(bytes, std::align_val_t{64}));
+        bytes_       = bytes;
+        mmap_backed_ = false;
+    }
+
+    [[nodiscard]] std::byte* data() noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return bytes_; }
+
+private:
+    void reset() noexcept {
+        if (!data_) { return; }
+#ifdef __linux__
+        if (mmap_backed_) {
+            (void)::munmap(data_, bytes_);
+            data_        = nullptr;
+            bytes_       = 0;
+            mmap_backed_ = false;
+            return;
+        }
+#endif
+        ::operator delete(data_, std::align_val_t{64});
+        data_        = nullptr;
+        bytes_       = 0;
+        mmap_backed_ = false;
+    }
+
+    std::byte* data_   = nullptr;
+    std::size_t bytes_ = 0;
+    bool mmap_backed_  = false;
+};
 
 // One turn of a spin wait: the processor's pause hint where it has one, a yield elsewhere.
 // YieldProcessor() is the Windows SDK's portable spelling; the GCC/Clang builtin is not known to
@@ -470,11 +479,7 @@ private:
         }
     }
     void work(int pin_cpu) {
-#ifdef __linux__
-        if (pin_cpu >= 0) { pin_current_thread(pin_cpu); }
-#else
-        (void)pin_cpu;
-#endif
+        if (pin_cpu >= 0) { (void)bind_thread_to_cpu(pin_cpu); }
         std::uint64_t seen = 0;
         for (;;) {
             if (stop_.load()) { return; }
@@ -580,10 +585,10 @@ struct ExpertMisses::Impl {
     std::vector<Rank> ranks;
     std::uint32_t pair_capacity = 0;
     std::uint64_t half_bytes = 0, file_half_bytes = 0;
-    std::unique_ptr<SpinPool> pool;
     ops::GgufCpuBackend backend = ops::GgufCpuBackend::Automatic;
-    std::uint32_t cpu_threads   = 0; // the pool's workers and the service thread
-    bool disk = false;
+    std::uint32_t cpu_threads   = 0; // total CPU workers across all active NUMA nodes
+    HostNumaMode numa_mode      = HostNumaMode::Isolate;
+    bool disk                   = false;
 
     // CPU work of one request.
     struct CpuExpert {
@@ -600,11 +605,40 @@ struct ExpertMisses::Impl {
         std::size_t expert = 0;
         int token          = 0;
     };
-    std::vector<CpuExpert> cpu_experts;
-    std::vector<MidTask> mid_tasks;
-    ops::GgufCpuActivation shared_in, shared_in_up;
-    ops::GgmlCpuActivation shared_in_ggml, shared_in_up_ggml;
+    struct NodeContext {
+        int node_id                  = 0;
+        bool is_primary              = true;
+        int lead_cpu                 = -1;
+        std::uint32_t worker_threads = 0;
+        std::unique_ptr<SpinPool> pool;
+        std::vector<CpuExpert> cpu_experts;
+        std::size_t active_experts = 0;
+        std::vector<MidTask> mid_tasks;
+        ops::GgufCpuActivation shared_in, shared_in_up;
+        ops::GgmlCpuActivation shared_in_ggml, shared_in_up_ggml;
+        MirrorBuffer mirror_buffer;
+        std::vector<std::array<std::vector<const void*>, 3>> mirror_ptrs;
+
+        struct RemoteRunner {
+            std::thread thread;
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::atomic<bool> spinning{false};
+            std::atomic<bool> stop{false};
+            std::atomic<std::uint64_t> pending_seq{0};
+            std::atomic<std::uint64_t> done_seq{0};
+            std::uint64_t expected_seq  = 0;
+            const MissLayer* layer      = nullptr;
+            bool cpu_ggml               = false;
+            ops::GgufCpuBackend backend = ops::GgufCpuBackend::Automatic;
+            std::exception_ptr failure;
+        };
+        std::unique_ptr<RemoteRunner> remote;
+    };
+    std::vector<std::unique_ptr<NodeContext>> nodes;
+    std::vector<std::vector<std::uint16_t>> expert_home_node;
     int service_pin_cpu = -1;
+    int primary_gpu_node = kNoNumaNode;
     TimeFit cpu_time{20.0, 100.0}; // about 10 GB/s, refitted by the first CPU requests
 
     mutable std::mutex stats_mutex;
@@ -660,7 +694,10 @@ struct ExpertMisses::Impl {
             RankBinding bind(device, r);
             stamp_device[r] = DeviceBuffer(admitting[r] * kMaxExperts * 4);
             stamp_device[r].fill(0);
-            stamp_host[r] = std::make_unique<PinnedHostBuffer>(admitting[r] * kMaxExperts * 4);
+            const int rank_node = device_numa_node(device.rank(r).device);
+            stamp_host[r] = std::make_unique<PinnedHostBuffer>(
+                admitting[r] * kMaxExperts * 4, rank_node,
+                rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
             std::memset(stamp_host[r]->data(), 0, stamp_host[r]->size());
         }
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
@@ -672,30 +709,43 @@ struct ExpertMisses::Impl {
             Rank& rank = ranks[r];
             if (!rank.used) { continue; }
             RankBinding bind(device, r);
-            rank.box_memory = std::make_unique<PinnedHostBuffer>(sizeof(Mailbox));
-            rank.box        = ::new (rank.box_memory->data()) Mailbox();
-            rank.cached_ids     = DeviceBuffer(std::size_t(pair_capacity) * 4);
-            rank.missing_device = DeviceBuffer(std::size_t(pair_capacity) * 4);
-            rank.staging    = DeviceBuffer(2 * half_bytes);
+            const int rank_node  = device_numa_node(device.rank(r).device);
+            const auto pin_place = rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default;
+            rank.box_memory      = std::make_unique<PinnedHostBuffer>(sizeof(Mailbox), rank_node,
+                                                                      pin_place);
+            rank.box             = ::new (rank.box_memory->data()) Mailbox();
+            rank.cached_ids      = DeviceBuffer(std::size_t(pair_capacity) * 4);
+            rank.missing_device  = DeviceBuffer(std::size_t(pair_capacity) * 4);
+            rank.staging         = DeviceBuffer(2 * half_bytes);
             rank.staging.fill(0);
-            rank.need          = std::make_unique<PinnedHostBuffer>(64);
+            rank.need          = std::make_unique<PinnedHostBuffer>(64, rank_node, pin_place);
             *static_cast<std::uint32_t*>(rank.need->data()) = 0;
-            rank.tables        = std::make_unique<PinnedHostBuffer>(3 * kMaxExperts * sizeof(void*));
+            rank.tables        = std::make_unique<PinnedHostBuffer>(3 * kMaxExperts * sizeof(void*),
+                                                                    rank_node, pin_place);
             std::memset(rank.tables->data(), 0, rank.tables->size());
-            rank.missing_ids   = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4);
-            rank.product_pairs = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4);
-            rank.product_count = std::make_unique<PinnedHostBuffer>(64);
+            rank.missing_ids   = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4,
+                                                                    rank_node, pin_place);
+            rank.product_pairs = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4,
+                                                                    rank_node, pin_place);
+            rank.product_count = std::make_unique<PinnedHostBuffer>(64, rank_node, pin_place);
             rank.products      = std::make_unique<PinnedHostBuffer>(
-                cpu ? std::size_t(pair_capacity) * kHidden * 4 : 64);
-            rank.host_ids      = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4);
-            rank.host_missing  = std::make_unique<PinnedHostBuffer>(kMaxExperts * 4);
+                cpu ? std::size_t(pair_capacity) * kHidden * 4 : 64, rank_node, pin_place);
+            rank.host_ids      = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4,
+                                                                    rank_node, pin_place);
+            rank.host_missing  = std::make_unique<PinnedHostBuffer>(kMaxExperts * 4, rank_node,
+                                                                    pin_place);
             rank.host_m        = cpu ? std::make_unique<PinnedHostBuffer>(
-                                    std::size_t(options.token_capacity) * kHidden * 2)
+                                    std::size_t(options.token_capacity) * kHidden * 2, rank_node,
+                                    pin_place)
                                      : nullptr;
-            if (disk) { rank.file_staging = std::make_unique<PinnedHostBuffer>(2 * file_half_bytes); }
-            rank.patches = std::make_unique<PinnedHostBuffer>(2 * kMaxExperts * sizeof(TablePatch));
+            if (disk) {
+                rank.file_staging =
+                    std::make_unique<PinnedHostBuffer>(2 * file_half_bytes, rank_node, pin_place);
+            }
+            rank.patches = std::make_unique<PinnedHostBuffer>(
+                2 * kMaxExperts * sizeof(TablePatch), rank_node, pin_place);
             rank.behind_patches = std::make_unique<PinnedHostBuffer>(
-                kBehindLists * 2 * kMaxExperts * sizeof(TablePatch));
+                kBehindLists * 2 * kMaxExperts * sizeof(TablePatch), rank_node, pin_place);
             rank.stamps  = DeviceBuffer(64);
             rank.stamps.fill(0);
             CUDA_CHECK(cudaStreamCreateWithFlags(&rank.copies, cudaStreamNonBlocking));
@@ -716,28 +766,130 @@ struct ExpertMisses::Impl {
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaStreamSynchronize(rank.copies));
         }
+        const std::size_t primary_rank_idx = !layers.empty() ? layers.front().rank : 0;
+        primary_gpu_node = device_numa_node(device.rank(primary_rank_idx).device);
         if (cpu) {
-            // By default the physical cores (assuming two hardware threads each) less two, for the
-            // executor's thread and this service.
-            const std::uint32_t threads =
-                options.cpu_threads != 0 ? options.cpu_threads
-                                         : std::clamp(usable_cpus() / 2, 3U, 18U) - 2U;
-            std::vector<int> worker_pins;
-#ifdef __linux__
-            std::vector<int> phys = physical_cpus();
-            if (phys.size() >= threads) {
-                worker_pins.assign(phys.begin(), phys.begin() + std::ptrdiff_t(threads - 1));
-                service_pin_cpu = phys[threads - 1];
+            std::uint64_t total_host_bytes = 0;
+            if (!disk) {
+                for (const auto& layer : layers) {
+                    std::uint64_t lb = 0;
+                    for (const auto& p : layer.projections) {
+                        lb += std::uint64_t(p.expert_bytes);
+                    }
+                    total_host_bytes += lb * layer.experts;
+                }
             }
-#endif
-            pool        = std::make_unique<SpinPool>(threads > 1 ? threads - 1 : 0, std::move(worker_pins));
-            backend     = ops::gguf_cpu_backend_selected(ops::GgufCpuBackend::Automatic);
-            cpu_threads = threads;
+            const HostNumaPlan numa_plan = plan_host_numa(
+                host_numa_topology(), primary_gpu_node, total_host_bytes, options.cpu_threads,
+                options.numa_policy);
+            numa_mode       = numa_plan.mode;
+            service_pin_cpu = numa_plan.service_cpu;
+            backend         = ops::gguf_cpu_backend_selected(ops::GgufCpuBackend::Automatic);
+
+            nodes.reserve(numa_plan.node_plans.size());
+            for (std::size_t idx = 0; idx < numa_plan.node_plans.size(); ++idx) {
+                const HostNumaNodePlan& np = numa_plan.node_plans[idx];
+                auto ctx                   = std::make_unique<NodeContext>();
+                ctx->node_id               = np.node_id;
+                ctx->is_primary            = (idx == 0);
+                ctx->worker_threads        = np.worker_threads;
+                if (ctx->is_primary) {
+                    ctx->lead_cpu = numa_plan.service_cpu;
+                    ctx->pool     = std::make_unique<SpinPool>(
+                        np.worker_threads > 1 ? np.worker_threads - 1 : 0, np.worker_cpus);
+                } else {
+                    ctx->lead_cpu = !np.worker_cpus.empty() ? np.worker_cpus.front() : -1;
+                    std::vector<int> bg_pins;
+                    if (np.worker_cpus.size() > 1) {
+                        bg_pins.assign(np.worker_cpus.begin() + 1, np.worker_cpus.end());
+                    }
+                    ctx->pool = std::make_unique<SpinPool>(
+                        np.worker_threads > 1 ? np.worker_threads - 1 : 0, std::move(bg_pins));
+                    ctx->remote = std::make_unique<NodeContext::RemoteRunner>();
+                    NodeContext* raw_ctx = ctx.get();
+                    ctx->remote->thread  = std::thread([this, raw_ctx] { run_remote_node(*raw_ctx); });
+                }
+                cpu_threads += ctx->worker_threads;
+                nodes.push_back(std::move(ctx));
+            }
+
+            if (numa_mode == HostNumaMode::Mirror && !disk && nodes.size() > 1 &&
+                total_host_bytes > 0) {
+                for (std::size_t idx = 1; idx < nodes.size(); ++idx) {
+                    NodeContext& ctx = *nodes[idx];
+                    std::size_t aligned_bytes = 0;
+                    for (const auto& layer : layers) {
+                        for (int k = 0; k < 3; ++k) {
+                            const auto& p = layer.projections[std::size_t(k)];
+                            aligned_bytes += aligned(std::uint64_t(p.expert_bytes)) * layer.experts;
+                        }
+                    }
+                    ctx.mirror_buffer.allocate(aligned_bytes, ctx.node_id);
+                    ctx.mirror_ptrs.resize(layers.size());
+                    ScopedThreadMemPolicy mem_scope(ctx.node_id, NumaPlacement::Bind);
+                    std::size_t cursor = 0;
+                    for (std::size_t li = 0; li < layers.size(); ++li) {
+                        const auto& layer = layers[li];
+                        for (int k = 0; k < 3; ++k) {
+                            const auto& p = layer.projections[std::size_t(k)];
+                            auto& dst_vec = ctx.mirror_ptrs[li][std::size_t(k)];
+                            dst_vec.resize(layer.experts);
+                            const std::size_t stride = aligned(std::uint64_t(p.expert_bytes));
+                            for (std::uint32_t e = 0; e < layer.experts; ++e) {
+                                std::byte* dst = ctx.mirror_buffer.data() + cursor;
+                                std::memcpy(dst, p.host[e], std::size_t(p.expert_bytes));
+                                dst_vec[e] = dst;
+                                cursor += stride;
+                            }
+                        }
+                    }
+                }
+            } else if (numa_mode == HostNumaMode::Sharded && !disk && nodes.size() > 1) {
+                const auto node_index_of = [&](int os_node) -> int {
+                    for (std::size_t idx = 0; idx < nodes.size(); ++idx) {
+                        if (nodes[idx]->node_id == os_node) { return static_cast<int>(idx); }
+                    }
+                    return -1;
+                };
+                expert_home_node.resize(layers.size());
+                for (std::size_t li = 0; li < layers.size(); ++li) {
+                    const auto& layer = layers[li];
+                    expert_home_node[li].resize(layer.experts);
+                    const auto fallback_idx =
+                        static_cast<std::uint16_t>((li * nodes.size()) / layers.size());
+                    for (std::uint32_t e = 0; e < layer.experts; ++e) {
+                        int chosen = -1;
+                        std::array<int, 3> candidates{-1, -1, -1};
+                        for (int k = 0; k < 3; ++k) {
+                            const int n =
+                                query_page_numa_node(layer.projections[std::size_t(k)].host[e]);
+                            candidates[std::size_t(k)] = node_index_of(n);
+                        }
+                        if (candidates[0] >= 0 &&
+                            (candidates[0] == candidates[1] || candidates[0] == candidates[2])) {
+                            chosen = candidates[0];
+                        } else if (candidates[1] >= 0 && candidates[1] == candidates[2]) {
+                            chosen = candidates[1];
+                        } else {
+                            for (const int c : candidates) {
+                                if (c >= 0) {
+                                    chosen = c;
+                                    break;
+                                }
+                            }
+                        }
+                        expert_home_node[li][e] =
+                            chosen >= 0 ? static_cast<std::uint16_t>(chosen) : fallback_idx;
+                    }
+                }
+            }
         }
         service = std::thread([this] {
-#ifdef __linux__
-            if (service_pin_cpu >= 0) { pin_current_thread(service_pin_cpu); }
-#endif
+            if (service_pin_cpu >= 0) {
+                (void)bind_thread_to_cpu(service_pin_cpu);
+            } else if (primary_gpu_node >= 0) {
+                (void)bind_thread_to_node(primary_gpu_node);
+            }
             serve();
         });
     }
@@ -752,6 +904,15 @@ struct ExpertMisses::Impl {
         }
         wake.notify_all();
         if (service.joinable()) { service.join(); }
+        for (auto& ctx : nodes) {
+            if (!ctx || !ctx->remote) { continue; }
+            {
+                std::lock_guard lock(ctx->remote->mutex);
+                ctx->remote->stop.store(true, std::memory_order_release);
+            }
+            ctx->remote->cv.notify_all();
+            if (ctx->remote->thread.joinable()) { ctx->remote->thread.join(); }
+        }
         for (auto& rank : ranks) {
             if (rank.copies) { cudaStreamDestroy(rank.copies); }
             if (rank.copying) { cudaEventDestroy(rank.copying); }
@@ -789,7 +950,7 @@ struct ExpertMisses::Impl {
         for (const auto& p : layer.projections) {
             if (!ops::gguf_cpu_supported(p.format)) { return false; }
         }
-        return pool != nullptr;
+        return !nodes.empty() && cpu_threads > 0;
     }
 
     void admit_behind(Rank& rank, const MissLayer& layer, std::uint32_t layer_index,
@@ -805,19 +966,22 @@ struct ExpertMisses::Impl {
         auto* joiners  = victims + kMaxExperts;
         int leaving = 0, joining = 0;
         std::vector<std::pair<std::int32_t, ExpertCache::Admitted>> admitted;
-        for (const CpuExpert& job : cpu_experts) {
-            ExpertCache::Admitted slot;
-            if (!cache->admit(layer_index, job.expert,
-                              last_use_host(layer_index),
-                              {in_use.data(), in_use.size()}, slot)) {
-                continue;
+        for (const auto& ctx : nodes) {
+            for (std::size_t ei = 0; ei < ctx->active_experts; ++ei) {
+                const CpuExpert& job = ctx->cpu_experts[ei];
+                ExpertCache::Admitted slot;
+                if (!cache->admit(layer_index, job.expert,
+                                  last_use_host(layer_index),
+                                  {in_use.data(), in_use.size()}, slot)) {
+                    continue;
+                }
+                if (slot.victim >= 0) {
+                    victims[leaving++] =
+                        TablePatch{slot.victim, {slot.victim_host[0], slot.victim_host[1], slot.victim_host[2]}};
+                }
+                joiners[joining++] = TablePatch{job.expert, {slot.slot[0], slot.slot[1], slot.slot[2]}};
+                admitted.emplace_back(job.expert, slot);
             }
-            if (slot.victim >= 0) {
-                victims[leaving++] =
-                    TablePatch{slot.victim, {slot.victim_host[0], slot.victim_host[1], slot.victim_host[2]}};
-            }
-            joiners[joining++] = TablePatch{job.expert, {slot.slot[0], slot.slot[1], slot.slot[2]}};
-            admitted.emplace_back(job.expert, slot);
         }
         if (joining == 0) { return; }
         const auto tables_of = cache->tables(layer_index);
@@ -849,8 +1013,150 @@ struct ExpertMisses::Impl {
         counters.staged_bytes += bytes;
     }
 
+    void spin_all(bool on) {
+        for (auto& ctx : nodes) {
+            if (ctx->pool) { ctx->pool->spin(on); }
+            if (ctx->remote) {
+                {
+                    std::lock_guard lock(ctx->remote->mutex);
+                    ctx->remote->spinning.store(on, std::memory_order_release);
+                }
+                ctx->remote->cv.notify_all();
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t target_node_index(std::size_t idx, std::size_t total,
+                                                std::size_t layer_index,
+                                                std::int32_t expert) const {
+        if (nodes.size() <= 1) { return 0; }
+        if (numa_mode == HostNumaMode::Sharded && !disk &&
+            layer_index < expert_home_node.size() &&
+            std::size_t(expert) < expert_home_node[layer_index].size()) {
+            return expert_home_node[layer_index][std::size_t(expert)];
+        }
+        if (total <= 1 || cpu_threads == 0) { return 0; }
+        const std::size_t slot = ((idx * 2 + 1) * std::size_t(cpu_threads)) / (2 * total);
+        std::size_t cum        = 0;
+        for (std::size_t k = 0; k < nodes.size(); ++k) {
+            cum += nodes[k]->worker_threads;
+            if (slot < cum) { return k; }
+        }
+        return nodes.size() - 1;
+    }
+
+    void execute_node_experts(NodeContext& ctx, const MissLayer& layer) {
+        const std::size_t n_experts = ctx.active_experts;
+        if (n_experts == 0) { return; }
+        const auto& gate_p = layer.projections[0];
+        const auto& up_p   = layer.projections[1];
+        const auto& down_p = layer.projections[2];
+        const auto ggml_layout = [](QType format) {
+            return (format == QType::GGUF_IQ4_NL || format == QType::GGUF_Q8_0)
+                       ? ops::GgmlActLayout::Q8_0
+                       : ops::GgmlActLayout::Q8K;
+        };
+        const bool gate_ggml = options.cpu_ggml && ops::gguf_ggml_supported(gate_p.format);
+        const bool up_ggml   = options.cpu_ggml && ops::gguf_ggml_supported(up_p.format);
+        const bool down_ggml = options.cpu_ggml && ops::gguf_ggml_supported(down_p.format);
+        const bool same_up_act =
+            gate_ggml == up_ggml &&
+            (gate_ggml ? ggml_layout(gate_p.format) == ggml_layout(up_p.format)
+                       : up_p.format == gate_p.format);
+
+        constexpr int kRowsPerTask = 64;
+        const int gate_tasks = (kWidth + kRowsPerTask - 1) / kRowsPerTask;
+        const std::size_t first_count = n_experts * std::size_t(2 * gate_tasks);
+        ctx.pool->run(first_count, [&](std::size_t i) {
+            auto& job        = ctx.cpu_experts[i / (2 * gate_tasks)];
+            const int part   = int(i % (2 * gate_tasks));
+            const bool is_up = part >= gate_tasks;
+            const int begin  = (part % gate_tasks) * kRowsPerTask;
+            const int end    = std::min(begin + kRowsPerTask, kWidth);
+            const auto& p    = is_up ? up_p : gate_p;
+            const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows, p.k};
+            if (is_up ? up_ggml : gate_ggml) {
+                const auto& xx = (is_up && !same_up_act)
+                                     ? (job.use_shared_input ? ctx.shared_in_up_ggml : job.input_up_ggml)
+                                     : (job.use_shared_input ? ctx.shared_in_ggml : job.input_ggml);
+                ops::gguf_cpu_rows_ggml(w, xx, begin, end, (is_up ? job.up : job.gate).data(), kWidth);
+            } else {
+                const auto& x = (is_up && !same_up_act)
+                                    ? (job.use_shared_input ? ctx.shared_in_up : job.input_up)
+                                    : (job.use_shared_input ? ctx.shared_in : job.input);
+                ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth,
+                                  backend);
+            }
+        });
+        // Parallel SwiGLU + middle activation preparation across every (expert, token) column.
+        ctx.pool->run(ctx.mid_tasks.size(), [&](std::size_t i) {
+            const MidTask task    = ctx.mid_tasks[i];
+            auto& job             = ctx.cpu_experts[task.expert];
+            const std::size_t off = std::size_t(task.token) * kWidth;
+            if (options.cpu_ggml) {
+                ops::gguf_cpu_swiglu_bf16_fast(job.gate.data() + off, job.up.data() + off, kWidth,
+                                               job.middle_bf16.data() + off, backend);
+            } else {
+                ops::gguf_cpu_swiglu_bf16(job.gate.data() + off, job.up.data() + off, kWidth,
+                                          job.middle_bf16.data() + off, backend);
+            }
+            if (down_ggml) {
+                job.middle_ggml.prepare_bf16_token(task.token, job.middle_bf16.data() + off);
+            } else {
+                job.middle.prepare_bf16_token(task.token, job.middle_bf16.data() + off);
+            }
+        });
+        const int down_tasks = kHidden / 128;
+        ctx.pool->run(n_experts * std::size_t(down_tasks), [&](std::size_t i) {
+            auto& job       = ctx.cpu_experts[i / down_tasks];
+            const int begin = int(i % down_tasks) * 128;
+            const ops::GgufCpuMatrix w{down_p.format, job.bytes[2], down_p.row_bytes, down_p.rows,
+                                       down_p.k};
+            if (down_ggml) {
+                ops::gguf_cpu_rows_ggml(w, job.middle_ggml, begin, begin + 128, job.down.data(),
+                                       kHidden);
+            } else {
+                ops::gguf_cpu_rows(w, job.middle, begin, begin + 128, job.down.data(), kHidden,
+                                  backend);
+            }
+        });
+    }
+
+    void run_remote_node(NodeContext& ctx) {
+        if (ctx.lead_cpu >= 0) {
+            (void)bind_thread_to_cpu(ctx.lead_cpu);
+        } else if (ctx.node_id >= 0) {
+            (void)bind_thread_to_node(ctx.node_id);
+        }
+        auto& r            = *ctx.remote;
+        std::uint64_t seen = 0;
+        for (;;) {
+            if (r.stop.load(std::memory_order_acquire)) { return; }
+            const std::uint64_t seq = r.pending_seq.load(std::memory_order_acquire);
+            if (seq != seen) {
+                seen = seq;
+                try {
+                    r.failure = nullptr;
+                    execute_node_experts(ctx, *r.layer);
+                } catch (...) { r.failure = std::current_exception(); }
+                r.done_seq.store(seq, std::memory_order_release);
+                continue;
+            }
+            if (r.spinning.load(std::memory_order_relaxed)) {
+                spin_hint();
+                continue;
+            }
+            std::unique_lock lock(r.mutex);
+            r.cv.wait(lock, [&] {
+                return r.stop.load(std::memory_order_acquire) ||
+                       r.spinning.load(std::memory_order_acquire) ||
+                       r.pending_seq.load(std::memory_order_acquire) != seen;
+            });
+        }
+    }
+
     void compute_cpu(const MissLayer& layer, Rank& rank) {
-        const auto* m = static_cast<const std::uint16_t*>(rank.host_m->data());
+        const auto* m  = static_cast<const std::uint16_t*>(rank.host_m->data());
         auto* products = static_cast<float*>(rank.products->data());
         const auto& gate_p = layer.projections[0];
         const auto& up_p   = layer.projections[1];
@@ -876,11 +1182,13 @@ struct ExpertMisses::Impl {
         tok_slot.fill(-1);
         std::array<int, 64> unique_toks{};
         int unique_count = 0;
-        for (const auto& job : cpu_experts) {
-            for (const std::int32_t tok : job.tokens) {
-                if (tok >= 0 && tok < 64 && tok_slot[std::size_t(tok)] < 0) {
-                    tok_slot[std::size_t(tok)] = unique_count;
-                    unique_toks[std::size_t(unique_count++)] = tok;
+        for (const auto& ctx : nodes) {
+            for (std::size_t ei = 0; ei < ctx->active_experts; ++ei) {
+                for (const std::int32_t tok : ctx->cpu_experts[ei].tokens) {
+                    if (tok >= 0 && tok < 64 && tok_slot[std::size_t(tok)] < 0) {
+                        tok_slot[std::size_t(tok)]             = unique_count;
+                        unique_toks[std::size_t(unique_count++)] = tok;
+                    }
                 }
             }
         }
@@ -888,182 +1196,206 @@ struct ExpertMisses::Impl {
             *static_cast<std::int32_t*>(rank.product_count->data()) = 0;
             return;
         }
-        const int capacity = int(options.token_capacity);
+        NodeContext& primary = *nodes[0];
+        const int capacity   = int(options.token_capacity);
         if (gate_ggml) {
-            if (shared_in_ggml.k() != kHidden) { shared_in_ggml = ops::GgmlCpuActivation(capacity, kHidden); }
-            shared_in_ggml.prepare_bf16_start(ggml_layout(gate_p.format), unique_count);
+            if (primary.shared_in_ggml.k() != kHidden) {
+                primary.shared_in_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+            }
+            primary.shared_in_ggml.prepare_bf16_start(ggml_layout(gate_p.format), unique_count);
         } else {
-            if (shared_in.k() != kHidden) { shared_in = ops::GgufCpuActivation(capacity, kHidden); }
-            shared_in.prepare_bf16_start(gate_p.format, unique_count);
+            if (primary.shared_in.k() != kHidden) {
+                primary.shared_in = ops::GgufCpuActivation(capacity, kHidden);
+            }
+            primary.shared_in.prepare_bf16_start(gate_p.format, unique_count);
         }
         if (!same_up_act) {
             if (up_ggml) {
-                if (shared_in_up_ggml.k() != kHidden) {
-                    shared_in_up_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+                if (primary.shared_in_up_ggml.k() != kHidden) {
+                    primary.shared_in_up_ggml = ops::GgmlCpuActivation(capacity, kHidden);
                 }
-                shared_in_up_ggml.prepare_bf16_start(ggml_layout(up_p.format), unique_count);
+                primary.shared_in_up_ggml.prepare_bf16_start(ggml_layout(up_p.format), unique_count);
             } else {
-                if (shared_in_up.k() != kHidden) {
-                    shared_in_up = ops::GgufCpuActivation(capacity, kHidden);
+                if (primary.shared_in_up.k() != kHidden) {
+                    primary.shared_in_up = ops::GgufCpuActivation(capacity, kHidden);
                 }
-                shared_in_up.prepare_bf16_start(up_p.format, unique_count);
+                primary.shared_in_up.prepare_bf16_start(up_p.format, unique_count);
             }
         }
         const int prep_groups = same_up_act ? 1 : 2;
         if (unique_count * prep_groups > 1) {
-            pool->run(std::size_t(unique_count * prep_groups), [&](std::size_t idx) {
+            primary.pool->run(std::size_t(unique_count * prep_groups), [&](std::size_t idx) {
                 const int u    = int(idx % std::size_t(unique_count));
                 const bool up  = int(idx / std::size_t(unique_count)) != 0;
                 const auto* src = m + std::size_t(unique_toks[std::size_t(u)]) * kHidden;
                 if (!up) {
-                    if (gate_ggml) { shared_in_ggml.prepare_bf16_token(u, src); }
-                    else { shared_in.prepare_bf16_token(u, src); }
+                    if (gate_ggml) { primary.shared_in_ggml.prepare_bf16_token(u, src); }
+                    else { primary.shared_in.prepare_bf16_token(u, src); }
                 } else {
-                    if (up_ggml) { shared_in_up_ggml.prepare_bf16_token(u, src); }
-                    else { shared_in_up.prepare_bf16_token(u, src); }
+                    if (up_ggml) { primary.shared_in_up_ggml.prepare_bf16_token(u, src); }
+                    else { primary.shared_in_up.prepare_bf16_token(u, src); }
                 }
             });
         } else {
             const auto* src = m + std::size_t(unique_toks[0]) * kHidden;
-            if (gate_ggml) { shared_in_ggml.prepare_bf16_token(0, src); }
-            else { shared_in.prepare_bf16_token(0, src); }
+            if (gate_ggml) { primary.shared_in_ggml.prepare_bf16_token(0, src); }
+            else { primary.shared_in.prepare_bf16_token(0, src); }
         }
 
-        mid_tasks.clear();
-        for (std::size_t ei = 0; ei < cpu_experts.size(); ++ei) {
-            auto& job = cpu_experts[ei];
-            const auto n = static_cast<int>(job.tokens.size());
-            job.use_shared_input = (n == unique_count);
-            if (job.use_shared_input) {
-                for (int j = 0; j < n; ++j) {
-                    if (job.tokens[std::size_t(j)] != unique_toks[std::size_t(j)]) {
-                        job.use_shared_input = false;
-                        break;
-                    }
-                }
-            }
-            if (!job.use_shared_input) {
+        for (std::size_t ni = 0; ni < nodes.size(); ++ni) {
+            NodeContext& ctx = *nodes[ni];
+            if (ctx.active_experts == 0) { continue; }
+            if (!ctx.is_primary) {
                 if (gate_ggml) {
-                    if (job.input_ggml.k() != kHidden) {
-                        job.input_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+                    if (ctx.shared_in_ggml.k() != kHidden) {
+                        ctx.shared_in_ggml = ops::GgmlCpuActivation(capacity, kHidden);
                     }
-                    job.input_ggml.prepare_bf16_start(ggml_layout(gate_p.format), n);
-                    for (int j = 0; j < n; ++j) {
-                        job.input_ggml.copy_token_from(
-                            j, shared_in_ggml, tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                    ctx.shared_in_ggml.prepare_bf16_start(ggml_layout(gate_p.format), unique_count);
+                    for (int u = 0; u < unique_count; ++u) {
+                        ctx.shared_in_ggml.copy_token_from(u, primary.shared_in_ggml, u);
                     }
                 } else {
-                    if (job.input.k() != kHidden) {
-                        job.input = ops::GgufCpuActivation(capacity, kHidden);
+                    if (ctx.shared_in.k() != kHidden) {
+                        ctx.shared_in = ops::GgufCpuActivation(capacity, kHidden);
                     }
-                    job.input.prepare_bf16_start(gate_p.format, n);
-                    for (int j = 0; j < n; ++j) {
-                        job.input.copy_token_from(
-                            j, shared_in, tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                    ctx.shared_in.prepare_bf16_start(gate_p.format, unique_count);
+                    for (int u = 0; u < unique_count; ++u) {
+                        ctx.shared_in.copy_token_from(u, primary.shared_in, u);
                     }
                 }
                 if (!same_up_act) {
                     if (up_ggml) {
-                        if (job.input_up_ggml.k() != kHidden) {
-                            job.input_up_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+                        if (ctx.shared_in_up_ggml.k() != kHidden) {
+                            ctx.shared_in_up_ggml = ops::GgmlCpuActivation(capacity, kHidden);
                         }
-                        job.input_up_ggml.prepare_bf16_start(ggml_layout(up_p.format), n);
-                        for (int j = 0; j < n; ++j) {
-                            job.input_up_ggml.copy_token_from(
-                                j, shared_in_up_ggml,
-                                tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                        ctx.shared_in_up_ggml.prepare_bf16_start(ggml_layout(up_p.format),
+                                                                 unique_count);
+                        for (int u = 0; u < unique_count; ++u) {
+                            ctx.shared_in_up_ggml.copy_token_from(u, primary.shared_in_up_ggml, u);
                         }
                     } else {
-                        if (job.input_up.k() != kHidden) {
-                            job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+                        if (ctx.shared_in_up.k() != kHidden) {
+                            ctx.shared_in_up = ops::GgufCpuActivation(capacity, kHidden);
                         }
-                        job.input_up.prepare_bf16_start(up_p.format, n);
-                        for (int j = 0; j < n; ++j) {
-                            job.input_up.copy_token_from(
-                                j, shared_in_up,
-                                tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                        ctx.shared_in_up.prepare_bf16_start(up_p.format, unique_count);
+                        for (int u = 0; u < unique_count; ++u) {
+                            ctx.shared_in_up.copy_token_from(u, primary.shared_in_up, u);
                         }
                     }
                 }
             }
-            if (down_ggml) {
-                if (job.middle_ggml.k() != kWidth) {
-                    job.middle_ggml = ops::GgmlCpuActivation(capacity, kWidth);
+            ctx.mid_tasks.clear();
+            for (std::size_t ei = 0; ei < ctx.active_experts; ++ei) {
+                auto& job      = ctx.cpu_experts[ei];
+                const auto n   = static_cast<int>(job.tokens.size());
+                job.use_shared_input = (n == unique_count);
+                if (job.use_shared_input) {
+                    for (int j = 0; j < n; ++j) {
+                        if (job.tokens[std::size_t(j)] != unique_toks[std::size_t(j)]) {
+                            job.use_shared_input = false;
+                            break;
+                        }
+                    }
                 }
-                job.middle_ggml.prepare_bf16_start(ggml_layout(down_p.format), n);
-            } else {
-                if (job.middle.k() != kWidth) { job.middle = ops::GgufCpuActivation(capacity, kWidth); }
-                job.middle.prepare_bf16_start(down_p.format, n);
+                if (!job.use_shared_input) {
+                    if (gate_ggml) {
+                        if (job.input_ggml.k() != kHidden) {
+                            job.input_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+                        }
+                        job.input_ggml.prepare_bf16_start(ggml_layout(gate_p.format), n);
+                        for (int j = 0; j < n; ++j) {
+                            job.input_ggml.copy_token_from(
+                                j, ctx.shared_in_ggml, tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                        }
+                    } else {
+                        if (job.input.k() != kHidden) {
+                            job.input = ops::GgufCpuActivation(capacity, kHidden);
+                        }
+                        job.input.prepare_bf16_start(gate_p.format, n);
+                        for (int j = 0; j < n; ++j) {
+                            job.input.copy_token_from(
+                                j, ctx.shared_in, tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                        }
+                    }
+                    if (!same_up_act) {
+                        if (up_ggml) {
+                            if (job.input_up_ggml.k() != kHidden) {
+                                job.input_up_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+                            }
+                            job.input_up_ggml.prepare_bf16_start(ggml_layout(up_p.format), n);
+                            for (int j = 0; j < n; ++j) {
+                                job.input_up_ggml.copy_token_from(
+                                    j, ctx.shared_in_up_ggml,
+                                    tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                            }
+                        } else {
+                            if (job.input_up.k() != kHidden) {
+                                job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+                            }
+                            job.input_up.prepare_bf16_start(up_p.format, n);
+                            for (int j = 0; j < n; ++j) {
+                                job.input_up.copy_token_from(
+                                    j, ctx.shared_in_up,
+                                    tok_slot[std::size_t(job.tokens[std::size_t(j)])]);
+                            }
+                        }
+                    }
+                }
+                if (down_ggml) {
+                    if (job.middle_ggml.k() != kWidth) {
+                        job.middle_ggml = ops::GgmlCpuActivation(capacity, kWidth);
+                    }
+                    job.middle_ggml.prepare_bf16_start(ggml_layout(down_p.format), n);
+                } else {
+                    if (job.middle.k() != kWidth) {
+                        job.middle = ops::GgufCpuActivation(capacity, kWidth);
+                    }
+                    job.middle.prepare_bf16_start(down_p.format, n);
+                }
+                job.gate.resize(std::size_t(n) * kWidth);
+                job.up.resize(std::size_t(n) * kWidth);
+                job.down.resize(std::size_t(n) * kHidden);
+                job.middle_bf16.resize(job.gate.size());
+                for (int t = 0; t < n; ++t) { ctx.mid_tasks.push_back({ei, t}); }
             }
-            job.gate.resize(std::size_t(n) * kWidth);
-            job.up.resize(std::size_t(n) * kWidth);
-            job.down.resize(std::size_t(n) * kHidden);
-            job.middle_bf16.resize(job.gate.size());
-            for (int t = 0; t < n; ++t) { mid_tasks.push_back({ei, t}); }
         }
-        constexpr int kRowsPerTask = 64;
-        const int gate_tasks = (kWidth + kRowsPerTask - 1) / kRowsPerTask;
-        const std::size_t first_count = cpu_experts.size() * std::size_t(2 * gate_tasks);
-        pool->run(first_count, [&](std::size_t i) {
-            auto& job        = cpu_experts[i / (2 * gate_tasks)];
-            const int part   = int(i % (2 * gate_tasks));
-            const bool is_up = part >= gate_tasks;
-            const int begin  = (part % gate_tasks) * kRowsPerTask;
-            const int end    = std::min(begin + kRowsPerTask, kWidth);
-            const auto& p    = is_up ? up_p : gate_p;
-            const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows, p.k};
-            if (is_up ? up_ggml : gate_ggml) {
-                const auto& xx = (is_up && !same_up_act)
-                                     ? (job.use_shared_input ? shared_in_up_ggml : job.input_up_ggml)
-                                     : (job.use_shared_input ? shared_in_ggml : job.input_ggml);
-                ops::gguf_cpu_rows_ggml(w, xx, begin, end, (is_up ? job.up : job.gate).data(), kWidth);
-            } else {
-                const auto& x = (is_up && !same_up_act)
-                                    ? (job.use_shared_input ? shared_in_up : job.input_up)
-                                    : (job.use_shared_input ? shared_in : job.input);
-                ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth,
-                                  backend);
+
+        // Launch remote socket nodes first so every NUMA domain computes in parallel using only
+        // its own socket-local SpinPool and local DRAM weights/mirrors.
+        for (std::size_t ni = 1; ni < nodes.size(); ++ni) {
+            NodeContext& ctx = *nodes[ni];
+            if (ctx.active_experts == 0 || !ctx.remote) { continue; }
+            auto& r = *ctx.remote;
+            {
+                std::lock_guard lock(r.mutex);
+                r.layer = &layer;
+                ++r.expected_seq;
+                r.pending_seq.store(r.expected_seq, std::memory_order_release);
             }
-        });
-        // Parallel SwiGLU + middle activation preparation across every (expert, token) column.
-        pool->run(mid_tasks.size(), [&](std::size_t i) {
-            const MidTask task = mid_tasks[i];
-            auto& job          = cpu_experts[task.expert];
-            const std::size_t off = std::size_t(task.token) * kWidth;
-            if (options.cpu_ggml) {
-                ops::gguf_cpu_swiglu_bf16_fast(job.gate.data() + off, job.up.data() + off, kWidth,
-                                               job.middle_bf16.data() + off, backend);
-            } else {
-                ops::gguf_cpu_swiglu_bf16(job.gate.data() + off, job.up.data() + off, kWidth,
-                                          job.middle_bf16.data() + off, backend);
-            }
-            if (down_ggml) {
-                job.middle_ggml.prepare_bf16_token(task.token, job.middle_bf16.data() + off);
-            } else {
-                job.middle.prepare_bf16_token(task.token, job.middle_bf16.data() + off);
-            }
-        });
-        const int down_tasks = kHidden / 128;
-        pool->run(cpu_experts.size() * std::size_t(down_tasks), [&](std::size_t i) {
-            auto& job       = cpu_experts[i / down_tasks];
-            const int begin = int(i % down_tasks) * 128;
-            const ops::GgufCpuMatrix w{down_p.format, job.bytes[2], down_p.row_bytes, down_p.rows,
-                                       down_p.k};
-            if (down_ggml) {
-                ops::gguf_cpu_rows_ggml(w, job.middle_ggml, begin, begin + 128, job.down.data(),
-                                       kHidden);
-            } else {
-                ops::gguf_cpu_rows(w, job.middle, begin, begin + 128, job.down.data(), kHidden,
-                                  backend);
-            }
-        });
-        auto* pairs = static_cast<std::int32_t*>(rank.product_pairs->data());
+            r.cv.notify_one();
+        }
+        if (primary.active_experts > 0) { execute_node_experts(primary, layer); }
+
+        std::exception_ptr remote_err;
+        for (std::size_t ni = 1; ni < nodes.size(); ++ni) {
+            NodeContext& ctx = *nodes[ni];
+            if (ctx.active_experts == 0 || !ctx.remote) { continue; }
+            auto& r = *ctx.remote;
+            while (r.done_seq.load(std::memory_order_acquire) != r.expected_seq) { spin_hint(); }
+            if (r.failure && !remote_err) { remote_err = std::exchange(r.failure, nullptr); }
+        }
+        if (remote_err) { std::rethrow_exception(remote_err); }
+
+        auto* pairs        = static_cast<std::int32_t*>(rank.product_pairs->data());
         std::int32_t count = 0;
-        for (auto& job : cpu_experts) {
-            for (std::size_t j = 0; j < job.pairs.size(); ++j) {
-                std::memcpy(products + std::size_t(count) * kHidden, job.down.data() + j * kHidden,
-                            kHidden * 4);
-                pairs[count++] = job.pairs[j];
+        for (const auto& ctx : nodes) {
+            for (std::size_t ei = 0; ei < ctx->active_experts; ++ei) {
+                const auto& job = ctx->cpu_experts[ei];
+                for (std::size_t j = 0; j < job.pairs.size(); ++j) {
+                    std::memcpy(products + std::size_t(count) * kHidden,
+                                job.down.data() + j * kHidden, kHidden * 4);
+                    pairs[count++] = job.pairs[j];
+                }
             }
         }
         *static_cast<std::int32_t*>(rank.product_count->data()) = count;
@@ -1313,14 +1645,22 @@ struct ExpertMisses::Impl {
         }
         if (copies_down) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
         // The CPU's share, while the copies run.
+        for (auto& ctx : nodes) { ctx->active_experts = 0; }
         std::uint64_t cpu_pairs = 0;
         const auto cpu_started  = std::chrono::steady_clock::now();
         double cpu_work_done    = 0;
         if (cpu_count > 0) {
-            cpu_experts.resize(cpu_count);
             for (std::size_t i = 0; i < cpu_count; ++i) {
-                CpuExpert& job = cpu_experts[i];
-                job.expert     = order[gpu_count + i].second;
+                const std::int32_t expert = order[gpu_count + i].second;
+                const std::size_t target =
+                    target_node_index(i, cpu_count, layer_index, expert);
+                NodeContext& dst      = *nodes[target];
+                const std::size_t slot = dst.active_experts++;
+                if (dst.cpu_experts.size() < dst.active_experts) {
+                    dst.cpu_experts.resize(dst.active_experts);
+                }
+                CpuExpert& job = dst.cpu_experts[slot];
+                job.expert     = expert;
                 job.pairs.clear();
                 job.tokens.clear();
                 for (std::uint32_t p = 0; p < pairs; ++p) {
@@ -1331,6 +1671,8 @@ struct ExpertMisses::Impl {
                 }
                 cpu_pairs += job.pairs.size();
                 cpu_work_done += cpu_work(expert_megabytes(layer), int(job.pairs.size()));
+                const bool use_mirror = (numa_mode == HostNumaMode::Mirror && !disk && target > 0 &&
+                                         layer_index < dst.mirror_ptrs.size());
                 for (int k = 0; k < 3; ++k) {
                     const auto& proj = layer.projections[std::size_t(k)];
                     if (disk) {
@@ -1341,6 +1683,9 @@ struct ExpertMisses::Impl {
                         job.bytes[std::size_t(k)] =
                             reinterpret_cast<const std::uint8_t*>(file_staging + file_used);
                         file_used += aligned(std::uint64_t(proj.expert_bytes));
+                    } else if (use_mirror) {
+                        job.bytes[std::size_t(k)] = static_cast<const std::uint8_t*>(
+                            dst.mirror_ptrs[layer_index][std::size_t(k)][std::size_t(job.expert)]);
                     } else {
                         job.bytes[std::size_t(k)] =
                             static_cast<const std::uint8_t*>(proj.host[std::size_t(job.expert)]);
@@ -1389,7 +1734,7 @@ struct ExpertMisses::Impl {
         bool awake = false;
         while (!stopping.load(std::memory_order_acquire)) {
             if (now_ns() > deadline.load(std::memory_order_acquire)) {
-                if (awake && pool) { pool->spin(false); }
+                if (awake) { spin_all(false); }
                 awake = false;
                 std::unique_lock lock(wake_mutex);
                 sleeping.store(true, std::memory_order_release);
@@ -1400,7 +1745,7 @@ struct ExpertMisses::Impl {
                 sleeping.store(false, std::memory_order_release);
                 continue;
             }
-            if (!awake && pool) { pool->spin(true); }
+            if (!awake) { spin_all(true); }
             awake = true;
             bool worked = false;
             for (auto& rank : ranks) {
@@ -1577,11 +1922,29 @@ MissStats ExpertMisses::stats() const {
     std::lock_guard lock(impl_->stats_mutex);
     return impl_->counters;
 }
-bool ExpertMisses::cpu_enabled() const noexcept { return impl_->pool != nullptr; }
+bool ExpertMisses::cpu_enabled() const noexcept {
+    return !impl_->nodes.empty() && impl_->cpu_threads > 0;
+}
 std::string ExpertMisses::cpu_description() const {
-    if (!impl_->pool) { return {}; }
-    return std::to_string(impl_->cpu_threads) + " threads, " +
-           ops::gguf_cpu_backend_name(impl_->backend);
+    if (!cpu_enabled()) { return {}; }
+    const char* mode_name = impl_->numa_mode == HostNumaMode::Isolate   ? "isolate"
+                            : impl_->numa_mode == HostNumaMode::Sharded ? "sharded"
+                                                                        : "mirror";
+    std::string out = std::to_string(impl_->cpu_threads) + " threads";
+    if (impl_->nodes.size() > 1) {
+        out += " (";
+        for (std::size_t i = 0; i < impl_->nodes.size(); ++i) {
+            if (i > 0) { out += ", "; }
+            out += std::to_string(impl_->nodes[i]->worker_threads) + "@node" +
+                   std::to_string(impl_->nodes[i]->node_id);
+        }
+        out += ")";
+    }
+    out += ", ";
+    out += ops::gguf_cpu_backend_name(impl_->backend);
+    out += ", numa=";
+    out += mode_name;
+    return out;
 }
 
 } // namespace ninfer::models::qwen4_exp

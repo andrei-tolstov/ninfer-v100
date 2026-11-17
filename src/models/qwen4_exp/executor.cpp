@@ -1108,8 +1108,10 @@ struct Executor::Impl {
             rank.slot_ids = DeviceBuffer(std::size_t(options.sequences) * 4);
             rank.slot_ids.copy_from_host(identity.data(), std::size_t(options.sequences) * 4);
             // ids, positions, RoPE positions, scatter columns, three-axis RoPE positions, rows.
+            const int rank_node = device_numa_node(device.rank(r).device);
             rank.staging = std::make_unique<PinnedHostBuffer>(
-                round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b));
+                round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b),
+                rank_node, rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, cudaEventDisableTiming));
@@ -1350,7 +1352,9 @@ struct Executor::Impl {
             options.prefill_chunk, std::uint64_t(verify_width) * options.sequences);
         mtp_ids       = DeviceBuffer(cells * 4);
         mtp_positions = DeviceBuffer(cells * 4);
-        mtp_staging   = std::make_unique<PinnedHostBuffer>(cells * 8);
+        const int head_node = device_numa_node(device.rank(head).device);
+        mtp_staging   = std::make_unique<PinnedHostBuffer>(
+            cells * 8, head_node, head_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
         if (options.draft_min_p > 0) {
             mtp_logprobs = DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
         }
@@ -1399,8 +1403,12 @@ struct Executor::Impl {
             route_records.push_back(static_cast<std::byte*>(route_blocks[plan->rank].p) +
                                     on_rank[plan->rank]++ * pairs * sizeof(std::int32_t));
         }
+        const int head_node = device_numa_node(device.rank(model.head_rank()).device);
         route_host =
-            std::make_unique<PinnedHostBuffer>(expert.size() * pairs * sizeof(std::int32_t));
+            std::make_unique<PinnedHostBuffer>(expert.size() * pairs * sizeof(std::int32_t),
+                                               head_node,
+                                               head_node >= 0 ? NumaPlacement::Bind
+                                                              : NumaPlacement::Default);
         const ExpertResidency residency = model.options().experts;
         const bool native_host = residency == ExpertResidency::Host &&
             std::any_of(expert.begin(), expert.end(), [](const auto& item) { return item.first->moe.native.has_value(); });
@@ -1559,6 +1567,7 @@ struct Executor::Impl {
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.cpu_ggml       = options.hybrid_experts.cpu_ggml;
+        miss.numa_policy    = options.hybrid_experts.numa_policy;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         misses              = std::make_unique<ExpertMisses>(
@@ -1603,7 +1612,12 @@ struct Executor::Impl {
                 memory.ranks[r].workspace_bytes += buffer.storage.bytes + buffer.tables.bytes;
             }
         }
-        slot_entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
+        const int cache_node = !layers.empty()
+                                   ? device_numa_node(device.rank(layers.front().rank).device)
+                                   : device_numa_node(device.rank(0).device);
+        slot_entries = std::make_unique<PinnedHostBuffer>(
+            3 * experts * sizeof(void*), cache_node,
+            cache_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
         prefetches.resize(device.size());
         for (std::size_t r = 0; r < device.size(); ++r) {
             if (slot_pools[r].slots == 0) { continue; }
@@ -1616,7 +1630,10 @@ struct Executor::Impl {
                     cudaEventCreateWithFlags(&prefetch.buffers[b].free, cudaEventDisableTiming));
             }
             for (auto& entries : prefetch.entries) {
-                entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
+                const int rank_node = device_numa_node(device.rank(r).device);
+                entries = std::make_unique<PinnedHostBuffer>(
+                    3 * experts * sizeof(void*), rank_node,
+                    rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
             }
             for (cudaEvent_t& copied : prefetch.copied) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));

@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <limits>
@@ -9,6 +10,10 @@
 #include <stdexcept>
 #include <utility>
 #include <string>
+
+#ifdef __linux__
+#    include <sys/mman.h>
+#endif
 
 namespace ninfer {
 namespace {
@@ -46,11 +51,20 @@ void free_device(void*& ptr) noexcept {
     }
 }
 
-void free_pinned(void*& ptr) noexcept {
+void free_pinned_storage(void*& ptr, std::size_t& size_bytes, bool& mmap_backed) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        if (mmap_backed) {
+#ifdef __linux__
+            log_cuda_error("cudaHostUnregister", cudaHostUnregister(ptr));
+            munmap(ptr, size_bytes);
+#endif
+        } else {
+            log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        }
         ptr = nullptr;
     }
+    size_bytes  = 0;
+    mmap_backed = false;
 }
 
 std::atomic<bool> g_wddm_evictable_budget{false};
@@ -398,8 +412,15 @@ ScopedArenaRank::~ScopedArenaRank() noexcept {
     if (arena_.active_rank() != previous_rank_) { arena_.activate_rank(previous_rank_); }
 }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes)
+    : PinnedHostBuffer(size_bytes, kNoNumaNode, NumaPlacement::Default) {}
+
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, int numa_node, NumaPlacement placement) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+
+    // Apply requested NUMA mempolicy around cudaHostAlloc so the driver faults pinned pages onto
+    // the local socket at allocation time; restricted containers without mempolicy fall back cleanly.
+    ScopedThreadMemPolicy mem_policy(numa_node, placement);
 
     // A pending error from an earlier call is returned by whatever runs next, so read and clear it
     // first. Without this, a failure here can be somebody else's error wearing this message.
@@ -457,7 +478,51 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes,
+                                   std::span<const PinnedShardRange> shards) {
+    if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+    std::vector<int> unique_nodes;
+    for (const auto& s : shards) {
+        if (s.numa_node >= 0 &&
+            std::find(unique_nodes.begin(), unique_nodes.end(), s.numa_node) ==
+                unique_nodes.end()) {
+            unique_nodes.push_back(s.numa_node);
+        }
+    }
+    if (unique_nodes.size() <= 1) {
+        *this = PinnedHostBuffer(
+            size_bytes, unique_nodes.empty() ? kNoNumaNode : unique_nodes.front(),
+            unique_nodes.empty() ? NumaPlacement::Default : NumaPlacement::Bind);
+        return;
+    }
+#ifdef __linux__
+    void* mapped = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped != MAP_FAILED) {
+        for (const auto& s : shards) {
+            if (s.numa_node >= 0 && s.bytes > 0 && s.offset < size_bytes) {
+                const std::size_t clamped = std::min(s.bytes, size_bytes - s.offset);
+                // Set per-VMA MPOL_BIND before cudaHostRegister faults pages.
+                (void)bind_memory_to_node(static_cast<std::byte*>(mapped) + s.offset, clamped,
+                                          s.numa_node, /*move_pages=*/false);
+            }
+        }
+        const cudaError_t reg_err =
+            cudaHostRegister(mapped, size_bytes, cudaHostRegisterPortable);
+        if (reg_err == cudaSuccess) {
+            data_        = mapped;
+            size_        = size_bytes;
+            mmap_backed_ = true;
+            return;
+        }
+        (void)cudaGetLastError();
+        munmap(mapped, size_bytes);
+    }
+#endif
+    *this = PinnedHostBuffer(size_bytes, kNoNumaNode, NumaPlacement::Interleave);
+}
+
+PinnedHostBuffer::~PinnedHostBuffer() { free_pinned_storage(data_, size_, mmap_backed_); }
 
 HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes) {
     if (!data || !bytes) { throw std::invalid_argument("host registration needs a nonempty allocation"); }
@@ -472,20 +537,23 @@ HostMemoryRegistration::~HostMemoryRegistration() {
 }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
-    other.data_ = nullptr;
-    other.size_ = 0;
+    : data_(other.data_), size_(other.size_), mmap_backed_(other.mmap_backed_) {
+    other.data_        = nullptr;
+    other.size_        = 0;
+    other.mmap_backed_ = false;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_pinned(data_);
-    data_ = other.data_;
-    size_ = other.size_;
+    free_pinned_storage(data_, size_, mmap_backed_);
+    data_        = other.data_;
+    size_        = other.size_;
+    mmap_backed_ = other.mmap_backed_;
 
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_        = nullptr;
+    other.size_        = 0;
+    other.mmap_backed_ = false;
     return *this;
 }
 

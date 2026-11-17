@@ -205,7 +205,8 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, and their slots fill behind the call; `auto` (GGUF experts) gives each call the split whose copies and CPU products end soonest by the times measured on earlier calls. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. The second buffer's memory comes from the expert cache: on an RTX 3090 with Q2_0 it took the cache from 17,296 to 16,683 MiB, prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster, decoded 1.5-2.8% slower once the cache was warm (within 1.5% either way from a cold one) and answered a 37-to-39-token prompt 7.5-10.2% later warm |
-| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers (pinned to distinct physical cores on Linux when available); default is half the logical CPUs the process may use (its affinity mask and container CPU quota) less two, from 1 to 16. On Intel Xeon E5-2650 v2 (8 physical cores / 16 threads), `8` workers outperform `6` with the persistent barrier pool in `ninfer_gguf_expert_cpu_bench`, while `--expert-cpu-threads 8` can opt into all physical cores explicitly |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers (pinned to distinct physical cores on Linux when available); automatic default leaves core headroom on the selected socket(s) (`phys - 2` in `isolate`, `(phys_0 - 2) + sum(phys_i - 1)` across sockets in `sharded`/`mirror`). On Intel Xeon E5-2650 v2 (8 physical cores / 16 threads), `8` workers beat `6` with the persistent barrier pool in `ninfer_gguf_expert_cpu_bench`, while `--expert-cpu-threads 8` can opt into all physical cores explicitly |
+| `--numa-policy P` | multi-socket NUMA placement for host experts, pinned DMA buffers, CPU worker pools, and CPU Vision (`auto`, `isolate`, `sharded`, `mirror`; default `auto`): `auto` isolates memory and threads to the GPU's NUMA node when available RAM (free + reclaimable file cache minus OS headroom) and physical cores fit; otherwise picks `mirror` when total available RAM `>= 2.2x` host expert size and each node holds a full copy, or `sharded` with page-bound expert shards and per-node compute pools without cross-socket barrier spinning |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the host expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`) |
 | `--expert-profile-out PATH` | record every layer's expert routes after requests, for a later `--expert-profile` |
@@ -283,6 +284,29 @@ host CPU throws `std::invalid_argument`. For `--expert-cpu-arithmetic ggml`, con
 AVX1 `quantize_row_q8_K`, direct `BF16`->`q8_K`/`q8_0` conversion, and multi-token `*_rows` kernels;
 AVX2+FMA+F16C is the default on x86-64, disallowed on non-x86-64 builds since only x86 kernels are vendored,
 and refused at startup if unsupported).
+
+#### Multi-socket NUMA placement (`--numa-policy`)
+
+On multi-socket x86 servers (such as dual-socket **Xeon E5-2696 v2** / **Supermicro X9DAX-7F-HFT**
+with quad-channel DDR3L-1866 per socket connected over QPI), scattering pinned host experts or CPU
+worker barriers across sockets starves local memory controllers and adds cross-socket QPI traffic:
+
+- `isolate`: pins all host pinned buffers (via `set_mempolicy(MPOL_BIND)` around `cudaHostAlloc`),
+  expert staging/tables, and CPU worker pools to the PCIe root-complex NUMA node of the primary
+  GPU (`node_id` from `/sys/bus/pci/devices/<bus>/numa_node`).
+- `sharded`: splits the pinned host expert buffer across NUMA nodes with `mmap` + per-shard
+  `mbind(MPOL_BIND)` before `cudaHostRegisterPortable`, queries each expert's backing NUMA node via
+  `get_mempolicy(MPOL_F_NODE | MPOL_F_ADDR)`, and runs an independent socket-local `SpinPool` on
+  each socket so only one batch handoff crosses QPI per layer while every socket reads its own local
+  DRAM channels.
+- `mirror`: keeps the CUDA-registered pinned host buffer on the GPU's local NUMA node for fast PCIe
+  DMA and allocates read-only `mbind(MPOL_BIND)` DRAM mirrors on remote sockets so every socket
+  computes proportional expert slices from local memory.
+- `auto` (default): stays in `isolate` when available local RAM (reclaimable page cache included)
+  and single-socket physical cores cover the model and `--expert-cpu-threads`; promotes to
+  `mirror` when free RAM exceeds `2.2x` host expert size with per-node headroom, and falls back to
+  `sharded` otherwise. Dual-socket runtime scaling is implemented and protected by synthetic 2P
+  sysfs and policy unit tests; physical 2P hardware execution awaits testbed availability.
 
 ### The n-gram rows
 

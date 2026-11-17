@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/vision_cpu.h"
 #include "models/qwen3_5/execution/vision_cpu_kernels.h"
+#include "core/numa.h"
 
 #include <algorithm>
 #include <bit>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -44,10 +46,12 @@ std::uint16_t f32_to_bf16(float value) {
 // each create threads.
 class Team {
 public:
-    explicit Team(unsigned threads) : size_(std::max(1U, threads)) {
+    explicit Team(unsigned threads, std::span<const int> worker_cpus = {})
+        : size_(std::max(1U, threads)) {
         workers_.reserve(size_ - 1);
         for (unsigned index = 1; index < size_; ++index) {
-            workers_.emplace_back([this, index] { serve(index); });
+            const int cpu_id = index < worker_cpus.size() ? worker_cpus[index] : -1;
+            workers_.emplace_back([this, index, cpu_id] { serve(index, cpu_id); });
         }
     }
 
@@ -93,7 +97,8 @@ public:
     }
 
 private:
-    void serve(unsigned index) {
+    void serve(unsigned index, int cpu_id) {
+        if (cpu_id >= 0) { (void)bind_thread_to_cpu(cpu_id); }
         std::uint64_t seen = 0;
         for (;;) {
             std::function<void(unsigned)> job;
@@ -308,7 +313,10 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
         control.position_table_weights.size() != static_cast<std::size_t>(count) * 4) {
         throw std::invalid_argument("CPU Vision item does not match its control");
     }
-    Team team(threads != 0 ? threads : std::max(1U, std::thread::hardware_concurrency()));
+    const auto worker_cpus = select_worker_cpus(device_numa_node(0), threads);
+    const unsigned team_threads =
+        threads != 0 ? threads : static_cast<unsigned>(std::max<std::size_t>(1, worker_cpus.size()));
+    Team team(team_threads, worker_cpus);
     const auto stop = [&] { return cancelled != nullptr && cancelled->load(); };
 
     Matrix input(weights.patch_width, count);

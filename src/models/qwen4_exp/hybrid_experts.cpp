@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/cuda_host_handshake.h"
+#include "core/numa.h"
 #include "models/qwen4_exp/read_pool.h"
 #include "ninfer/ops/residual_add.h"
 
@@ -15,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <thread>
 
@@ -61,6 +63,48 @@ std::size_t expert_bytes(const ops::CpuExpertWeights& expert) {
     std::size_t bytes = 0;
     for (const auto* projection : projections(expert)) { bytes += planes(projection->weight).size(); }
     return bytes;
+}
+
+struct HybridWorkerPlan {
+    std::uint32_t threads = 1;
+    std::vector<int> cpu_ids;
+};
+
+HybridWorkerPlan plan_hybrid_workers(DeviceContext& d,
+                                     std::span<const HybridExpertLayer> inputs,
+                                     const HybridExpertOptions& o) {
+    const NumaTopology& topo = host_numa_topology();
+    const int gpu_node       = device_numa_node(d.rank(0).device);
+    std::uint64_t host_bytes = 0;
+    for (const auto& layer : inputs) {
+        if (layer.experts.empty()) { continue; }
+        host_bytes += std::uint64_t(expert_bytes(layer.experts.front())) * layer.experts.size();
+    }
+    const HostNumaPlan numa =
+        plan_host_numa(topo, gpu_node, host_bytes, o.cpu_threads, o.numa_policy);
+    HybridWorkerPlan out;
+    if (!topo.multi_node() && o.cpu_threads == 0) {
+        out.threads = std::clamp(std::thread::hardware_concurrency(), 1U, 16U);
+        if (const auto* primary = topo.find(numa.primary_node)) {
+            const auto& cpus = primary->physical_cpus.size() >= out.threads
+                                   ? primary->physical_cpus
+                                   : primary->logical_cpus;
+            for (std::size_t i = 0; i < cpus.size() && out.cpu_ids.size() < out.threads; ++i) {
+                out.cpu_ids.push_back(cpus[i]);
+            }
+        }
+        return out;
+    }
+    std::uint32_t total = 0;
+    for (const auto& np : numa.node_plans) {
+        total += np.worker_threads;
+        for (const int cpu : np.worker_cpus) { out.cpu_ids.push_back(cpu); }
+    }
+    if (numa.service_cpu >= 0 && out.cpu_ids.size() < total) {
+        out.cpu_ids.push_back(numa.service_cpu);
+    }
+    out.threads = std::max(1U, total);
+    return out;
 }
 
 // Physical copies preserve every code and scale. The CPU and GPU keep the same representation;
@@ -174,11 +218,11 @@ struct HybridExperts::Impl {
     }
 
     Impl(DeviceContext& d, std::vector<HybridExpertLayer> inputs, std::uint32_t tokens,
-         std::uint64_t requested_cache, HybridExpertOptions o, std::function<void()> hook)
-        : device(d), options(validated(o)), capacity(tokens), ranks(d.size()),
-          workers(options.cpu_threads ? options.cpu_threads :
-                      std::clamp(std::thread::hardware_concurrency(), 1U, 16U)),
-          pool(workers.size()), before_cpu(std::move(hook)) {
+         std::uint64_t requested_cache, HybridExpertOptions o, std::function<void()> hook,
+         const HybridWorkerPlan& wp)
+        : device(d), options(o), capacity(tokens), ranks(d.size()),
+          workers(wp.threads),
+          pool(workers.size(), wp.cpu_ids), before_cpu(std::move(hook)) {
         if (tokens == 0 || inputs.empty()) {
             throw std::invalid_argument("hybrid experts: invalid capacity, DMA share or worker count");
         }
@@ -224,15 +268,25 @@ struct HybridExperts::Impl {
             rank.handshake = std::make_unique<CudaHostHandshake>(device.rank(r));
             for (auto& event : rank.staged) { event = std::make_unique<CudaCompletionEvent>(device.rank(r)); }
         }
-        routes = std::make_unique<PinnedHostBuffer>(kTop * tokens * sizeof(std::int32_t));
-        activations = std::make_unique<PinnedHostBuffer>(kCpuTokens * kHidden * sizeof(std::uint16_t));
-        route_weights = std::make_unique<PinnedHostBuffer>(kCpuTokens * kTop * sizeof(float));
-        selection = std::make_unique<PinnedHostBuffer>(kTop * tokens);
-        entries = std::make_unique<PinnedHostBuffer>(3 * max_experts * sizeof(Weight));
-        sum = std::make_unique<PinnedHostBuffer>(kCpuTokens * kHidden * sizeof(float));
+        const int primary_node = device_numa_node(device.rank(0).device);
+        const NumaPlacement primary_place =
+            primary_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default;
+        routes = std::make_unique<PinnedHostBuffer>(kTop * tokens * sizeof(std::int32_t),
+                                                    primary_node, primary_place);
+        activations = std::make_unique<PinnedHostBuffer>(
+            kCpuTokens * kHidden * sizeof(std::uint16_t), primary_node, primary_place);
+        route_weights = std::make_unique<PinnedHostBuffer>(kCpuTokens * kTop * sizeof(float),
+                                                           primary_node, primary_place);
+        selection = std::make_unique<PinnedHostBuffer>(kTop * tokens, primary_node, primary_place);
+        entries = std::make_unique<PinnedHostBuffer>(3 * max_experts * sizeof(Weight), primary_node,
+                                                     primary_place);
+        sum = std::make_unique<PinnedHostBuffer>(kCpuTokens * kHidden * sizeof(float), primary_node,
+                                                 primary_place);
         staging_bytes = std::max<std::size_t>(32U << 20, max_slot_bytes);
         if (std::any_of(layers.begin(), layers.end(), [](const auto& layer) { return !layer.inputs.registered; })) {
-            for (auto& block : staging) { block = std::make_unique<PinnedHostBuffer>(staging_bytes); }
+            for (auto& block : staging) {
+                block = std::make_unique<PinnedHostBuffer>(staging_bytes, primary_node, primary_place);
+            }
         }
         cpu_jobs.reserve(max_experts);
         dma_jobs.reserve(max_experts);
@@ -637,9 +691,12 @@ struct HybridExperts::Impl {
 
 HybridExperts::HybridExperts(DeviceContext& d, std::vector<HybridExpertLayer> layers,
                              std::uint32_t tokens, std::uint64_t cache_bytes,
-                             HybridExpertOptions options, std::function<void()> before_cpu)
-    : impl_(std::make_unique<Impl>(d, std::move(layers), tokens, cache_bytes, options,
-                                   std::move(before_cpu))) {}
+                             HybridExpertOptions options, std::function<void()> before_cpu) {
+    const HybridExpertOptions valid = validated(options);
+    const HybridWorkerPlan wp       = plan_hybrid_workers(d, layers, valid);
+    impl_ = std::make_unique<Impl>(d, std::move(layers), tokens, cache_bytes, valid,
+                                   std::move(before_cpu), wp);
+}
 HybridExperts::~HybridExperts() = default;
 void HybridExperts::run(std::size_t layer, const Tensor& x, const Tensor& ids, const Tensor& weights,
                          const Tensor& shared, ops::NativeMoeWeights banks, bool cpu_allowed,

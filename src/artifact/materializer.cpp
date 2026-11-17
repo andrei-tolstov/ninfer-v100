@@ -467,8 +467,35 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         throw ArtifactError("pinned Host backing exceeds size_t");
     }
     if (!plan.pinned_objects.empty()) {
-        out.pinned_ = std::make_unique<PinnedHostBuffer>(
-            static_cast<std::size_t>(plan.pinned_capacity_bytes));
+        const auto pinned_bytes = static_cast<std::size_t>(plan.pinned_capacity_bytes);
+        if (!options.pinned_shards.empty()) {
+            out.pinned_ = std::make_unique<PinnedHostBuffer>(pinned_bytes, options.pinned_shards);
+        } else if (options.pinned_numa_placement != NumaPlacement::Default ||
+                   options.pinned_numa_node >= 0) {
+            out.pinned_ = std::make_unique<PinnedHostBuffer>(
+                pinned_bytes, options.pinned_numa_node, options.pinned_numa_placement);
+        } else {
+            const auto& topo        = host_numa_topology();
+            const int gpu_node      = device_numa_node(device.rank(0).device);
+            const auto plan_numa    = plan_host_numa(
+                topo, gpu_node, pinned_bytes, /*requested_threads=*/0,
+                topo.multi_node() ? NumaPolicy::Auto : NumaPolicy::Isolate);
+            if (plan_numa.pinned_shards.size() > 1) {
+                std::vector<PinnedShardRange> shards;
+                shards.reserve(plan_numa.pinned_shards.size());
+                for (const auto& s : plan_numa.pinned_shards) {
+                    shards.push_back(PinnedShardRange{s.offset, s.bytes, s.numa_node});
+                }
+                out.pinned_ = std::make_unique<PinnedHostBuffer>(pinned_bytes, shards);
+            } else {
+                const int target_node = plan_numa.pinned_shards.empty()
+                                            ? gpu_node
+                                            : plan_numa.pinned_shards.front().numa_node;
+                out.pinned_ = std::make_unique<PinnedHostBuffer>(
+                    pinned_bytes, target_node,
+                    target_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
+            }
+        }
         auto* const block          = static_cast<std::byte*>(out.pinned_->data());
         std::uint64_t previous_end = 0;
         for (const auto& placement : plan.pinned_objects) {
@@ -510,6 +537,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         storage.host_data = std::move(placement.data);
         if (placement.registered) {
+            const int target_node = options.pinned_numa_node >= 0
+                                        ? options.pinned_numa_node
+                                        : device_numa_node(device.rank(0).device);
+            if (target_node >= 0) {
+                (void)bind_memory_to_node(storage.host_data.data(), storage.host_data.size(),
+                                          target_node, /*move_pages=*/true);
+            }
             storage.registration = std::make_unique<HostMemoryRegistration>(
                 storage.host_data.data(), storage.host_data.size());
             out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, storage.host_data.size(),

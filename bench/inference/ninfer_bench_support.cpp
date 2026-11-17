@@ -326,6 +326,8 @@ std::string usage_text(std::string_view program) {
         << "  --expert-cpu-arithmetic <exact|ggml>  CPU arithmetic for the host experts the CPU "
            "computes (default: exact, bit for bit with the GPU; ggml: faster, not bit for bit, "
            "formats ggml-cpu does not cover keep the exact products)\n"
+        << "  --numa-policy <auto|isolate|sharded|mirror>  host NUMA placement and CPU worker "
+           "scheduling on multi-socket systems (default: auto)\n"
         << "  --expert-prefill-buffers <1|2>  device buffers for a long prompt's uncached "
            "experts (default: 1)\n"
         << "  --expert-cache-adaptive     replace cold cached experts between calls\n"
@@ -474,6 +476,20 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.hybrid_experts.cpu_ggml = true;
             } else {
                 throw std::invalid_argument("--expert-cpu-arithmetic must be exact or ggml");
+            }
+        } else if (arg == "--numa-policy") {
+            const std::string mode = value("--numa-policy");
+            if (mode == "auto") {
+                options.hybrid_experts.numa_policy = ninfer::NumaPolicy::Auto;
+            } else if (mode == "isolate") {
+                options.hybrid_experts.numa_policy = ninfer::NumaPolicy::Isolate;
+            } else if (mode == "sharded") {
+                options.hybrid_experts.numa_policy = ninfer::NumaPolicy::Sharded;
+            } else if (mode == "mirror") {
+                options.hybrid_experts.numa_policy = ninfer::NumaPolicy::Mirror;
+            } else {
+                throw std::invalid_argument(
+                    "--numa-policy must be auto, isolate, sharded or mirror");
             }
         } else if (arg == "--expert-prefill-buffers") {
             const std::uint32_t buffers =

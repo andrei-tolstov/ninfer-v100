@@ -109,6 +109,10 @@ struct MaterializeOptions {
     // if a path is replaced meanwhile.
     bool suspendable = false;
     std::shared_ptr<const Reader> retained_reader;
+    // NUMA placement hints for host pinned and registered allocations.
+    int pinned_numa_node                = kNoNumaNode;
+    NumaPlacement pinned_numa_placement = NumaPlacement::Default;
+    std::vector<PinnedShardRange> pinned_shards;
 };
 
 class MaterializedArtifact {

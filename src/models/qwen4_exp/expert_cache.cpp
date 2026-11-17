@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/expert_cache.h"
 
+#include "core/numa.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -109,7 +111,12 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         stats_.slots += layer.slots;
         layers_.push_back(std::move(layer));
     }
-    staging_ = std::make_unique<PinnedHostBuffer>(std::max<std::size_t>(staging_bytes, 64));
+    const int primary_node =
+        layers_.empty() ? kNoNumaNode
+                        : device_numa_node(device_.rank(layers_.front().banks.rank).device);
+    staging_ = std::make_unique<PinnedHostBuffer>(
+        std::max<std::size_t>(staging_bytes, 64), primary_node,
+        primary_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
 }
 
 ExpertCache::~ExpertCache() = default;

@@ -122,6 +122,8 @@ struct LoadOptions {
     // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
     // beside the head it shares; its experts take the text layers' residency.
     bool mtp = false;
+    NumaPolicy numa_policy    = NumaPolicy::Auto;
+    std::uint32_t cpu_threads = 0;
 };
 
 class Model {

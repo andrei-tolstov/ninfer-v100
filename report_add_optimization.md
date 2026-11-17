@@ -12,7 +12,8 @@
 2. Реализовать быстрый `AVX 1.0 + F16C + SSSE3 + SSE4.1` путь для точной CPU-арифметики GGUF-экспертов (`GgufCpuBackend::Avx`, побитово эквивалентный GPU и `Scalar`), для режима `ggml` (`quantize_row_q8_K`, прямой `BF16 -> Q8`, батчевые `*_rows` кернелы), и для нативных MoE-экспертов (`CpuExpertBackend::Avx`).
 3. Оптимизировать многопоточный runtime CPU-миссов в `Qwen3.8-Flash-Next` (`src/models/qwen4_exp/expert_misses.cu`).
 4. Оптимизировать CPU-энкодеры зрения для **Gemma 4** и **Qwen3.5** на `AVX 1.0` (и `AVX2+FMA`).
-5. Исправить методику микробенчмарка `ninfer_gguf_expert_cpu_bench` (заменив создание/join `std::thread` на каждой итерации на постоянный spin-barrier пул) и обновить документацию строго по проверенным замерам.
+6. Провести сквозной GPU+CPU запуск на `192.168.50.38` (`Tesla V100-PCIE-32GB`).
+7. **Фаза B**: Добавить полную поддержку и оптимизацию для двухсокетных NUMA-систем (ориентир — **Supermicro X9DAX-7F-HFT**, `2 × Intel Xeon E5-2696 v2`, DDR3L-1866: `24` физических ядра / `48` потоков, `AVX 1.0 + F16C`, 4 канала DDR3L на сокет, PCIe 3.0 root complexes на обоих сокетах, QPI) — без сторонней зависимости `libnuma`.
 
 ---
 
@@ -61,6 +62,27 @@
 - **Qwen3.5 CPU Vision** ([`src/models/qwen3_5/execution/vision_cpu_kernels.h`](src/models/qwen3_5/execution/vision_cpu_kernels.h), [`vision_cpu_kernels.cpp`](src/models/qwen3_5/execution/vision_cpu_kernels.cpp), [`vision_cpu_kernels_x86.inl`](src/models/qwen3_5/execution/vision_cpu_kernels_x86.inl), [`vision_cpu_kernels_avx.cpp`](src/models/qwen3_5/execution/vision_cpu_kernels_avx.cpp), [`vision_cpu_kernels_avx2.cpp`](src/models/qwen3_5/execution/vision_cpu_kernels_avx2.cpp), [`vision_cpu.cpp`](src/models/qwen3_5/execution/vision_cpu.cpp), [`execution_sources.cmake`](src/models/qwen3_5/execution_sources.cmake)):
   - Векторизованы с нуля на `AVX 1.0` и `AVX2+FMA` (через общий шаблонный `.inl` с `-ffp-contract=off`): `pack_panel`, `gemm_packed_bias` (`6×16`), `layer_norm_cols`, `add_into`, `gelu_tanh`, `rope_pair`, и 3-проходный `segment_attention_block` (`4×16` QK^T в регистрах + `exp_nonpositive` softmax + PV).
   - Границы параллельных срезов в 1D-проходах выровнены по 8 элементов, сохраняя строгий контракт **побитовой детерминированности `single == parallel`** при любом числе потоков.
+
+### 2.6. Поддержка и оптимизация для двухсокетных NUMA-систем (Фаза B)
+Целевой ориентир: **Supermicro X9DAX-7F-HFT** с **2 × Intel Xeon E5-2696 v2** (Ivy Bridge-EP, `12c/24t` на сокет = `24c/48t` суммарно, `AVX 1.0 + F16C`, 4 канала `DDR3L-1866` на каждый сокет, межсокетная шина `QPI`, линии PCIe 3.0 на обоих сокетах):
+- **Базовый модуль NUMA без зависимости от `libnuma`** ([`src/core/numa.h`](src/core/numa.h), [`src/core/numa.cpp`](src/core/numa.cpp), [`src/core/CMakeLists.txt`](src/core/CMakeLists.txt)):
+  - `parse_numa_sysfs` читает `/sys/devices/system/node` и `/sys/devices/system/cpu`: объединяет `MemFree` с вытесняемым файловым кэшем (`Active(file) + Inactive(file) + SReclaimable`, либо `FilePages`), дедуплицирует физические ядра по `(physical_package_id, core_id)` с фильтрацией по `sched_getaffinity` и квотам cgroup v1/v2 (`cpu.max`, `cpu.cfs_quota_us`). При превышении числа запрошенных потоков сверх физических ядер планировщик дополняет маску оставшимися SMT-потоками того же узла, избегая двойной привязки двух рабочих к одному логическому CPU.
+  - `device_numa_node` / `parse_pci_device_numa_node` определяют локальный NUMA-узел PCIe Root Complex видеокарты через `cudaDeviceGetPCIBusId` и `/sys/bus/pci/devices/<lower-bus>/numa_node`.
+  - Прямые Linux syscalls (`__NR_mbind`, `__NR_set_mempolicy`, `__NR_get_mempolicy`) с RAII-классом `ScopedThreadMemPolicy`, `bind_memory_nodes`, `bind_memory_to_node`, `query_page_numa_node`, `bind_thread_to_cpu`, `bind_thread_to_node` и безопасными заглушками для Windows/non-Linux с корректным `maxnode` для ядра Linux (`words * bits + 1`).
+- **NUMA-привязка закреплённой host-памяти и артефактов**:
+  - `PinnedHostBuffer` ([`src/core/arena.h`](src/core/arena.h), [`src/core/arena.cu`](src/core/arena.cu)) получил конструкторы `(size_bytes, numa_node, NumaPlacement)` (`ScopedThreadMemPolicy` вокруг `cudaHostAlloc`, т.к. драйвер NVIDIA аллоцирует/фиксирует страницы сразу внутри `cudaHostAlloc`) и мультишардовый `(size_bytes, span<const PinnedShardRange>)` (анонимный `mmap` + `mbind(MPOL_BIND)` на 4 KiB-выровненные сегменты + `cudaHostRegisterPortable` с автоматическим откатом на `Interleave`).
+  - `MaterializedArtifact` ([`src/artifact/materializer.h`](src/artifact/materializer.h), [`src/artifact/materializer.cpp`](src/artifact/materializer.cpp)) использует `MaterializeOptions` и `plan_host_numa`, а `Executor`, `ExpertDelivery`, `ExpertCache` и `ExpertMisses` ([`executor.cpp`](src/models/qwen4_exp/executor.cpp), [`expert_delivery.cu`](src/core/expert_delivery.cu), [`expert_cache.cpp`](src/models/qwen4_exp/expert_cache.cpp)) привязывают все per-rank `PinnedHostBuffer` буферы к узлу своего CUDA-устройства.
+- **Политика `--numa-policy auto|isolate|sharded|mirror`**:
+  - `NumaPolicy` добавлен в [`include/ninfer/types.h`](include/ninfer/types.h), единый парсер [`src/product/hybrid_expert_options.h`](src/product/hybrid_expert_options.h) покрывает `ninfer`, `ninfer-serve`, `ninfer-perplexity` и `ninfer_bench` (`--numa-policy`).
+  - Логика `plan_host_numa`:
+    - `auto`: при 1 GPU и достаточной свободной памяти локального узла (минус системный headroom) + числе потоков `<= physical_cpus` локального сокета выбирает **`isolate`** (ноль cross-socket QPI DMA/CPU-трафика); если веса не помещаются на одном сокете или явно запрошено потоков больше числа физических ядер одного сокета — выбирает **`mirror`** при наличии `>= 2.2x` свободной RAM от размера экспертов (и запаса на каждом узле), иначе **`sharded`**.
+- **Per-socket `NodeContext` / `SpinPool` и `MirrorBuffer` без межсокетных spin-барьеров**:
+  - В [`src/models/qwen4_exp/expert_misses.cu`](src/models/qwen4_exp/expert_misses.cu) создан отдельный `NodeContext` на каждый активный NUMA-узел со своим локальным `SpinPool`, `shared_in*` и переиспользуемым списком `active_experts` (без churn аллокаций). Удалённые сокеты (`index >= 1`) обслуживаются выделенным координатором `RemoteRunner`: на одном слое главный сокет передаёт удалённому узлу пакет 1 раз, оба сокета независимо проходят `gate+up -> SwiGLU -> down` внутри своих локальных `SpinPool` (только внутрисокетные L3/кэш-барьеры, ноль QPI-контенции на `ticket_`/`done_`) и объединяют результаты.
+  - В режиме `sharded` (`!disk`) для каждого эксперта при старте определяется фактический домашний узел через `query_page_numa_node` (с детерминированным послойным fallback); вычисление эксперта направляется на домашний сокет. В режиме `mirror` (`!disk`) на удалённых сокетах создаётся локальная `mmap`+`mbind`-копия весов (`MirrorBuffer`), а пакет делится между сокетами пропорционально их `worker_threads` (кроме одиночного `cpu_count == 1`, который считается локально на первичном узле). Снят старый межсокетный потолок `16` потоков (`nodes` масштабируется на `2 × 12` ядрах E5-2696 v2 до `10 + 11 = 21` авто-потока).
+  - [`src/models/qwen4_exp/hybrid_experts.cpp`](src/models/qwen4_exp/hybrid_experts.cpp) + [`read_pool.cpp`](src/models/qwen4_exp/read_pool.cpp) используют `plan_host_numa` и привязывают потоки `ReadPool` к выбранным CPU.
+- **NUMA-оптимизация CPU Vision и стартовая диагностика**:
+  - [`src/models/gemma4/vision_cpu.cpp`](src/models/gemma4/vision_cpu.cpp) и [`src/models/qwen3_5/execution/vision_cpu.cpp`](src/models/qwen3_5/execution/vision_cpu.cpp) используют общий `select_worker_cpus` (`core/numa.h`): по умолчанию используют физические ядра локального узла GPU (без кросс-сокетных CV/мьютекс-барьеров в `Team` на сотнях мелких слоёв), а `gemma4` также выделяет FP32-веса башни зрения внутри `ScopedThreadMemPolicy`.
+  - В [`qwen4_exp_core.cpp`](src/runtime/engine/qwen4_exp_core.cpp) и [`gemma4_core.cpp`](src/runtime/engine/gemma4_core.cpp) при `multi_node()` печатается диагностика `Host NUMA topology`, а `ExpertMisses::cpu_description()` выводит распределение потоков по узлам и активный `--numa-policy`.
 
 ---
 
@@ -145,6 +167,27 @@
    - Код `AVX2=ON` (`vision_cpu_kernels_avx2` в `qwen3_5`/`gemma4` и `#else`-ветки в `arch/x86/quants.c`) проверен компиляцией в `build-avx2`, но физически на AVX2-процессоре не запускался (CPU стенда не имеет AVX2/FMA).
    - После всех замеров временный срез удалён, а рабочий сервис `coder390-llama-server` и `deepseek-llama-swap` восстановлены (`/health -> {"status":"ok"}`).
 
+### 3.5. Верификация Фазы B (NUMA + dual-socket) и рекомендации для `Supermicro X9DAX-7F-HFT` (`2 × E5-2696 v2`, DDR3L-1866)
+1. **Проверки после финальных правок Фазы B на `192.168.50.38` (`Tesla V100` / `E5-2650 v2`)**:
+   - **`build-avx` (`-DNINFER_GGML_CPU_AVX2=OFF -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release`)**:
+     - Полная сборка `ninfer_tests`, `ninfer_benches`, `ninfer`, `ninfer-serve`, `ninfer-perplexity`, `ninfer_bench` — без ошибок.
+     - CPU/NUMA-набор (`ctest -R 'ninfer_numa_test|ninfer_cli_options_test|ninfer_serve_options_test|gguf_expert_cpu|moe_expert_cpu|vision_cpu|qwen4_exp_config'`): **9/9 Passed, 0 Failed** (`8.90 s`), включая [`tests/core/test_numa.cpp`](tests/core/test_numa.cpp) (`ninfer_numa_test`: синтетический sysfs `Supermicro X9DAX-7F-HFT` `2 × 12c/24t = 48 log / 24 phys`, `Active(file)+Inactive(file)+SReclaimable`/`FilePages`, квота cgroup, case-insensitive PCIe lookup, все пороги `Auto`/`Isolate`/`Sharded`/`Mirror` `2.2x`, live `mbind`/`get_mempolicy` и одно-/двухшардовый `PinnedHostBuffer`).
+     - GPU+CPU CUDA-набор на `GPU 1` (`Tesla V100-PCIE-32GB`, `--gpus '"device=1"'`): **5/5 Passed, 0 Failed** (`38.55 s`): `ninfer_expert_delivery_test` (`3.00s`), `ninfer_numa_test` (`0.38s`), `ninfer_qwen4_exp_expert_cache_test` (`0.32s`), `ninfer_qwen4_exp_hybrid_experts_test` (`2.28s`), `ninfer_moe_experts_gguf_test` (`32.56s`).
+     - Проверка `--help` в `ninfer`, `ninfer-serve`, `ninfer_bench`: опция `--numa-policy auto|isolate|sharded|mirror` присутствует и распарсена.
+   - **`build-avx2` (`-DNINFER_GGML_CPU_AVX2=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release`)**:
+     - Сборка `582/582` целей (`ninfer_tests`) — без ошибок; CPU/NUMA-тесты: **8/9 Passed, 1 Skipped** (`ninfer_gguf_expert_cpu_ggml_test` пропущен с кодом `77` на AVX-only CPU), **0 Failed**.
+   - **Host-compile проверка** (`python3 scripts/check-host-compile.py build-avx build-avx2 --filter "numa|arena|materializer|expert_misses|hybrid_experts|vision_cpu|qwen4_exp_core|gemma4_core"`): **`24/24` distinct TU (`2 .cu`) без ошибок**.
+   - Рабочий сервис `coder390-llama-server` и `deepseek-llama-swap` восстановлены (`/health -> {"status":"ok","version":"1.7.2+v1.7.2"}`, `32124 MiB` на V100).
+   - **Статус двухсокетной проверки**: реальный физический 2-сокетный стенд **Supermicro X9DAX-7F-HFT** на момент подготовки изменения отсутствует, поэтому живое 2P-исполнение и замеры масштабирования `Sharded` / `Mirror` на двух физических сокетах ещё **не проводились** и являются следующим шагом после получения доступа к стенду.
+2. **Практические рекомендации запуска на целевом сервере `Supermicro X9DAX-7F-HFT` (`2 × Xeon E5-2696 v2`, DDR3L-1866)**:
+   - Собирать движок строго с **`-DNINFER_GGML_CPU_AVX2=OFF`** (Ivy Bridge-EP имеет `AVX 1.0 + F16C`, без `AVX2/FMA`).
+   - Проверить в BIOS режим **NUMA = Enabled** (отключение `Node Interleaving`, чтобы ОС видела два отдельных узла `node0` и `node1` по `12` физических ядер и 4 канала DDR3L-1866 на каждом).
+   - Убедиться, в какой сокет (`node 0` или `node 1`) заведён PCIe-слот видеокарты через `/sys/bus/pci/devices/<bus>/numa_node` (движок определяет это автоматически на старте).
+   - Выбор флагов:
+     - **Модель/эксперты помещаются в свободную RAM сокета GPU** (например, 128 GiB на сокет для 52 GiB IQ3_S): режим `--numa-policy auto` (по умолчанию) выберет `isolate` — `10` выделенных физических ядер сокета GPU (`12 - 2`) при нулевом cross-socket QPI DMA-трафике.
+     - **Нужна суммарная пропускная способность обоих сокетов (~8 каналов DDR3L-1866)** при наличии свободной RAM `>= 2.2x` от экспертов (например, `256 GiB+` RAM на узел / всего для ~52 GiB IQ3_S): `--numa-policy mirror` (или `auto` с `--expert-cpu-threads 20` / `21`) продублирует веса экспертов локально на оба сокета, исключив QPI-чтение.
+     - **Эксперты не помещаются на одном сокете** (или RAM < `2.2x` для зеркалирования): `auto` / `--numa-policy sharded` разобьёт `PinnedHostBuffer` и вычисления между `node0` (`10` ядер) и `node1` (`11` ядер) = `21` рабочий поток по умолчанию с независимыми локальными барьерами `SpinPool`.
+
 ---
 
 ## 4. Источники
@@ -153,3 +196,4 @@
 3. [Agner Fog — Optimizing software in C++ / The microarchitecture of Intel CPUs (Ivy Bridge)](https://www.agner.org/optimize/microarchitecture.pdf)
 4. [llama.cpp — ggml-cpu x86 quants](https://github.com/ggml-org/llama.cpp/tree/master/ggml/src/ggml-cpu/arch/x86)
 5. Sylvie Boldo, Guillaume Melquiond — *Emulation of a FMA and Correctly Rounded Sums: Proved Algorithms Using Rounding to Odd*, IEEE Transactions on Computers, 57(4):462–471, 2008.
+6. [Linux Kernel Memory Policy API (`mbind`, `set_mempolicy`, `get_mempolicy`)](https://www.kernel.org/doc/html/latest/admin-guide/mm/numa_memory_policy.html)
