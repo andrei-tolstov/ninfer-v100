@@ -73,7 +73,22 @@ void GgmlCpuActivation::prepare_bf16_start(GgmlActLayout layout, int tokens) {
     tokens_ = tokens;
 }
 
+// The vendored ggml BF16 quantizers (ggml_quantize_bf16_q8_0 / ggml_quantize_bf16_q8_K) derive
+// their block scale with `_mm256_max_ps`, which propagates a NaN (or silently drops it, depending
+// on which operand carries it): a non-finite activation would come back as garbage codes at a NaN
+// scale instead of an error. The exact backend rejects the same input
+// ("GGUF CPU expert: nonfinite activation", gguf_expert_cpu.cpp), so the ggml path has to too. The
+// scan is a plain BF16 bit test (`exponent == 0x7F` covers NaN and +/-Inf), one pass per row.
+static void require_finite_bf16_row(const std::uint16_t* v, int k) {
+    for (int i = 0; i < k; ++i) {
+        if ((v[i] & 0x7F80U) == 0x7F80U) {
+            throw std::runtime_error("GGUF CPU expert: nonfinite activation");
+        }
+    }
+}
+
 void GgmlCpuActivation::prepare_bf16_token(int token, const std::uint16_t* values) {
+    require_finite_bf16_row(values, k_);
     void* out = data_.data() + std::size_t(token) * row_bytes_;
     if (gguf_ggml_cpu_available()) {
         if (layout_ == GgmlActLayout::Q8K) {
@@ -103,6 +118,7 @@ void GgmlCpuActivation::prepare_bf16(GgmlActLayout layout, const std::uint16_t* 
     if (!use_simd) { scratch_.resize(k_); }
     for (int t = 0; t < tokens; ++t) {
         const std::uint16_t* v = values + std::size_t(t) * stride;
+        require_finite_bf16_row(v, k_);
         void* out = data_.data() + std::size_t(t) * row_bytes_;
         if (use_simd) {
             if (layout == GgmlActLayout::Q8K) {

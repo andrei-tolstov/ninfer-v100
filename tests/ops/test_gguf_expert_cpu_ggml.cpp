@@ -331,6 +331,40 @@ int main() {
             a.prepare_bf16(GgmlActLayout::Q8K, x.data(), 640, 1);
         } catch (const std::invalid_argument&) { refused = true; }
         require(refused, "a Q8_K activation with k not a multiple of 256 was accepted");
+        // A non-finite activation must be rejected before the fast ggml quantizer, which would
+        // otherwise derive a NaN block scale and emit garbage codes (the exact path throws for the
+        // same input, so the two backends must agree).
+        auto expect_nonfinite = [&](const std::string& kind, auto&& call) {
+            bool threw = false;
+            std::string message;
+            try { call(); } catch (const std::runtime_error& error) {
+                threw = true;
+                message = error.what();
+            }
+            require(threw && message.find("nonfinite") != std::string::npos,
+                    kind + " activation was not rejected as nonfinite");
+        };
+        auto finite_row = [&] { return std::vector<std::uint16_t>(2560, 0x3F00); };  // all 1.0
+        GgmlCpuActivation single(1, 2560);
+        single.prepare_bf16_start(GgmlActLayout::Q8K, 1);
+        {
+            auto row = finite_row();
+            row[1234] = 0x7F81;  // NaN
+            expect_nonfinite("a NaN", [&] { single.prepare_bf16_token(0, row.data()); });
+        }
+        {
+            auto row = finite_row();
+            row[0] = 0x7F80;  // +Inf
+            expect_nonfinite("an Inf", [&] { single.prepare_bf16_token(0, row.data()); });
+        }
+        {
+            std::vector<std::uint16_t> both(2 * 2560, 0x3F00);
+            both[2560 + 7] = 0xFFC0;  // -Inf in the second token
+            GgmlCpuActivation batch(2, 2560);
+            expect_nonfinite("a batch Inf", [&] {
+                batch.prepare_bf16(GgmlActLayout::Q8K, both.data(), 2560, 2);
+            });
+        }
         std::cout << "gguf_expert_cpu_ggml: OK\n";
         return 0;
     } catch (const std::exception& error) {
