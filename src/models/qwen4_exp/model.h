@@ -136,6 +136,13 @@ public:
 
     [[nodiscard]] const LoadOptions& options() const noexcept { return options_; }
 
+    // The single NUMA plan resolved at load for host-resident experts (pinned-buffer shards,
+    // per-node worker pools, service CPU). Empty for device-resident loads. ExpertMisses reuses it
+    // so the CPU pool placement matches the pinned buffer's socket layout instead of re-planning.
+    [[nodiscard]] const std::optional<HostNumaPlan>& numa_plan() const noexcept {
+        return numa_plan_;
+    }
+
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
 
     [[nodiscard]] const StagePlan& stages() const noexcept { return stages_; }
@@ -206,6 +213,7 @@ private:
     std::optional<qwen3_5::VisionWeights> vision_weights_;
     std::optional<MtpConfig> mtp_config_;
     std::optional<MtpWeights> mtp_weights_;
+    std::optional<HostNumaPlan> numa_plan_;
 };
 
 // Whether the artifact's text component is this family.

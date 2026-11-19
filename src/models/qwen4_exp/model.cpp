@@ -487,11 +487,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
     artifact::MaterializeOptions mat_options;
+    std::optional<HostNumaPlan> host_numa_plan;
     if (options.experts == ExpertResidency::Host) {
         const auto& topo        = host_numa_topology();
         const int gpu_node      = device_numa_node(device.rank(0).device);
         const auto numa_plan    = plan_host_numa(topo, gpu_node, materialization.pinned_capacity_bytes,
                                                  options.cpu_threads, options.numa_policy);
+        host_numa_plan          = numa_plan;
         mat_options.pinned_numa_node = numa_plan.primary_node;
         mat_options.pinned_numa_placement =
             numa_plan.primary_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default;
@@ -510,6 +512,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         new Model(std::move(config), options, std::move(weights), std::move(stages),
                   std::move(bound), std::move(resources), std::move(info), std::move(backing)));
     model->files_          = std::move(files);
+    model->numa_plan_      = std::move(host_numa_plan);
     model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);
     model->vision_config_  = std::move(vision_config);
     model->vision_weights_ = std::move(vision_weights);

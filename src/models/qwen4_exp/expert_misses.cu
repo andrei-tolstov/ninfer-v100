@@ -779,9 +779,17 @@ struct ExpertMisses::Impl {
                     total_host_bytes += lb * layer.experts;
                 }
             }
-            const HostNumaPlan numa_plan = plan_host_numa(
-                host_numa_topology(), primary_gpu_node, total_host_bytes, options.cpu_threads,
-                options.numa_policy);
+            // Prefer the plan resolved at load: it was computed against the pinned buffer's true
+            // capacity and the primary rank's GPU socket, so the CPU pools land on the same sockets
+            // as the pinned weights. A caller that provides no plan falls back to re-planning here.
+            HostNumaPlan numa_plan;
+            if (options.numa_plan) {
+                numa_plan = *options.numa_plan;
+            } else {
+                numa_plan = plan_host_numa(
+                    host_numa_topology(), primary_gpu_node, total_host_bytes, options.cpu_threads,
+                    options.numa_policy);
+            }
             numa_mode       = numa_plan.mode;
             service_pin_cpu = numa_plan.service_cpu;
             backend         = ops::gguf_cpu_backend_selected(ops::GgufCpuBackend::Automatic);

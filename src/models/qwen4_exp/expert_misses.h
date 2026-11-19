@@ -68,6 +68,10 @@ struct MissOptions {
     // kernels cover the stored format; other stored formats keep the exact q8_1 products.
     bool cpu_ggml          = false;
     NumaPolicy numa_policy = NumaPolicy::Auto;
+    // The NUMA plan resolved at load (pinned-buffer shards + per-node CPU pools). When present,
+    // ExpertMisses adopts it verbatim instead of re-planning from its own byte estimate, so the
+    // CPU pool sockets match the pinned buffer's socket layout.
+    std::optional<HostNumaPlan> numa_plan;
 };
 
 struct MissStats {

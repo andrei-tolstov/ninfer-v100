@@ -1568,6 +1568,7 @@ struct Executor::Impl {
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.cpu_ggml       = options.hybrid_experts.cpu_ggml;
         miss.numa_policy    = options.hybrid_experts.numa_policy;
+        miss.numa_plan      = model.numa_plan();
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         misses              = std::make_unique<ExpertMisses>(
