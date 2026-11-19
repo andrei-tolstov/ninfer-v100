@@ -108,8 +108,10 @@ inline bool bind_memory_to_node(void* addr, std::size_t bytes, int node_id,
 [[nodiscard]] int query_page_numa_node(const void* addr) noexcept;
 
 // RAII scope setting the calling thread's Linux memory allocation policy (`MPOL_BIND` or
-// `MPOL_INTERLEAVE`) before allocating/faulting pages (e.g. `cudaHostAlloc`), restoring `MPOL_DEFAULT`
-// on scope exit.
+// `MPOL_INTERLEAVE`) before allocating/faulting pages (e.g. `cudaHostAlloc`). The previous policy
+// is captured with `get_mempolicy` and restored on scope exit -- not reset to `MPOL_DEFAULT` -- so
+// a policy the process or its launcher (numactl) set before the scope survives it, and nested
+// scopes unwind cleanly.
 class ScopedThreadMemPolicy {
 public:
     ScopedThreadMemPolicy(std::span<const int> nodes, bool interleave = false) noexcept;
@@ -122,15 +124,19 @@ public:
     [[nodiscard]] bool active() const noexcept { return active_; }
 
 private:
-    bool active_ = false;
+    bool active_   = false;
+    int prev_mode_ = -1;  // captured previous mode; -1: nothing captured
+    std::vector<unsigned long> prev_mask_;
 };
 
 // Resolves NUMA placement and per-node CPU thread assignment for host-resident MoE execution.
+// `page_size` rounds shard boundaries to whole pages; pass 0 (the default) to use the system's
+// native page size rather than assuming 4096 (64 KiB hosts would otherwise mis-round shards).
 [[nodiscard]] HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
                                           std::uint64_t pinned_bytes,
                                           std::uint32_t requested_threads,
                                           NumaPolicy policy,
-                                          std::uint64_t page_size = 4096);
+                                          std::uint64_t page_size = 0);
 
 // Returns worker CPU IDs pinned to `preferred_node` (physical cores first, then local SMT
 // siblings) when `threads` fits on that node (0 picks physical cores of `preferred_node`), or

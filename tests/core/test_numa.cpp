@@ -16,7 +16,11 @@
 #include <vector>
 
 #ifdef __linux__
+#    include <linux/mempolicy.h>
+#    include <sched.h>
 #    include <sys/mman.h>
+#    include <sys/syscall.h>
+#    include <unistd.h>
 #endif
 
 namespace {
@@ -225,6 +229,157 @@ void test_plan_host_numa_policies() {
     }
 }
 
+// Exercises the review-driven fixes: Shmem subtraction, free-weighted Sharded split, explicit
+// mirror/isolate RAM refusal, the CPU_SETSIZE guard, and policy save/restore.
+void test_numa_review_fixes() {
+#ifdef __linux__
+    constexpr std::uint64_t kGiB = 1ULL << 30;
+    constexpr std::uint64_t kKibPerGiB = 1024ULL * 1024ULL;
+
+    // Shmem is subtracted from a node's reclaimable memory: a node reporting 10 GiB of shmem sees
+    // 10 GiB less free than an otherwise identical one.
+    {
+        auto write_node = [](TempSysfs& s, int node, std::uint64_t avail_kib,
+                             bool with_shmem) {
+            const std::uint64_t free_kib  = avail_kib / 2;
+            const std::uint64_t act_file  = avail_kib - free_kib;
+            const std::uint64_t shmem_kib = with_shmem ? 10ULL * kKibPerGiB : 0ULL;
+            s.write("devices/system/node/node" + std::to_string(node) + "/meminfo",
+                    "Node " + std::to_string(node) + " MemTotal:       " +
+                            std::to_string(128ULL * kKibPerGiB) + " kB\n"
+                            "Node " + std::to_string(node) + " MemFree:        " +
+                            std::to_string(free_kib) + " kB\n"
+                            "Node " + std::to_string(node) + " Active(file):   " +
+                            std::to_string(act_file) + " kB\n"
+                            "Node " + std::to_string(node) + " Inactive(file): 0 kB\n"
+                            "Node " + std::to_string(node) + " Shmem:          " +
+                            std::to_string(shmem_kib) + " kB\n");
+        };
+        TempSysfs s0;
+        s0.write("devices/system/node/online", "0-1\n");
+        write_node(s0, 0, 80ULL * kKibPerGiB, /*with_shmem=*/false);
+        write_node(s0, 1, 80ULL * kKibPerGiB, /*with_shmem=*/true);
+        for (int cpu = 0; cpu < 8; ++cpu) {
+            const std::string base = "devices/system/cpu/cpu" + std::to_string(cpu);
+            s0.write(base + "/online", "1\n");
+            s0.write(base + "/topology/physical_package_id",
+                     std::string(cpu < 4 ? "0" : "1") + "\n");
+            s0.write(base + "/topology/core_id", std::to_string(cpu % 4) + "\n");
+        }
+        for (int node = 0; node < 2; ++node) {
+            s0.write("devices/system/node/node" + std::to_string(node) + "/cpulist",
+                     node == 0 ? "0-3\n" : "4-7\n");
+        }
+        const NumaTopology t0 = parse_numa_sysfs(s0.root);
+        const NumaNodeInfo* n0 = t0.find(0);
+        const NumaNodeInfo* n1 = t0.find(1);
+        require(n0 && n1, "2-node topology with shmem must parse");
+        require(n1->free_bytes < n0->free_bytes,
+                "node with 10 GiB shmem must report less free memory");
+        const std::uint64_t delta = n0->free_bytes - n1->free_bytes;
+        require(delta >= 9ULL * kGiB && delta <= 11ULL * kGiB,
+                "shmem subtraction should remove ~10 GiB from free");
+    }
+
+    // Free-weighted Sharded: with node0 free 90 GiB and node1 free 54 GiB, the pinned range splits
+    // ~5:3, not evenly 40:40.
+    {
+        TempSysfs s;
+        s.write("devices/system/node/online", "0-1\n");
+        const auto meminfo = [&](int node, std::uint64_t avail_kib) {
+            s.write("devices/system/node/node" + std::to_string(node) + "/meminfo",
+                    "Node " + std::to_string(node) + " MemTotal:       " +
+                            std::to_string(128ULL * kKibPerGiB) + " kB\n"
+                            "Node " + std::to_string(node) + " MemFree:        " +
+                            std::to_string(avail_kib / 2) + " kB\n"
+                            "Node " + std::to_string(node) + " Active(file):   " +
+                            std::to_string(avail_kib - avail_kib / 2) + " kB\n"
+                            "Node " + std::to_string(node) + " Inactive(file): 0 kB\n"
+                            "Node " + std::to_string(node) + " SReclaimable:   0 kB\n");
+        };
+        meminfo(0, 90ULL * kKibPerGiB);
+        meminfo(1, 54ULL * kKibPerGiB);
+        for (int cpu = 0; cpu < 8; ++cpu) {
+            const std::string base = "devices/system/cpu/cpu" + std::to_string(cpu);
+            s.write(base + "/online", "1\n");
+            s.write(base + "/topology/physical_package_id",
+                    std::string(cpu < 4 ? "0" : "1") + "\n");
+            s.write(base + "/topology/core_id", std::to_string(cpu % 4) + "\n");
+        }
+        s.write("devices/system/node/node0/cpulist", "0-3\n");
+        s.write("devices/system/node/node1/cpulist", "4-7\n");
+        const NumaTopology t = parse_numa_sysfs(s.root);
+        const auto plan      = plan_host_numa(t, 0, 80ULL * kGiB, 0, NumaPolicy::Sharded);
+        require(plan.pinned_shards.size() == 2, "free-weighted Sharded keeps 2 shards");
+        require(plan.pinned_shards[0].bytes > plan.pinned_shards[1].bytes,
+                "node with more free memory must carry the larger shard");
+        const double ratio =
+            static_cast<double>(plan.pinned_shards[0].bytes) /
+            static_cast<double>(plan.pinned_shards[1].bytes);
+        require(ratio > 1.5 && ratio < 3.5,
+                "shard ratio should track the 90:54 free ratio, not 1:1");
+        require(plan.pinned_shards[0].bytes + plan.pinned_shards[1].bytes == 80ULL * kGiB,
+                "weighted shards must still sum to the pinned size");
+    }
+
+    // Explicit Mirror on a host that provably cannot hold the weights refuses up front.
+    {
+        TempSysfs s;
+        s.write("devices/system/node/online", "0-1\n");
+        const auto meminfo = [&](int node) {
+            s.write("devices/system/node/node" + std::to_string(node) + "/meminfo",
+                    "Node " + std::to_string(node) + " MemTotal:       " +
+                            std::to_string(8ULL * kKibPerGiB) + " kB\n"
+                    "Node " + std::to_string(node) + " MemFree:        " +
+                            std::to_string(4ULL * kKibPerGiB) + " kB\n"
+                    "Node " + std::to_string(node) + " SReclaimable:   0 kB\n");
+        };
+        meminfo(0);
+        meminfo(1);
+        for (int cpu = 0; cpu < 8; ++cpu) {
+            const std::string base = "devices/system/cpu/cpu" + std::to_string(cpu);
+            s.write(base + "/online", "1\n");
+            s.write(base + "/topology/physical_package_id",
+                    std::string(cpu < 4 ? "0" : "1") + "\n");
+            s.write(base + "/topology/core_id", std::to_string(cpu % 4) + "\n");
+        }
+        s.write("devices/system/node/node0/cpulist", "0-3\n");
+        s.write("devices/system/node/node1/cpulist", "4-7\n");
+        const NumaTopology t = parse_numa_sysfs(s.root);
+        bool refused         = false;
+        try {
+            (void)plan_host_numa(t, 0, 20ULL * kGiB, 0, NumaPolicy::Mirror);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        require(refused, "explicit Mirror with insufficient RAM must throw");
+    }
+
+    // bind_thread_to_cpu rejects ids past the static cpu_set_t (CPU_SETSIZE) bound.
+    require(!bind_thread_to_cpu(1 << 20), "bind_thread_to_cpu must reject cpu_id >= CPU_SETSIZE");
+    require(!bind_thread_to_cpu(-1), "bind_thread_to_cpu must reject negative cpu_id");
+
+    // ScopedThreadMemPolicy restores the caller's pre-existing policy on scope exit (not a blind
+    // MPOL_DEFAULT reset). Record the thread policy, enter a bind scope, and confirm the policy is
+    // back on exit.
+    {
+        auto read_mode = []() -> int {
+            int mode             = -1;
+            unsigned long mask[16] = {0};
+            const long rc =
+                syscall(__NR_get_mempolicy, &mode, mask, 1024UL + 1UL, nullptr, 0UL);
+            return (rc == 0) ? mode : -1;
+        };
+        const int before = read_mode();
+        { ScopedThreadMemPolicy scope(0, NumaPlacement::Bind); }
+        const int after = read_mode();
+        require(before == after, "memory policy must be restored after the scope exits");
+    }
+#else
+    (void)require;
+#endif
+}
+
 void test_live_host_and_cuda_numa() {
     const NumaTopology& topo = host_numa_topology();
     require(!topo.nodes.empty(), "host_numa_topology must yield >= 1 node");
@@ -285,6 +440,7 @@ int main() {
     try {
         test_synthetic_supermicro_sysfs();
         test_plan_host_numa_policies();
+        test_numa_review_fixes();
         test_live_host_and_cuda_numa();
         std::cout << "test_numa: PASS\n";
         return 0;

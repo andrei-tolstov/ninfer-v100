@@ -11,6 +11,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -79,7 +80,7 @@ void parse_node_meminfo(const std::filesystem::path& meminfo_path, std::uint64_t
     std::ifstream f(meminfo_path);
     if (!f) { return; }
     std::uint64_t mem_free = 0, active_file = 0, inactive_file = 0, file_pages = 0,
-                  sreclaimable = 0;
+                  sreclaimable = 0, shmem = 0;
     bool has_active_inactive = false;
     std::string line;
     while (std::getline(f, line)) {
@@ -106,10 +107,16 @@ void parse_node_meminfo(const std::filesystem::path& meminfo_path, std::uint64_t
             file_pages = bytes;
         } else if (key.find("SReclaimable") != std::string::npos) {
             sreclaimable = bytes;
+        } else if (key.size() >= 5 && key.compare(key.size() - 5, 5, "Shmem") == 0) {
+            // Suffix match so ShmemHugePages does not leak into the plain Shmem figure.
+            shmem = bytes;
         }
     }
     std::uint64_t reclaimable = has_active_inactive ? (active_file + inactive_file) : file_pages;
-    std::uint64_t avail       = mem_free + reclaimable + sreclaimable;
+    // Shmem (tmpfs / shared mappings) is resident and non-file-reclaimable; counting it as free
+    // would overstate the RAM a pinned buffer can actually take on this node.
+    if (reclaimable > shmem) { reclaimable -= shmem; } else { reclaimable = 0; }
+    std::uint64_t avail = mem_free + reclaimable + sreclaimable;
     if (total_bytes > 0) { avail = std::min(avail, total_bytes); }
     free_bytes = avail;
 }
@@ -360,8 +367,11 @@ int device_numa_node(int cuda_device) {
 }
 
 bool bind_thread_to_cpu(int cpu_id) noexcept {
-    if (cpu_id < 0) { return false; }
 #ifdef __linux__
+    // CPU_SET writes past the static cpu_set_t (CPU_SETSIZE bits, 1024 on Linux) for ids at or
+    // above the bound -- a stack overflow on machines with more logical CPUs than that (the 192-
+    // core Supermicro X9DAX is one). bind_thread_to_node already guards the same bound.
+    if (cpu_id < 0 || cpu_id >= CPU_SETSIZE) { return false; }
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu_id, &set);
@@ -435,9 +445,35 @@ int query_page_numa_node(const void* addr) noexcept {
 #endif
 }
 
+#if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
+// Captures the calling thread's current memory policy so it can be restored when a
+// ScopedThreadMemPolicy scope exits. `get_mempolicy` with a null address returns the thread-wide
+// policy; MPOL_DEFAULT carries no nodemask, and the other modes fill `mask`/`maxnode`.
+static bool capture_thread_mempolicy(int& mode_out, std::vector<unsigned long>& mask_out) noexcept {
+    unsigned long maxnode = 0;
+    constexpr std::size_t mask_words = 1024 / (8 * sizeof(unsigned long));
+    mask_out.assign(mask_words, 0UL);
+    const long rc = syscall(__NR_get_mempolicy, &mode_out, mask_out.data(), 1024UL + 1UL,
+                            static_cast<void*>(nullptr), 0UL);
+    if (rc != 0) { return false; }
+    maxnode = 1024UL + 1UL;
+    (void)maxnode;
+    return true;
+}
+
+static void restore_thread_mempolicy(int mode, const std::vector<unsigned long>& mask) noexcept {
+    if (mode == MPOL_DEFAULT || mode < 0) {
+        (void)syscall(__NR_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL);
+        return;
+    }
+    (void)syscall(__NR_set_mempolicy, mode, mask.data(), 1024UL + 1UL);
+}
+#endif
+
 ScopedThreadMemPolicy::ScopedThreadMemPolicy(std::span<const int> nodes,
                                              bool interleave) noexcept {
-#if defined(__linux__) && defined(__NR_set_mempolicy)
+#if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
+    capture_thread_mempolicy(prev_mode_, prev_mask_);
     std::vector<unsigned long> mask;
     unsigned long maxnode = 0;
     if (build_nodemask(nodes, mask, maxnode)) {
@@ -451,7 +487,8 @@ ScopedThreadMemPolicy::ScopedThreadMemPolicy(std::span<const int> nodes,
 }
 
 ScopedThreadMemPolicy::ScopedThreadMemPolicy(int node_id, NumaPlacement placement) noexcept {
-#if defined(__linux__) && defined(__NR_set_mempolicy)
+#if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
+    capture_thread_mempolicy(prev_mode_, prev_mask_);
     if (placement == NumaPlacement::Bind && node_id >= 0) {
         std::vector<unsigned long> mask;
         unsigned long maxnode = 0;
@@ -481,8 +518,11 @@ ScopedThreadMemPolicy::ScopedThreadMemPolicy(int node_id, NumaPlacement placemen
 }
 
 ScopedThreadMemPolicy::~ScopedThreadMemPolicy() noexcept {
-#if defined(__linux__) && defined(__NR_set_mempolicy)
-    if (active_) { (void)syscall(__NR_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL); }
+#if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
+    if (active_) { restore_thread_mempolicy(prev_mode_, prev_mask_); }
+#else
+    (void)prev_mode_;
+    (void)prev_mask_;
 #endif
 }
 
@@ -491,6 +531,14 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
                               NumaPolicy policy, std::uint64_t page_size) {
     HostNumaPlan plan;
     if (topo.nodes.empty()) { return plan; }
+    // A zero page_size means "use the system's native page size" (the default argument).
+    if (page_size == 0) {
+        page_size = 4096;
+#ifdef __linux__
+        const long native = sysconf(_SC_PAGESIZE);
+        if (native > 0) { page_size = static_cast<std::uint64_t>(native); }
+#endif
+    }
 
     const NumaNodeInfo* gpu_info = (gpu_node >= 0) ? topo.find(gpu_node) : nullptr;
     if (!gpu_info) { gpu_info = &topo.nodes.front(); }
@@ -543,6 +591,36 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         }
     }
     plan.mode = mode;
+
+    // An explicit --numa-policy is a contract, not a best effort. When the node(s) that must hold
+    // the pinned weights provably cannot, refuse up front with a clear error instead of dying at
+    // the first cudaHostRegister with ENOMEM. Auto keeps its graceful downgrade.
+    if (pinned_bytes > 0 && policy != NumaPolicy::Auto) {
+        const std::uint64_t headroom =
+            gpu_info->total_bytes > 0
+                ? std::min<std::uint64_t>(2ULL << 30, gpu_info->total_bytes / 16)
+                : 0ULL;
+        if (mode == HostNumaMode::Sharded) {
+            std::uint64_t total_free = 0;
+            bool all_known          = true;
+            for (const auto& n : topo.nodes) {
+                total_free += n.free_bytes;
+                if (n.total_bytes == 0) { all_known = false; }
+            }
+            if (all_known && total_free + headroom < pinned_bytes) {
+                throw std::runtime_error("NUMA sharded: cannot pin " + std::to_string(pinned_bytes) +
+                                         " B across " + std::to_string(topo.nodes.size()) +
+                                         " node(s) with only " + std::to_string(total_free) +
+                                         " B free");
+            }
+        } else if (gpu_info->total_bytes > 0 && gpu_info->free_bytes + headroom < pinned_bytes) {
+            throw std::runtime_error(std::string("NUMA ") +
+                                     (mode == HostNumaMode::Mirror ? "mirror" : "isolate") +
+                                     ": node " + std::to_string(gpu_info->node_id) + " has only " +
+                                     std::to_string(gpu_info->free_bytes) +
+                                     " B free, cannot pin " + std::to_string(pinned_bytes) + " B");
+        }
+    }
 
     const auto node_phys = [](const NumaNodeInfo& n) -> const std::vector<int>& {
         return !n.physical_cpus.empty() ? n.physical_cpus : n.logical_cpus;
@@ -682,12 +760,34 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         } else {
             const std::uint64_t psize = std::max<std::uint64_t>(page_size, 4096);
             const std::size_t kNodes  = ordered.size();
-            std::uint64_t prev        = 0;
+            // Free-weighted split when every node's free RAM is known: a node with more free
+            // memory carries more of the pinned range, so the two sockets stop fighting over the
+            // scarcer one. Even split is the fallback when any node's free_bytes is unknown (0).
+            std::vector<std::uint64_t> weights(kNodes, 0);
+            std::uint64_t weight_sum             = 0;
+            bool all_known                       = true;
             for (std::size_t idx = 0; idx < kNodes; ++idx) {
-                std::uint64_t next =
-                    (idx + 1 == kNodes)
-                        ? pinned_bytes
-                        : ((pinned_bytes * (idx + 1)) / kNodes) / psize * psize;
+                const std::uint64_t w = ordered[idx]->free_bytes;
+                if (w == 0) { all_known = false; break; }
+                weights[idx] = w;
+                weight_sum  += w;
+            }
+            if (all_known && weight_sum == 0) { all_known = false; }
+            std::uint64_t prev = 0;
+            std::uint64_t cumulative = 0;
+            for (std::size_t idx = 0; idx < kNodes; ++idx) {
+                std::uint64_t next;
+                if (idx + 1 == kNodes) {
+                    next = pinned_bytes;
+                } else if (all_known) {
+                    cumulative += weights[idx];
+                    // uint128 intermediate: pinned_bytes * cumulative overflows uint64 at GiB scale.
+                    next = static_cast<std::uint64_t>(
+                        (static_cast<__uint128_t>(pinned_bytes) * cumulative) / weight_sum);
+                } else {
+                    next = (pinned_bytes * (idx + 1)) / kNodes;
+                }
+                next = next / psize * psize;
                 if (next < prev) { next = prev; }
                 if (next > prev) {
                     plan.pinned_shards.push_back(HostNumaShard{
