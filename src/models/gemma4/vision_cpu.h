@@ -17,8 +17,10 @@ namespace ninfer::models::gemma4 {
 
 class CpuVisionTower {
 public:
-    // `threads`: the CPU threads an encode uses (0: all hardware threads).
-    explicit CpuVisionTower(const Model& model, unsigned threads = 0);
+    // `cuda_device`: the CUDA device index this tower serves; its workers pin to that device's NUMA
+    // socket (not device 0's, which can be a different socket under --device). `threads`: the CPU
+    // threads an encode uses (0: all hardware threads on that socket).
+    explicit CpuVisionTower(const Model& model, int cuda_device, unsigned threads = 0);
 
     [[nodiscard]] const VisionConfig& config() const noexcept { return config_; }
 
@@ -36,6 +38,7 @@ private:
     };
 
     VisionConfig config_;
+    int cuda_device_ = 0;
     unsigned threads_ = 0;
     std::vector<float> patch_embedding_, projection_, position_table_, std_bias_, std_scale_;
     std::vector<Layer> layers_;

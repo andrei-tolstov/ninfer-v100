@@ -27,14 +27,15 @@ namespace ninfer::models::qwen3_5::execution {
 [[nodiscard]] std::vector<std::uint16_t>
 encode_vision_on_cpu(const CpuVisionWeights& weights, std::span<const std::uint16_t> patches,
                      const VisionItemControl& control, unsigned threads = 0,
-                     const std::atomic<bool>* cancelled = nullptr);
+                     const std::atomic<bool>* cancelled = nullptr, int cuda_device = 0);
 
 // One Vision prefill session's host encoder: at most one item in flight, encoded on a worker
 // thread beside other lanes' decode and handed over as BF16 host embeddings. Two result buffers
 // alternate, so the next item can encode while prefill still reads the previous one.
 class CpuVisionSession {
 public:
-    explicit CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights);
+    explicit CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights,
+                              int cuda_device = 0);
     ~CpuVisionSession();
 
     CpuVisionSession(const CpuVisionSession&)            = delete;
@@ -63,6 +64,7 @@ public:
 
 private:
     std::shared_ptr<const CpuVisionWeights> weights_;
+    int cuda_device_ = 0;
     std::thread worker_;
     std::atomic<bool> finished_{false};
     std::atomic<bool> cancelled_{false};

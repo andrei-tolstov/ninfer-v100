@@ -225,16 +225,17 @@ void apply_norm(const Matrix& x, const std::vector<float>& scale, const std::vec
 
 } // namespace
 
-CpuVisionTower::CpuVisionTower(const Model& model, unsigned threads)
+CpuVisionTower::CpuVisionTower(const Model& model, int cuda_device, unsigned threads)
     : config_(*model.vision_config()),
+      cuda_device_(cuda_device),
       threads_(threads != 0
                    ? threads
-                   : static_cast<unsigned>(
-                         std::max<std::size_t>(1, select_worker_cpus(device_numa_node(0), 0).size()))) {
+                   : static_cast<unsigned>(std::max<std::size_t>(
+                         1, select_worker_cpus(device_numa_node(cuda_device), 0).size()))) {
     if (!model.vision() || model.vision_placement() != VisionPlacement::Host) {
         throw std::invalid_argument("gemma4 CPU vision: the model holds no host vision tower");
     }
-    const int vision_node = device_numa_node(0);
+    const int vision_node = device_numa_node(cuda_device);
     ScopedThreadMemPolicy mem_scope(vision_node,
                                     vision_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
     const VisionWeights& w = *model.vision();
@@ -290,7 +291,7 @@ std::vector<std::uint16_t> CpuVisionTower::encode(std::span<const std::uint16_t>
         throw std::invalid_argument("gemma4 CPU vision: invalid encode batch");
     }
     const float eps = config_.rms_norm_eps;
-    const auto worker_cpus = select_worker_cpus(device_numa_node(0), threads_);
+    const auto worker_cpus = select_worker_cpus(device_numa_node(cuda_device_), threads_);
     Team team(threads_, worker_cpus);
 
     Matrix x(features, total);

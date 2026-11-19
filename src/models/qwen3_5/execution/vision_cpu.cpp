@@ -300,7 +300,8 @@ std::mutex& encode_turn() {
 std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
                                                 std::span<const std::uint16_t> patches,
                                                 const VisionItemControl& control, unsigned threads,
-                                                const std::atomic<bool>* cancelled) {
+                                                const std::atomic<bool>* cancelled,
+                                                int cuda_device) {
     const auto count   = static_cast<std::int32_t>(control.patch_count);
     const auto merged  = static_cast<std::int32_t>(control.merged_count);
     const auto hidden  = weights.hidden;
@@ -313,7 +314,7 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
         control.position_table_weights.size() != static_cast<std::size_t>(count) * 4) {
         throw std::invalid_argument("CPU Vision item does not match its control");
     }
-    const auto worker_cpus = select_worker_cpus(device_numa_node(0), threads);
+    const auto worker_cpus = select_worker_cpus(device_numa_node(cuda_device), threads);
     const unsigned team_threads =
         threads != 0 ? threads : static_cast<unsigned>(std::max<std::size_t>(1, worker_cpus.size()));
     Team team(team_threads, worker_cpus);
@@ -402,8 +403,9 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
     return out;
 }
 
-CpuVisionSession::CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights)
-    : weights_(std::move(weights)) {
+CpuVisionSession::CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights,
+                                   int cuda_device)
+    : weights_(std::move(weights)), cuda_device_(cuda_device) {
     if (!weights_) { throw std::invalid_argument("CPU Vision session has no weights"); }
 }
 
@@ -425,8 +427,8 @@ void CpuVisionSession::submit_item(std::shared_ptr<const PreparedMediaPayload> p
         try {
             const std::lock_guard turn(encode_turn());
             const auto started = std::chrono::steady_clock::now();
-            results_[slot] =
-                encode_vision_on_cpu(*weights_, payload->span(), control, 0, &cancelled_);
+            results_[slot] = encode_vision_on_cpu(*weights_, payload->span(), control, 0,
+                                                  &cancelled_, cuda_device_);
             worker_seconds_ =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         } catch (...) { error_ = std::current_exception(); }

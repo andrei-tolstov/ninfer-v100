@@ -201,7 +201,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         }
     }
     if (vision == models::gemma4::VisionPlacement::Host) {
-        instance->cpu_vision = std::make_unique<models::gemma4::CpuVisionTower>(*model);
+        instance->cpu_vision =
+            std::make_unique<models::gemma4::CpuVisionTower>(*model, device.entry().device);
     }
     device.synchronize();
     program.complete();
