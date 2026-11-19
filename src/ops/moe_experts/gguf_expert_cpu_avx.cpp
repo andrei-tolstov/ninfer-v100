@@ -96,7 +96,13 @@ inline float butterfly8(const __m256* lanes) {
 
 inline __m256 live_floats(const float* from, int live) {
     if (live == 8) { return _mm256_loadu_ps(from); }
-    if (live == 4) { return _mm256_castps128_ps256(_mm_loadu_ps(from)); }
+    // The `live == 4` fast path must not rely on the compiler zeroing the upper 128 bits of the
+    // YMM register when widening an XMM load: the spec leaves them undefined, and a later
+    // `0.0F * garbage` (factor0/dot lanes are zero there) yields NaN when the garbage is NaN/Inf,
+    // which would poison `acc` and `butterfly8`. Insert the zeros explicitly.
+    if (live == 4) {
+        return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(from)), _mm_setzero_ps(), 1);
+    }
     alignas(32) float to[8];
     for (int i = 0; i < 8; ++i) { to[i] = i < live ? from[i] : 0.0F; }
     return _mm256_load_ps(to);
@@ -274,6 +280,11 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
             __m256 acc[4]         = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
                                      _mm256_setzero_ps()};
             for (int g = 0; g < groups; ++g) {
+                // A trailing group holds fewer than 8 32-value slices when k is not a multiple of
+                // 256 (e.g. the 640-column down projection). Only the live slices exist: decoding a
+                // missing one would read weight and activation bytes past the row and would scale
+                // them with a scale the row never stored.
+                const int live = slices - 8 * g < 8 ? slices - 8 * g : 8;
                 const std::uint8_t* block = r + std::size_t(g) * bytes;
                 const float d             = half_at(block);
                 std::uint16_t iq4_high    = 0;
@@ -285,6 +296,13 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
                     __m128i u_lo[4], u_hi[4];
                     for (int k = 0; k < 4; ++k) {
                         const int sub = base + k;
+                        if (sub >= live) {
+                            u_lo[k] = _mm_setzero_si128();
+                            u_hi[k] = _mm_setzero_si128();
+                            factor0[sub] = 0.0F;
+                            factor1[sub] = 0.0F;
+                            continue;
+                        }
                         __m128i mag_lo, mag_hi, sgn_lo, sgn_hi;
                         decode_iq_slice<F>(block, sub, d, iq4_high, table_iq4, table_iq4_abs,
                                            mag_lo, mag_hi, sgn_lo, sgn_hi, factor0[sub],
@@ -310,7 +328,7 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
                 run_half(0, lo0123, hi0123);
                 run_half(4, lo4567, hi4567);
 
-                const __m256 scale = _mm256_loadu_ps(act_scales + 8 * g);
+                const __m256 scale = live_floats(act_scales + 8 * g, live);
                 const __m256 f0    = _mm256_load_ps(factor0);
                 __m256 product;
                 if constexpr (halves) {
