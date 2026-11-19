@@ -99,3 +99,12 @@ Codegen M1 (objdump `gguf_expert_cpu_avx.cpp.o`): `vinsertf128` = 76, legacy `mo
 4. **N4**: добавить `-ffp-contract=off` для AVX-TU gemma4?
 5. **m4**: нужно ли закрыть `PinnedHostBuffer` (шардовый конструктор) до register + явно report-ить деградацию вместо тихого Interleave?
 6. thread_local в vision-kernels — оставить как есть?
+
+---
+
+## 7. Обновление контейнера flash-next
+
+- **Бинарник**: собран `ninfer-serve` (`build 1.7.2+cb38ca5a6`, `build-avx`, `NINFER_GGML_CPU_AVX2=OFF`, sm_70) и скопирован в `/opt/models/flash_next/bin/ninfer-serve`.
+- **Образ**: `docker build -f Dockerfile.ninfer-v100-avx.local -t ninfer-v100:e5-2650v2-avx` пересобран с новым бинарником (создан 2026-11-19 16:13). Контейнер `flash-next-llama-server` пересоздан на новом образе.
+- **Проверка на хосте**: с освобождённой V100 (после остановки `coder390-llama-server`, который на той же карте держит `coder390-27b`) новый бинарник загрузил модель `Qwen3.8-Flash-Next` (weights 4.57 GiB, experts в host-памяти, n-gram таблица 27465 MiB в RAM) за 1m41s и вышел в `listening on 0.0.0.0:8080`. По решению оператора дальнейший запуск flash-next не проводился — **проверка обновлённого контейнера засчитана успешной**.
+- **Итоговое состояние**: `flash-next-llama-server` остановлен (обновлён, готов к запуску `switch-to-flash-next.sh`), `restart`-политика возвращена к исходной `unless-stopped`, LLM сессии `coder390-llama-server` восстановлен и healthy (держит V100), остальные контейнеры (`deepseek-*`, omniroute, patroni, etcd, webtop) не тронуты.
