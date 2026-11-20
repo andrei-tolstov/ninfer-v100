@@ -21,7 +21,7 @@ constexpr float kNormEpsilon = 1.0e-6F;
 // The two-axis rotary geometry of the Qwen3.5 tower: 72-wide heads rotate 36 pairs, the first 18
 // by the patch row and the rest by its column, at 10000^(-2i/36) for i = pair % 18 -- the device
 // kernel's constant table (ops/kernel/rope.cuh), so both encoders rotate by the same angles.
-constexpr std::int32_t kHeadDim                   = 72;
+constexpr std::int32_t kHeadDim                   = cpu_vision::kHeadDim;
 constexpr std::int32_t kAxisPairs                 = 18;
 constexpr std::int32_t kRotaryPairs               = 2 * kAxisPairs;
 constexpr float kRopeInverseFrequency[kAxisPairs] = {
@@ -397,6 +397,9 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
     for (std::int32_t o = 0; o < weights.output_hidden; ++o) {
         const float* source = result.row(o);
         for (std::int32_t v = 0; v < merged; ++v) {
+            if (!std::isfinite(source[v])) {
+                throw std::runtime_error("CPU Vision: nonfinite output");
+            }
             out[static_cast<std::size_t>(v) * weights.output_hidden + o] = f32_to_bf16(source[v]);
         }
     }

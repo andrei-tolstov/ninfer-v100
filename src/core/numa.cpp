@@ -1,19 +1,25 @@
 #include "core/numa.h"
 
+#include "core/wide_math.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #ifdef __linux__
@@ -86,29 +92,40 @@ void parse_node_meminfo(const std::filesystem::path& meminfo_path, std::uint64_t
     while (std::getline(f, line)) {
         const auto colon = line.find(':');
         if (colon == std::string::npos) { continue; }
-        const std::string key = line.substr(0, colon);
+        std::string_view key = std::string_view(line).substr(0, colon);
+        while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) {
+            key.remove_prefix(1);
+        }
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
+            key.remove_suffix(1);
+        }
+        // Per-node meminfo prefixes keys with "Node <id> "; strip to the bare field name so
+        // *HugePages* / ShmemPmdMapped / FileHugePages never alias MemFree, FilePages, or Shmem.
+        if (key.rfind("Node ", 0) == 0) {
+            const auto last_sp = key.rfind(' ');
+            if (last_sp != std::string_view::npos) { key.remove_prefix(last_sp + 1); }
+        }
         std::uint64_t kb = 0;
         {
             std::istringstream val(line.substr(colon + 1));
             if (!(val >> kb)) { continue; }
         }
         const std::uint64_t bytes = kb * 1024ULL;
-        if (key.find("MemTotal") != std::string::npos) {
+        if (key == "MemTotal") {
             total_bytes = bytes;
-        } else if (key.find("MemFree") != std::string::npos) {
+        } else if (key == "MemFree") {
             mem_free = bytes;
-        } else if (key.find("Active(file)") != std::string::npos) {
+        } else if (key == "Active(file)") {
             active_file         = bytes;
             has_active_inactive = true;
-        } else if (key.find("Inactive(file)") != std::string::npos) {
+        } else if (key == "Inactive(file)") {
             inactive_file       = bytes;
             has_active_inactive = true;
-        } else if (key.find("FilePages") != std::string::npos) {
+        } else if (key == "FilePages") {
             file_pages = bytes;
-        } else if (key.find("SReclaimable") != std::string::npos) {
+        } else if (key == "SReclaimable") {
             sreclaimable = bytes;
-        } else if (key.size() >= 5 && key.compare(key.size() - 5, 5, "Shmem") == 0) {
-            // Suffix match so ShmemHugePages does not leak into the plain Shmem figure.
+        } else if (key == "Shmem") {
             shmem = bytes;
         }
     }
@@ -153,28 +170,6 @@ std::vector<int> current_allowed_cpus(std::uint32_t& quota_cpus_out) {
     }
     return cpus;
 }
-
-#    if defined(__NR_mbind) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
-bool build_nodemask(std::span<const int> nodes, std::vector<unsigned long>& mask,
-                    unsigned long& maxnode_out) {
-    if (nodes.empty()) { return false; }
-    int max_id = -1;
-    for (const int n : nodes) {
-        if (n < 0 || n >= 1024) { return false; }
-        max_id = std::max(max_id, n);
-    }
-    constexpr std::size_t kBitsPerWord = 8U * sizeof(unsigned long);
-    const std::size_t words = static_cast<std::size_t>(max_id) / kBitsPerWord + 1U;
-    mask.assign(words, 0UL);
-    for (const int n : nodes) {
-        const auto u = static_cast<std::size_t>(n);
-        mask[u / kBitsPerWord] |= (1UL << (u % kBitsPerWord));
-    }
-    // Linux kernel `get_nodes()` subtracts 1 from maxnode internally (`--maxnode`).
-    maxnode_out = static_cast<unsigned long>(words * kBitsPerWord + 1U);
-    return true;
-}
-#    endif
 #endif
 
 } // namespace
@@ -227,10 +222,11 @@ NumaTopology parse_numa_sysfs(const std::filesystem::path& sys_base,
         if (!entry.is_directory(ec)) { continue; }
         const std::string name = entry.path().filename().string();
         if (name.rfind("node", 0) != 0 || name.size() <= 4) { continue; }
-        bool all_digits = std::all_of(name.begin() + 4, name.end(),
-                                      [](unsigned char c) { return std::isdigit(c) != 0; });
-        if (!all_digits) { continue; }
-        const int id = std::stoi(name.substr(4));
+        int id              = -1;
+        const char* p_begin = name.data() + 4;
+        const char* p_end   = name.data() + name.size();
+        const auto [ptr, ec_parse] = std::from_chars(p_begin, p_end, id);
+        if (ec_parse != std::errc{} || ptr != p_end || id < 0) { continue; }
         if (have_online_list && online_nodes.find(id) == online_nodes.end()) { continue; }
         candidate_nodes.push_back(id);
     }
@@ -303,44 +299,41 @@ NumaTopology parse_numa_sysfs(const std::filesystem::path& sys_base,
     return topo;
 }
 
-const NumaTopology& host_numa_topology() {
-    static const NumaTopology topology = []() {
-        NumaTopology out;
+NumaTopology host_numa_topology() {
+    NumaTopology out;
 #ifdef __linux__
-        std::uint32_t quota_cap     = 0;
-        const std::vector<int> mask = current_allowed_cpus(quota_cap);
-        out                         = parse_numa_sysfs("/sys", mask, quota_cap);
-        if (out.nodes.empty()) {
-            NumaNodeInfo fallback;
-            fallback.node_id = 0;
-            const long pages = sysconf(_SC_PHYS_PAGES);
-            const long psize = sysconf(_SC_PAGESIZE);
-            const long avail = sysconf(_SC_AVPHYS_PAGES);
-            if (pages > 0 && psize > 0) {
-                fallback.total_bytes = static_cast<std::uint64_t>(pages) * psize;
-            }
-            if (avail > 0 && psize > 0) {
-                fallback.free_bytes = static_cast<std::uint64_t>(avail) * psize;
-            }
-            fallback.logical_cpus  = mask;
-            fallback.physical_cpus = mask;
-            if (!fallback.logical_cpus.empty() || fallback.total_bytes > 0) {
-                out.nodes.push_back(std::move(fallback));
-            }
+    std::uint32_t quota_cap     = 0;
+    const std::vector<int> mask = current_allowed_cpus(quota_cap);
+    out                         = parse_numa_sysfs("/sys", mask, quota_cap);
+    if (out.nodes.empty()) {
+        NumaNodeInfo fallback;
+        fallback.node_id = 0;
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long psize = sysconf(_SC_PAGESIZE);
+        const long avail = sysconf(_SC_AVPHYS_PAGES);
+        if (pages > 0 && psize > 0) {
+            fallback.total_bytes = static_cast<std::uint64_t>(pages) * psize;
         }
+        if (avail > 0 && psize > 0) {
+            fallback.free_bytes = static_cast<std::uint64_t>(avail) * psize;
+        }
+        fallback.logical_cpus  = mask;
+        fallback.physical_cpus = mask;
+        if (!fallback.logical_cpus.empty() || fallback.total_bytes > 0) {
+            out.nodes.push_back(std::move(fallback));
+        }
+    }
 #else
-        NumaNodeInfo single;
-        single.node_id        = 0;
-        const unsigned count  = std::max(1U, std::thread::hardware_concurrency());
-        for (unsigned i = 0; i < count; ++i) {
-            single.logical_cpus.push_back(static_cast<int>(i));
-            single.physical_cpus.push_back(static_cast<int>(i));
-        }
-        out.nodes.push_back(std::move(single));
+    NumaNodeInfo single;
+    single.node_id       = 0;
+    const unsigned count = std::max(1U, std::thread::hardware_concurrency());
+    for (unsigned i = 0; i < count; ++i) {
+        single.logical_cpus.push_back(static_cast<int>(i));
+        single.physical_cpus.push_back(static_cast<int>(i));
+    }
+    out.nodes.push_back(std::move(single));
 #endif
-        return out;
-    }();
-    return topology;
+    return out;
 }
 
 int parse_pci_device_numa_node(const std::filesystem::path& sys_base,
@@ -354,12 +347,24 @@ int parse_pci_device_numa_node(const std::filesystem::path& sys_base,
 }
 
 int device_numa_node(int cuda_device) {
+    if (cuda_device < 0) { return kNoNumaNode; }
 #ifdef __linux__
-    char bus_id[64]{};
-    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), cuda_device) != cudaSuccess) {
-        return kNoNumaNode;
+    static std::mutex cache_mutex;
+    static std::unordered_map<int, int> cache;
+    {
+        std::lock_guard lock(cache_mutex);
+        if (const auto it = cache.find(cuda_device); it != cache.end()) { return it->second; }
     }
-    return parse_pci_device_numa_node("/sys", std::string(bus_id));
+    char bus_id[64]{};
+    int node = kNoNumaNode;
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), cuda_device) == cudaSuccess) {
+        node = parse_pci_device_numa_node("/sys", std::string(bus_id));
+    }
+    {
+        std::lock_guard lock(cache_mutex);
+        cache.emplace(cuda_device, node);
+    }
+    return node;
 #else
     (void)cuda_device;
     return kNoNumaNode;
@@ -384,7 +389,7 @@ bool bind_thread_to_cpu(int cpu_id) noexcept {
 bool bind_thread_to_node(int node_id) noexcept {
     if (node_id < 0) { return false; }
 #ifdef __linux__
-    const NumaTopology& topo = host_numa_topology();
+    const NumaTopology topo  = host_numa_topology();
     const NumaNodeInfo* info = topo.find(node_id);
     if (!info || info->logical_cpus.empty()) { return false; }
     cpu_set_t set;
@@ -394,6 +399,33 @@ bool bind_thread_to_node(int node_id) noexcept {
     }
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
 #else
+    return false;
+#endif
+}
+
+bool build_nodemask(std::span<const int> nodes, std::vector<unsigned long>& mask,
+                    unsigned long& maxnode_out) {
+#ifdef __linux__
+    if (nodes.empty()) { return false; }
+    int max_id = -1;
+    for (const int n : nodes) {
+        if (n < 0 || n >= 1024) { return false; }
+        max_id = std::max(max_id, n);
+    }
+    constexpr std::size_t kBitsPerWord = 8U * sizeof(unsigned long);
+    const std::size_t words = static_cast<std::size_t>(max_id) / kBitsPerWord + 1U;
+    mask.assign(words, 0UL);
+    for (const int n : nodes) {
+        const auto u = static_cast<std::size_t>(n);
+        mask[u / kBitsPerWord] |= (1UL << (u % kBitsPerWord));
+    }
+    // Linux kernel `get_nodes()` subtracts 1 from maxnode internally (`--maxnode`).
+    maxnode_out = static_cast<unsigned long>(words * kBitsPerWord + 1U);
+    return true;
+#else
+    (void)nodes;
+    (void)mask;
+    (void)maxnode_out;
     return false;
 #endif
 }
@@ -419,7 +451,7 @@ bool bind_memory_nodes(void* addr, std::size_t bytes, std::span<const int> nodes
     long rc = syscall(__NR_mbind, reinterpret_cast<void*>(aligned_begin),
                       static_cast<unsigned long>(aligned_end - aligned_begin), mode, mask.data(),
                       maxnode, flags);
-    if (rc != 0 && move_pages && (errno == EIO || errno == EINVAL)) {
+    if (rc != 0 && move_pages && errno == EIO) {
         rc = syscall(__NR_mbind, reinterpret_cast<void*>(aligned_begin),
                      static_cast<unsigned long>(aligned_end - aligned_begin), mode, mask.data(),
                      maxnode, 0U);
@@ -430,6 +462,23 @@ bool bind_memory_nodes(void* addr, std::size_t bytes, std::span<const int> nodes
     (void)move_pages;
     return false;
 #endif
+}
+
+bool bind_pinned_shards(void* base, std::size_t size_bytes, std::span<const HostNumaShard> shards,
+                        std::vector<int>* failed_nodes) noexcept {
+    if (!base || size_bytes == 0) { return false; }
+    bool all_ok = true;
+    for (const auto& s : shards) {
+        if (s.numa_node >= 0 && s.bytes > 0 && s.offset < size_bytes) {
+            const std::size_t clamped = std::min(s.bytes, size_bytes - s.offset);
+            if (!bind_memory_to_node(static_cast<std::byte*>(base) + s.offset, clamped,
+                                     s.numa_node, /*move_pages=*/false)) {
+                all_ok = false;
+                if (failed_nodes) { failed_nodes->push_back(s.numa_node); }
+            }
+        }
+    }
+    return all_ok;
 }
 
 int query_page_numa_node(const void* addr) noexcept {
@@ -473,7 +522,8 @@ static void restore_thread_mempolicy(int mode, const std::vector<unsigned long>&
 ScopedThreadMemPolicy::ScopedThreadMemPolicy(std::span<const int> nodes,
                                              bool interleave) noexcept {
 #if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
-    capture_thread_mempolicy(prev_mode_, prev_mask_);
+    captured_ = capture_thread_mempolicy(prev_mode_, prev_mask_);
+    if (!captured_) { return; }
     std::vector<unsigned long> mask;
     unsigned long maxnode = 0;
     if (build_nodemask(nodes, mask, maxnode)) {
@@ -488,7 +538,8 @@ ScopedThreadMemPolicy::ScopedThreadMemPolicy(std::span<const int> nodes,
 
 ScopedThreadMemPolicy::ScopedThreadMemPolicy(int node_id, NumaPlacement placement) noexcept {
 #if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
-    capture_thread_mempolicy(prev_mode_, prev_mask_);
+    captured_ = capture_thread_mempolicy(prev_mode_, prev_mask_);
+    if (!captured_) { return; }
     if (placement == NumaPlacement::Bind && node_id >= 0) {
         std::vector<unsigned long> mask;
         unsigned long maxnode = 0;
@@ -519,10 +570,11 @@ ScopedThreadMemPolicy::ScopedThreadMemPolicy(int node_id, NumaPlacement placemen
 
 ScopedThreadMemPolicy::~ScopedThreadMemPolicy() noexcept {
 #if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
-    if (active_) { restore_thread_mempolicy(prev_mode_, prev_mask_); }
+    if (active_ && captured_) { restore_thread_mempolicy(prev_mode_, prev_mask_); }
 #else
     (void)prev_mode_;
     (void)prev_mask_;
+    (void)captured_;
 #endif
 }
 
@@ -531,18 +583,34 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
                               NumaPolicy policy, std::uint64_t page_size) {
     HostNumaPlan plan;
     if (topo.nodes.empty()) { return plan; }
+    std::uint64_t native_page = 4096ULL;
+#ifdef __linux__
+    const long native = sysconf(_SC_PAGESIZE);
+    if (native > 0) { native_page = static_cast<std::uint64_t>(native); }
+#endif
     // A zero page_size means "use the system's native page size" (the default argument).
     if (page_size == 0) {
-        page_size = 4096;
-#ifdef __linux__
-        const long native = sysconf(_SC_PAGESIZE);
-        if (native > 0) { page_size = static_cast<std::uint64_t>(native); }
-#endif
+        page_size = native_page;
+    } else if ((page_size & (page_size - 1ULL)) != 0ULL || page_size < native_page) {
+        throw std::invalid_argument("plan_host_numa: page_size must be a power of two >= native page size");
     }
 
     const NumaNodeInfo* gpu_info = (gpu_node >= 0) ? topo.find(gpu_node) : nullptr;
     if (!gpu_info) { gpu_info = &topo.nodes.front(); }
     plan.primary_node = gpu_info->node_id;
+
+    const auto headroom_for = [](const NumaNodeInfo& n) -> std::uint64_t {
+        return n.total_bytes > 0
+                   ? std::min<std::uint64_t>(2ULL << 30, n.total_bytes / 16ULL)
+                   : 0ULL;
+    };
+    const auto usable_free_for = [&](const NumaNodeInfo& n) -> std::uint64_t {
+        const std::uint64_t h = headroom_for(n);
+        return n.free_bytes > h ? (n.free_bytes - h) : 0ULL;
+    };
+
+    const bool unknown_pinned          = (pinned_bytes == kUnknownPinnedBytes);
+    const std::uint64_t effective_pinned = unknown_pinned ? 0ULL : pinned_bytes;
 
     HostNumaMode mode = HostNumaMode::Isolate;
     if (topo.multi_node()) {
@@ -552,17 +620,17 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
             mode = HostNumaMode::Sharded;
         } else if (policy == NumaPolicy::Mirror) {
             mode = HostNumaMode::Mirror;
+        } else if (unknown_pinned || effective_pinned == 0) {
+            // Disk/unpinned residency relies on OS page cache across nodes; keep workers spanning
+            // all sockets instead of collapsing to the GPU's local socket.
+            mode = HostNumaMode::Sharded;
         } else {
             // Auto: stay isolated to the GPU's local node when its available RAM holds the
             // weights (with OS headroom) and requested CPU threads fit within its physical cores.
-            std::uint64_t headroom =
-                gpu_info->total_bytes > 0
-                    ? std::min<std::uint64_t>(2ULL << 30, gpu_info->total_bytes / 16)
-                    : 0ULL;
-            const bool ram_known = (gpu_info->total_bytes > 0);
+            const std::uint64_t headroom = headroom_for(*gpu_info);
+            const bool ram_known         = (gpu_info->total_bytes > 0);
             const bool ram_fits =
-                !ram_known || (pinned_bytes == 0) ||
-                (gpu_info->free_bytes >= pinned_bytes + headroom);
+                !ram_known || (gpu_info->free_bytes >= effective_pinned + headroom);
             const std::size_t local_phys = gpu_info->physical_cpus.empty()
                                                ? gpu_info->logical_cpus.size()
                                                : gpu_info->physical_cpus.size();
@@ -570,11 +638,11 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
 
             if (ram_fits && threads_fit) {
                 mode = HostNumaMode::Isolate;
-            } else if (pinned_bytes > 0 && ram_fits) {
+            } else if (ram_fits) {
                 std::uint64_t total_free = 0;
                 bool every_node_fits     = true;
                 const std::uint64_t per_node_need =
-                    pinned_bytes + std::min<std::uint64_t>(1ULL << 30, pinned_bytes / 4);
+                    effective_pinned + std::min<std::uint64_t>(1ULL << 30, effective_pinned / 4);
                 for (const auto& n : topo.nodes) {
                     total_free += n.free_bytes;
                     if (n.total_bytes > 0 && n.free_bytes < per_node_need) {
@@ -582,7 +650,7 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
                     }
                 }
                 const auto mirror_threshold =
-                    static_cast<std::uint64_t>(2.2 * static_cast<double>(pinned_bytes));
+                    static_cast<std::uint64_t>(2.2 * static_cast<double>(effective_pinned));
                 mode = (every_node_fits && total_free >= mirror_threshold) ? HostNumaMode::Mirror
                                                                            : HostNumaMode::Sharded;
             } else {
@@ -592,33 +660,30 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
     }
     plan.mode = mode;
 
-    // An explicit --numa-policy is a contract, not a best effort. When the node(s) that must hold
-    // the pinned weights provably cannot, refuse up front with a clear error instead of dying at
-    // the first cudaHostRegister with ENOMEM. Auto keeps its graceful downgrade.
-    if (pinned_bytes > 0 && policy != NumaPolicy::Auto) {
-        const std::uint64_t headroom =
-            gpu_info->total_bytes > 0
-                ? std::min<std::uint64_t>(2ULL << 30, gpu_info->total_bytes / 16)
-                : 0ULL;
+    // Validate headroom-adjusted free RAM before returning a plan that would OOM or degrade.
+    if (effective_pinned > 0) {
         if (mode == HostNumaMode::Sharded) {
-            std::uint64_t total_free = 0;
-            bool all_known          = true;
+            std::uint64_t total_usable = 0;
+            bool all_known             = true;
             for (const auto& n : topo.nodes) {
-                total_free += n.free_bytes;
+                total_usable += usable_free_for(n);
                 if (n.total_bytes == 0) { all_known = false; }
             }
-            if (all_known && total_free + headroom < pinned_bytes) {
-                throw std::runtime_error("NUMA sharded: cannot pin " + std::to_string(pinned_bytes) +
-                                         " B across " + std::to_string(topo.nodes.size()) +
-                                         " node(s) with only " + std::to_string(total_free) +
-                                         " B free");
+            if (all_known && total_usable < effective_pinned) {
+                throw std::runtime_error(
+                    "NUMA sharded: cannot pin " + std::to_string(effective_pinned) +
+                    " B across " + std::to_string(topo.nodes.size()) +
+                    " node(s) with only " + std::to_string(total_usable) + " B usable free");
             }
-        } else if (gpu_info->total_bytes > 0 && gpu_info->free_bytes + headroom < pinned_bytes) {
-            throw std::runtime_error(std::string("NUMA ") +
-                                     (mode == HostNumaMode::Mirror ? "mirror" : "isolate") +
-                                     ": node " + std::to_string(gpu_info->node_id) + " has only " +
-                                     std::to_string(gpu_info->free_bytes) +
-                                     " B free, cannot pin " + std::to_string(pinned_bytes) + " B");
+        } else if (policy != NumaPolicy::Auto) {
+            const std::uint64_t headroom = headroom_for(*gpu_info);
+            if (gpu_info->total_bytes > 0 && gpu_info->free_bytes < effective_pinned + headroom) {
+                throw std::runtime_error(
+                    std::string("NUMA ") + (mode == HostNumaMode::Mirror ? "mirror" : "isolate") +
+                    ": node " + std::to_string(gpu_info->node_id) + " has only " +
+                    std::to_string(gpu_info->free_bytes) + " B free (needs " +
+                    std::to_string(effective_pinned + headroom) + " B including headroom)");
+            }
         }
     }
 
@@ -635,15 +700,21 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         return out;
     };
 
+    constexpr std::uint32_t kMaxSocketAutoWorkers = 16U;
+    constexpr std::uint32_t kMaxTotalAutoWorkers  = 32U;
+
     if (mode == HostNumaMode::Isolate || !topo.multi_node()) {
-        const auto& phys = node_phys(*gpu_info);
-        const auto cpus  = node_ordered_cpus(*gpu_info);
+        const auto& phys      = node_phys(*gpu_info);
+        const auto cpus       = node_ordered_cpus(*gpu_info);
         std::uint32_t workers = 0;
-        if (requested_threads > 0) {
+        if (phys.empty()) {
+            workers = 0;
+        } else if (requested_threads > 0) {
             workers = requested_threads;
         } else {
             const std::uint32_t count = static_cast<std::uint32_t>(phys.size());
-            workers = count > 2 ? (count - 2U) : std::max(1U, count);
+            workers = std::min(kMaxSocketAutoWorkers,
+                               count > 2 ? (count - 2U) : std::max(1U, count));
         }
         HostNumaNodePlan np;
         np.node_id        = gpu_info->node_id;
@@ -651,7 +722,7 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         // On the primary node the service thread itself participates as compute worker 0, so
         // `worker_cpus` holds up to (workers - 1) background pool pins and `service_cpu` gets
         // the remaining distinct CPU.
-        if (!cpus.empty()) {
+        if (!cpus.empty() && workers > 0) {
             const std::uint32_t bg_needed = workers > 1 ? workers - 1U : 0U;
             if (cpus.size() >= workers) {
                 for (std::uint32_t i = 0; i < bg_needed; ++i) { np.worker_cpus.push_back(cpus[i]); }
@@ -665,10 +736,10 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
             }
         }
         plan.node_plans.push_back(std::move(np));
-        if (pinned_bytes > 0) {
+        if (effective_pinned > 0) {
             plan.pinned_shards.push_back(HostNumaShard{
                 .offset    = 0,
-                .bytes     = static_cast<std::size_t>(pinned_bytes),
+                .bytes     = static_cast<std::size_t>(effective_pinned),
                 .numa_node = plan.primary_node,
             });
         }
@@ -683,6 +754,7 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
     }
 
     if (requested_threads == 0) {
+        std::uint32_t remaining_budget = kMaxTotalAutoWorkers;
         for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
             const auto& n            = *ordered[idx];
             const auto& cpus         = node_phys(n);
@@ -690,50 +762,54 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
             std::uint32_t w          = 0;
             HostNumaNodePlan np;
             np.node_id = n.node_id;
-            if (idx == 0) {
-                w                 = phys > 2 ? (phys - 2U) : std::max(1U, phys);
-                np.worker_threads = w;
-                const std::uint32_t bg = w > 1 ? w - 1U : 0U;
-                if (!cpus.empty()) {
+            if (phys > 0 && remaining_budget > 0) {
+                if (idx == 0) {
+                    w = std::min({kMaxSocketAutoWorkers, remaining_budget,
+                                  phys > 2 ? (phys - 2U) : std::max(1U, phys)});
+                    const std::uint32_t bg = w > 1 ? w - 1U : 0U;
                     plan.service_cpu = cpus[std::min<std::size_t>(bg, cpus.size() - 1U)];
                     for (std::uint32_t j = 0; j < bg && j < cpus.size(); ++j) {
                         np.worker_cpus.push_back(cpus[j]);
                     }
-                }
-            } else {
-                w                 = phys > 1 ? (phys - 1U) : std::max(1U, phys);
-                np.worker_threads = w;
-                for (std::uint32_t j = 0; j < w && j < cpus.size(); ++j) {
-                    np.worker_cpus.push_back(cpus[j]);
+                } else {
+                    w = std::min({kMaxSocketAutoWorkers, remaining_budget,
+                                  phys > 1 ? (phys - 1U) : std::max(1U, phys)});
+                    for (std::uint32_t j = 0; j < w && j < cpus.size(); ++j) {
+                        np.worker_cpus.push_back(cpus[j]);
+                    }
                 }
             }
+            np.worker_threads = w;
+            remaining_budget -= w;
             plan.node_plans.push_back(std::move(np));
         }
     } else {
         std::size_t total_phys = 0;
-        for (const auto* n : ordered) { total_phys += std::max<std::size_t>(1, node_phys(*n).size()); }
-        std::uint32_t remaining = requested_threads;
+        for (const auto* n : ordered) { total_phys += node_phys(*n).size(); }
         std::vector<std::uint32_t> counts(ordered.size(), 0);
-        for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
-            const auto w = static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(requested_threads) *
-                 std::max<std::size_t>(1, node_phys(*ordered[idx]).size())) /
-                total_phys);
-            counts[idx] = w;
-            remaining -= w;
+        if (total_phys > 0) {
+            std::uint32_t remaining = requested_threads;
+            for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
+                const std::size_t p = node_phys(*ordered[idx]).size();
+                if (p == 0) { continue; }
+                const auto w = static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(requested_threads) * p) / total_phys);
+                counts[idx] = w;
+                remaining -= w;
+            }
+            for (std::size_t idx = 0; idx < ordered.size() && remaining > 0; ++idx) {
+                if (node_phys(*ordered[idx]).empty()) { continue; }
+                ++counts[idx];
+                --remaining;
+            }
         }
-        for (std::size_t idx = 0; idx < ordered.size() && remaining > 0; ++idx) {
-            ++counts[idx];
-            --remaining;
-        }
         for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
-            if (counts[idx] == 0) { continue; }
             const auto& n    = *ordered[idx];
             const auto cpus  = node_ordered_cpus(n);
             HostNumaNodePlan np;
             np.node_id        = n.node_id;
             np.worker_threads = counts[idx];
-            if (!cpus.empty()) {
+            if (!cpus.empty() && counts[idx] > 0) {
                 if (idx == 0) {
                     const std::uint32_t bg = counts[idx] > 1 ? counts[idx] - 1U : 0U;
                     plan.service_cpu = cpus[std::min<std::size_t>(bg, cpus.size() - 1U)];
@@ -750,44 +826,77 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         }
     }
 
-    if (pinned_bytes > 0) {
+    if (effective_pinned > 0) {
         if (mode == HostNumaMode::Mirror) {
             plan.pinned_shards.push_back(HostNumaShard{
                 .offset    = 0,
-                .bytes     = static_cast<std::size_t>(pinned_bytes),
+                .bytes     = static_cast<std::size_t>(effective_pinned),
                 .numa_node = plan.primary_node,
             });
         } else {
-            const std::uint64_t psize = std::max<std::uint64_t>(page_size, 4096);
+            const std::uint64_t psize = page_size;
             const std::size_t kNodes  = ordered.size();
-            // Free-weighted split when every node's free RAM is known: a node with more free
-            // memory carries more of the pinned range, so the two sockets stop fighting over the
-            // scarcer one. Even split is the fallback when any node's free_bytes is unknown (0).
+            // Weight shards by usable free memory (free - headroom) when node totals are known
+            // so a tight socket never receives more bytes than its free - headroom budget; fall
+            // back to raw free_bytes when totals are omitted, or even split if unknown.
             std::vector<std::uint64_t> weights(kNodes, 0);
-            std::uint64_t weight_sum             = 0;
-            bool all_known                       = true;
-            for (std::size_t idx = 0; idx < kNodes; ++idx) {
-                const std::uint64_t w = ordered[idx]->free_bytes;
-                if (w == 0) { all_known = false; break; }
-                weights[idx] = w;
-                weight_sum  += w;
+            std::uint64_t weight_sum = 0;
+            bool all_totals          = true;
+            bool all_free            = true;
+            for (const auto* n : ordered) {
+                if (n->total_bytes == 0) { all_totals = false; }
+                if (n->free_bytes == 0) { all_free = false; }
             }
-            if (all_known && weight_sum == 0) { all_known = false; }
-            std::uint64_t prev = 0;
+            bool weighted = false;
+            if (all_totals) {
+                for (std::size_t idx = 0; idx < kNodes; ++idx) {
+                    weights[idx] = usable_free_for(*ordered[idx]);
+                    weight_sum  += weights[idx];
+                }
+                weighted = (weight_sum > 0);
+            } else if (all_free) {
+                for (std::size_t idx = 0; idx < kNodes; ++idx) {
+                    weights[idx] = ordered[idx]->free_bytes;
+                    weight_sum  += weights[idx];
+                }
+                weighted = (weight_sum > 0);
+            }
+            if (!weighted) {
+                weights.assign(kNodes, 1ULL);
+                weight_sum = kNodes;
+            }
+            std::size_t last_active = 0;
+            for (std::size_t idx = 0; idx < kNodes; ++idx) {
+                if (weights[idx] > 0) { last_active = idx; }
+            }
+
+            std::uint64_t prev       = 0;
             std::uint64_t cumulative = 0;
             for (std::size_t idx = 0; idx < kNodes; ++idx) {
+                if (weights[idx] == 0) { continue; }
                 std::uint64_t next;
-                if (idx + 1 == kNodes) {
-                    next = pinned_bytes;
-                } else if (all_known) {
-                    cumulative += weights[idx];
-                    // uint128 intermediate: pinned_bytes * cumulative overflows uint64 at GiB scale.
-                    next = static_cast<std::uint64_t>(
-                        (static_cast<__uint128_t>(pinned_bytes) * cumulative) / weight_sum);
+                if (idx == last_active) {
+                    // Last active shard keeps the exact unaligned tail so sum(bytes) == pinned_bytes
+                    // while its starting offset remains page-aligned.
+                    next = effective_pinned;
                 } else {
-                    next = (pinned_bytes * (idx + 1)) / kNodes;
+                    cumulative += weights[idx];
+                    // Portable 128-bit product/divide: pinned_bytes * cumulative overflows uint64
+                    // at GiB scale, and __uint128_t is unavailable on MSVC.
+                    const core::Uint128 prod = core::wide_multiply(effective_pinned, cumulative);
+                    std::uint64_t rem        = prod.high % weight_sum;
+                    std::uint64_t q          = 0;
+                    for (int bit = 63; bit >= 0; --bit) {
+                        const std::uint64_t bbit = (prod.low >> bit) & 1ULL;
+                        const bool carry         = (rem >> 63) != 0ULL;
+                        rem                      = (rem << 1) | bbit;
+                        if (carry || rem >= weight_sum) {
+                            rem -= weight_sum;
+                            q |= (1ULL << bit);
+                        }
+                    }
+                    next = (q / psize) * psize;
                 }
-                next = next / psize * psize;
                 if (next < prev) { next = prev; }
                 if (next > prev) {
                     plan.pinned_shards.push_back(HostNumaShard{

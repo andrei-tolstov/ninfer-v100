@@ -501,6 +501,7 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
+// NInfer: BF16 activation quantizers matching quantize_row_q8_0_ref / quantize_row_q8_K_ref.
 #if defined(__AVX2__) || defined(__AVX__)
 static inline __m256 ggml_bf16x8_to_fp32_avx(const uint16_t * p) {
     const __m128i v = _mm_loadu_si128((const __m128i *)p);
@@ -511,10 +512,23 @@ static inline __m256 ggml_bf16x8_to_fp32_avx(const uint16_t * p) {
                                 _mm_castsi128_ps(hi), 1);
 }
 
+static inline __m256i ggml_round_away_zero_epi32_avx(const __m256 q, const __m256 signBit,
+                                                     const __m256 half, const __m256 one) {
+    // roundf() semantics (ties away from zero), matching quantize_row_q8_0_ref.
+    const __m256 abs_q = _mm256_andnot_ps(signBit, q);
+    const __m256 abs_t = _mm256_round_ps(abs_q, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+    const __m256 ge    = _mm256_cmp_ps(_mm256_sub_ps(abs_q, abs_t), half, _CMP_GE_OQ);
+    const __m256 rounded = _mm256_or_ps(_mm256_add_ps(abs_t, _mm256_and_ps(ge, one)),
+                                        _mm256_and_ps(q, signBit));
+    return _mm256_cvttps_epi32(rounded);
+}
+
 static inline void ggml_quantize_block_q8_0_avx(const __m256 v0, const __m256 v1,
                                                 const __m256 v2, const __m256 v3,
                                                 block_q8_0 * GGML_RESTRICT out) {
     const __m256 signBit = _mm256_set1_ps(-0.0f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one  = _mm256_set1_ps(1.0f);
     __m256 maxAbs = _mm256_andnot_ps(signBit, v0);
     maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, v1));
     maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, v2));
@@ -527,13 +541,13 @@ static inline void ggml_quantize_block_q8_0_avx(const __m256 v0, const __m256 v1
 
     const float d = maxScalar / 127.f;
     out->d = GGML_CPU_FP32_TO_FP16(d);
-    const float id = (maxScalar != 0.0f) ? 127.f / maxScalar : 0.0f;
+    const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
     const __m256 mul = _mm256_set1_ps(id);
 
-    const __m256i i0 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v0, mul), _MM_ROUND_NEAREST));
-    const __m256i i1 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v1, mul), _MM_ROUND_NEAREST));
-    const __m256i i2 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v2, mul), _MM_ROUND_NEAREST));
-    const __m256i i3 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v3, mul), _MM_ROUND_NEAREST));
+    const __m256i i0 = ggml_round_away_zero_epi32_avx(_mm256_mul_ps(v0, mul), signBit, half, one);
+    const __m256i i1 = ggml_round_away_zero_epi32_avx(_mm256_mul_ps(v1, mul), signBit, half, one);
+    const __m256i i2 = ggml_round_away_zero_epi32_avx(_mm256_mul_ps(v2, mul), signBit, half, one);
+    const __m256i i3 = ggml_round_away_zero_epi32_avx(_mm256_mul_ps(v3, mul), signBit, half, one);
 
 #if defined(__AVX2__)
     const __m256i p0 = _mm256_packs_epi32(i0, i1);
@@ -570,67 +584,14 @@ static inline void ggml_store_q8k_16_avx(const __m256 v0, const __m256 v1,
 #endif
 
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
-#if defined(__AVX2__) || defined(__AVX__)
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    block_q8_K * GGML_RESTRICT y = vy;
-    const __m256 signBit = _mm256_set1_ps(-0.0f);
-    const __m128i ones_u8 = _mm_set1_epi8(1);
-    const __m128i ones_i16 = _mm_set1_epi16(1);
-
-    for (int64_t i = 0; i < nb; ++i) {
-        const float * xb = x + i * QK_K;
-        __m256 m0 = _mm256_setzero_ps();
-        __m256 m1 = _mm256_setzero_ps();
-        __m256 m2 = _mm256_setzero_ps();
-        __m256 m3 = _mm256_setzero_ps();
-        for (int j = 0; j < QK_K; j += 32) {
-            m0 = _mm256_max_ps(m0, _mm256_andnot_ps(signBit, _mm256_loadu_ps(xb + j +  0)));
-            m1 = _mm256_max_ps(m1, _mm256_andnot_ps(signBit, _mm256_loadu_ps(xb + j +  8)));
-            m2 = _mm256_max_ps(m2, _mm256_andnot_ps(signBit, _mm256_loadu_ps(xb + j + 16)));
-            m3 = _mm256_max_ps(m3, _mm256_andnot_ps(signBit, _mm256_loadu_ps(xb + j + 24)));
-        }
-        const __m256 ma = _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3));
-        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(ma, 1), _mm256_castps256_ps128(ma));
-        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
-        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
-        const float amax = _mm_cvtss_f32(max4);
-        if (amax == 0.0f) {
-            y[i].d = 0.0f;
-            memset(y[i].qs, 0, QK_K);
-            memset(y[i].bsums, 0, sizeof(y[i].bsums));
-            continue;
-        }
-        const __m256 amax_v = _mm256_set1_ps(amax);
-        float max = amax;
-        for (int j = 0; j < QK_K; j += 8) {
-            const __m256 v = _mm256_loadu_ps(xb + j);
-            const int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(signBit, v), amax_v, _CMP_EQ_OQ));
-            if (mask) {
-                for (int b = 0; b < 8; ++b) {
-                    if (mask & (1 << b)) { max = xb[j + b]; break; }
-                }
-                break;
-            }
-        }
-        const float iscale = -127.0f / max;
-        const __m256 v_iscale = _mm256_set1_ps(iscale);
-        y[i].d = 1.0f / iscale;
-        for (int j = 0; j < QK_K / 16; ++j) {
-            const __m256 v0 = _mm256_loadu_ps(xb + j * 16 + 0);
-            const __m256 v1 = _mm256_loadu_ps(xb + j * 16 + 8);
-            ggml_store_q8k_16_avx(v0, v1, v_iscale, ones_u8, ones_i16, y[i].qs + j * 16, &y[i].bsums[j]);
-        }
-    }
-#else
     quantize_row_q8_K_ref(x, vy, k);
-#endif
 }
 
+// NInfer: direct BF16 -> Q8_0 / Q8_K quantizers for host-expert activations.
 void ggml_quantize_bf16_q8_0(const uint16_t * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
 #if defined(__AVX2__) || defined(__AVX__)
-    assert(QK8_0 == 32);
-    assert(k % QK8_0 == 0);
+    GGML_ASSERT(QK8_0 == 32);
+    GGML_ASSERT(k > 0 && k % QK8_0 == 0);
     const int64_t nb = k / QK8_0;
     block_q8_0 * GGML_RESTRICT y = vy;
     for (int64_t i = 0; i < nb; ++i) {
@@ -642,13 +603,13 @@ void ggml_quantize_bf16_q8_0(const uint16_t * GGML_RESTRICT x, void * GGML_RESTR
     }
 #else
     UNUSED(x); UNUSED(vy); UNUSED(k);
-    assert(false && "ggml_quantize_bf16_q8_0 requires AVX");
+    GGML_ASSERT(false && "ggml_quantize_bf16_q8_0 requires AVX");
 #endif
 }
 
 void ggml_quantize_bf16_q8_K(const uint16_t * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
 #if defined(__AVX2__) || defined(__AVX__)
-    assert(k % QK_K == 0);
+    GGML_ASSERT(k > 0 && k % QK_K == 0);
     const int64_t nb = k / QK_K;
     block_q8_K * GGML_RESTRICT y = vy;
     const __m256 signBit = _mm256_set1_ps(-0.0f);
@@ -675,6 +636,8 @@ void ggml_quantize_bf16_q8_K(const uint16_t * GGML_RESTRICT x, void * GGML_RESTR
         if (amax == 0.0f) {
             y[i].d = 0.0f;
             memset(y[i].qs, 0, QK_K);
+            // Unlike quantize_row_q8_K_ref (which leaves bsums untouched), zero bsums for
+            // deterministic output across uninitialized caller buffers.
             memset(y[i].bsums, 0, sizeof(y[i].bsums));
             continue;
         }
@@ -703,7 +666,7 @@ void ggml_quantize_bf16_q8_K(const uint16_t * GGML_RESTRICT x, void * GGML_RESTR
     }
 #else
     UNUSED(x); UNUSED(vy); UNUSED(k);
-    assert(false && "ggml_quantize_bf16_q8_K requires AVX");
+    GGML_ASSERT(false && "ggml_quantize_bf16_q8_K requires AVX");
 #endif
 }
 
@@ -4308,7 +4271,7 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
-//===================================== Batched Multi-Token Row Kernels =====================================
+// NInfer: ========================= Batched Multi-Token Row Kernels =====================================
 
 #ifdef _MSC_VER
 #define GGML_ALWAYS_INLINE __forceinline
@@ -4359,7 +4322,7 @@ static GGML_ALWAYS_INLINE void ggml_iq3_s_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK_K == 0);
+    GGML_ASSERT(n > 0 && n % QK_K == 0);
     const int nb = n / QK_K;
     static const uint8_t k_mask1[32] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
@@ -4449,7 +4412,7 @@ static GGML_ALWAYS_INLINE void ggml_iq2_s_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK_K == 0);
+    GGML_ASSERT(n > 0 && n % QK_K == 0);
     const int nb = n / QK_K;
     static const uint8_t k_mask1[32] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
@@ -4518,7 +4481,7 @@ static GGML_ALWAYS_INLINE void ggml_iq2_xxs_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK_K == 0);
+    GGML_ASSERT(n > 0 && n % QK_K == 0);
     const int nb = n / QK_K;
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
     const block_q8_K * ys[8];
@@ -4561,7 +4524,7 @@ static GGML_ALWAYS_INLINE void ggml_iq2_xs_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK_K == 0);
+    GGML_ASSERT(n > 0 && n % QK_K == 0);
     const int nb = n / QK_K;
     const __m128i mone = _mm_set1_epi8(1);
     static const char block_sign_shuffle_mask_1[32] = {
@@ -4653,7 +4616,7 @@ static GGML_ALWAYS_INLINE void ggml_iq3_xxs_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK_K == 0);
+    GGML_ASSERT(n > 0 && n % QK_K == 0);
     const int nb = n / QK_K;
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
     const block_q8_K * ys[8];
@@ -4697,7 +4660,7 @@ static GGML_ALWAYS_INLINE void ggml_iq4_xs_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK_K == 0);
+    GGML_ASSERT(n > 0 && n % QK_K == 0);
     const int nb = n / QK_K;
     const __m128i values128 = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
     const __m128i values_abs = _mm_abs_epi8(values128);
@@ -4746,7 +4709,7 @@ static GGML_ALWAYS_INLINE void ggml_iq4_nl_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK4_NL == 0);
+    GGML_ASSERT(n > 0 && n % QK4_NL == 0);
     const int nb = n / QK4_NL;
     const __m128i values128 = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
     const __m128i values_abs = _mm_abs_epi8(values128);
@@ -4833,7 +4796,7 @@ static GGML_ALWAYS_INLINE void ggml_q8_0_rows_k(
     int n, int rows, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by, const int tc) {
-    assert(n % QK8_0 == 0);
+    GGML_ASSERT(n > 0 && n % QK8_0 == 0);
     const int nb = n / QK8_0;
     const __m128i mone16 = _mm_set1_epi16(1);
     const block_q8_0 * ys[4];

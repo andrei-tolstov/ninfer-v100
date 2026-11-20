@@ -10,6 +10,7 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 #include "ggml-quants.h"
+#include "quants.h"
 
 #include <algorithm>
 #include <bit>
@@ -288,15 +289,128 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
     require(vs_exact < 0.05, "the fast path strays from the exact path");
 }
 
+void check_bf16_quantizers_bit_exact_vs_ref(std::mt19937& rng) {
+    auto verify_q8_0 = [](const std::vector<std::uint16_t>& bf, const char* label) {
+        const int k = static_cast<int>(bf.size());
+        const int nb = k / QK8_0;
+        std::vector<float> fp32(k);
+        for (int i = 0; i < k; ++i) {
+            fp32[i] = std::bit_cast<float>(std::uint32_t(bf[i]) << 16);
+        }
+        std::vector<block_q8_0> ref(nb), got(nb);
+        std::memset(ref.data(), 0xA5, ref.size() * sizeof(block_q8_0));
+        std::memset(got.data(), 0x5A, got.size() * sizeof(block_q8_0));
+        quantize_row_q8_0_ref(fp32.data(), ref.data(), k);
+        ggml_quantize_bf16_q8_0(bf.data(), got.data(), k);
+        for (int b = 0; b < nb; ++b) {
+            require(std::memcmp(&ref[b], &got[b], sizeof(block_q8_0)) == 0,
+                    std::string("q8_0 byte mismatch vs ref: ") + label);
+        }
+    };
+    auto verify_q8_K = [](const std::vector<std::uint16_t>& bf, const char* label,
+                          bool expect_zero_bsums) {
+        const int k = static_cast<int>(bf.size());
+        const int nb = k / QK_K;
+        std::vector<float> fp32(k);
+        for (int i = 0; i < k; ++i) {
+            fp32[i] = std::bit_cast<float>(std::uint32_t(bf[i]) << 16);
+        }
+        std::vector<block_q8_K> ref(nb), got(nb);
+        // Pre-fill with 0xA5 so we observe that all-zero blocks zero bsums in AVX while _ref
+        // intentionally leaves bsums untouched.
+        std::memset(ref.data(), expect_zero_bsums ? 0xA5 : 0x00, ref.size() * sizeof(block_q8_K));
+        std::memset(got.data(), 0x5A, got.size() * sizeof(block_q8_K));
+        quantize_row_q8_K_ref(fp32.data(), ref.data(), k);
+        ggml_quantize_bf16_q8_K(bf.data(), got.data(), k);
+        for (int b = 0; b < nb; ++b) {
+            if (expect_zero_bsums) {
+                require(got[b].d == 0.0F, "all-zero q8_K d not zero");
+                for (int j = 0; j < QK_K; ++j) { require(got[b].qs[j] == 0, "all-zero q8_K qs"); }
+                for (int j = 0; j < QK_K / 16; ++j) {
+                    require(got[b].bsums[j] == 0, "all-zero q8_K bsums not zeroed by AVX");
+                }
+            } else {
+                require(std::memcmp(&ref[b], &got[b], sizeof(block_q8_K)) == 0,
+                        std::string("q8_K byte mismatch vs ref: ") + label);
+            }
+        }
+    };
+
+    // 1. All-zero blocks.
+    verify_q8_0(std::vector<std::uint16_t>(32, 0), "all-zero");
+    verify_q8_K(std::vector<std::uint16_t>(256, 0), "all-zero", /*expect_zero_bsums=*/true);
+
+    // 2. Two equal magnitudes with opposite signs (rule of the first maximum).
+    {
+        std::vector<std::uint16_t> ties(256, bf16(1.0F));
+        ties[0] = bf16(5.0F);
+        ties[5] = bf16(-5.0F);
+        verify_q8_0(ties, "equal-abs-opp-sign");
+        verify_q8_K(ties, "equal-abs-opp-sign", false);
+        ties[0] = bf16(-5.0F);
+        ties[5] = bf16(5.0F);
+        verify_q8_K(ties, "equal-abs-opp-sign-neg-first", false);
+    }
+
+    // 3. Exact .5 ties in v/d (q8_0: roundf ties-away) and iscale*x (q8_K: nearest_int ties-even).
+    {
+        std::vector<std::uint16_t> ties(256, 0);
+        ties[0]  = bf16(127.0F);
+        ties[1]  = bf16(0.5F);
+        ties[2]  = bf16(-0.5F);
+        ties[3]  = bf16(1.5F);
+        ties[4]  = bf16(-1.5F);
+        ties[5]  = bf16(2.5F);
+        ties[6]  = bf16(-2.5F);
+        ties[7]  = bf16(63.5F);
+        ties[8]  = bf16(-63.5F);
+        ties[9]  = 0x8000U; // -0.0
+        verify_q8_0(ties, "exact-halves");
+        verify_q8_K(ties, "exact-halves", false);
+    }
+
+    // 4. BF16 subnormal (1e-40 -> 0x0001) alongside 1.0, and 1e30.
+    {
+        std::vector<std::uint16_t> sub(256, bf16(1.0F));
+        sub[3] = 0x0001U;
+        sub[4] = 0x8001U;
+        verify_q8_0(sub, "subnormal-mixed");
+        verify_q8_K(sub, "subnormal-mixed", false);
+        std::vector<std::uint16_t> big(256, bf16(1e30F));
+        big[1] = bf16(-1e30F);
+        verify_q8_0(big, "1e30");
+        verify_q8_K(big, "1e30", false);
+    }
+
+    // 5. Random sweep across k=32/256/640/2560.
+    std::normal_distribution<float> normal(0.0F, 3.0F);
+    for (const int k : {32, 256, 640, 2560}) {
+        std::vector<std::uint16_t> x(k);
+        for (auto& v : x) { v = bf16(normal(rng)); }
+        verify_q8_0(x, "random-q8_0");
+        if (k % 256 == 0) { verify_q8_K(x, "random-q8_K", false); }
+    }
+}
+
 } // namespace
 
 int main() {
+    // T-03: on x86_64 builds with matching ISA (AVX+F16C when AVX2=OFF, AVX2+FMA when AVX2=ON),
+    // gguf_ggml_cpu_available() must report true so the test never silently skips.
+#if defined(__x86_64__) || defined(_M_X64)
+    const bool isa_ok = NINFER_GGML_CPU_REQUIRES_AVX2
+                            ? gguf_cpu_backend_available(GgufCpuBackend::Avx2)
+                            : gguf_cpu_backend_available(GgufCpuBackend::Avx);
+    require(gguf_ggml_cpu_available() == isa_ok,
+            "gguf_ggml_cpu_available() disagreed with host ISA and NINFER_GGML_CPU_AVX2");
+#endif
     if (!gguf_ggml_cpu_available()) {
         std::cout << "gguf_expert_cpu_ggml: skipped (CPU lacks required instruction set)\n";
         return 77;
     }
     try {
         std::mt19937 rng(20261030);
+        check_bf16_quantizers_bit_exact_vs_ref(rng);
         // The gate and up projections: k = 2560 (ten 256-value blocks).
         for (const QType format : {QType::GGUF_IQ2_XXS, QType::GGUF_IQ2_XS, QType::GGUF_IQ2_S,
                                    QType::GGUF_IQ3_XXS, QType::GGUF_IQ3_S, QType::GGUF_IQ4_XS,
@@ -354,8 +468,37 @@ int main() {
         }
         {
             auto row = finite_row();
+            row[2559] = 0x7F81;  // NaN at k-1
+            expect_nonfinite("a tail NaN", [&] { single.prepare_bf16_token(0, row.data()); });
+        }
+        {
+            auto row = finite_row();
+            row[2552] = 0xFF80;  // -Inf in the last 8-element vector
+            expect_nonfinite("a last-vec8 Inf", [&] { single.prepare_bf16_token(0, row.data()); });
+        }
+        {
+            auto row = finite_row();
             row[0] = 0x7F80;  // +Inf
             expect_nonfinite("an Inf", [&] { single.prepare_bf16_token(0, row.data()); });
+        }
+        {
+            // Finite extremes: 1e-40 makes 127/amax overflow to Inf in both Q8_K and Q8_0;
+            // +/-1e30 overflows Q8_0's FP16 block scale to Inf.
+            std::vector<std::uint16_t> tiny_row(2560, 0);
+            tiny_row[2559] = 0x0001; // ~9.18e-41 (< 1e-40)
+            expect_nonfinite("a tiny Q8_K block", [&] { single.prepare_bf16_token(0, tiny_row.data()); });
+
+            GgmlCpuActivation single_q80(1, 640);
+            single_q80.prepare_bf16_start(GgmlActLayout::Q8_0, 1);
+            std::vector<std::uint16_t> tiny_q80(640, 0);
+            tiny_q80[639] = 0x0001;
+            expect_nonfinite("a tiny Q8_0 block", [&] { single_q80.prepare_bf16_token(0, tiny_q80.data()); });
+
+            std::vector<std::uint16_t> huge_q80(640, bf16(1.0F));
+            huge_q80[639] = bf16(1e30F);
+            expect_nonfinite("a +1e30 Q8_0 block", [&] { single_q80.prepare_bf16_token(0, huge_q80.data()); });
+            huge_q80[639] = bf16(-1e30F);
+            expect_nonfinite("a -1e30 Q8_0 block", [&] { single_q80.prepare_bf16_token(0, huge_q80.data()); });
         }
         {
             std::vector<std::uint16_t> both(2 * 2560, 0x3F00);

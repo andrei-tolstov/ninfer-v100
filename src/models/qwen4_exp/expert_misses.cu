@@ -2,6 +2,7 @@
 
 #include "core/file_read_error.h"
 #include "core/numa.h"
+#include "models/qwen4_exp/cpu_node_coordinator.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 #include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 
@@ -111,23 +112,11 @@ private:
     bool mmap_backed_  = false;
 };
 
-// One turn of a spin wait: the processor's pause hint where it has one, a yield elsewhere.
-// YieldProcessor() is the Windows SDK's portable spelling; the GCC/Clang builtin is not known to
-// nvcc's front end in MSVC mode.
-inline void spin_hint() {
-#if defined(_WIN32)
-    YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#else
-    std::this_thread::yield();
-#endif
-}
-
 constexpr int kTop            = 10;
 constexpr int kHidden         = 2560;
 constexpr int kWidth          = 640;
 constexpr int kMaxExperts     = 512;
+constexpr int kMaxCallTokens  = 64;
 constexpr int kSplitThreads   = kMaxExperts / 2; // two expert flags a thread
 constexpr std::size_t kBehindLists = 16; // patch lists of admissions behind calls, reused in turn
 constexpr std::uint64_t kTail = 256;
@@ -403,115 +392,6 @@ private:
 #endif
 };
 
-// Workers that spin while a batch is likely (between spin(true) and spin(false)) and sleep
-// otherwise. run() executes job(i) for every i < count on the workers and the calling thread and
-// returns when all are done, rethrowing the first failure. A claim is one CAS on a ticket holding
-// the run's generation and next index, so a worker still leaving an earlier run can never claim an
-// index of a later one.
-class SpinPool {
-public:
-    explicit SpinPool(std::size_t threads, std::vector<int> pins = {}) {
-        for (std::size_t i = 0; i < threads; ++i) {
-            const int pin = i < pins.size() ? pins[i] : -1;
-            workers_.emplace_back([this, pin] { work(pin); });
-        }
-    }
-    ~SpinPool() {
-        {
-            std::lock_guard lock(mutex_);
-            stop_.store(true);
-        }
-        wake_.notify_all();
-        for (auto& worker : workers_) { worker.join(); }
-    }
-    SpinPool(const SpinPool&)            = delete;
-    SpinPool& operator=(const SpinPool&) = delete;
-
-    void spin(bool on) {
-        {
-            std::lock_guard lock(mutex_);
-            spinning_.store(on);
-        }
-        wake_.notify_all();
-    }
-
-    template <class Job>
-    void run(std::size_t count, Job&& job) {
-        if (count == 0) { return; }
-        context_ = &job;
-        call_    = [](void* context, std::size_t i) { (*static_cast<std::remove_reference_t<Job>*>(context))(i); };
-        const std::uint64_t generation = (ticket_.load(std::memory_order_relaxed) >> 32) + 1;
-        done_.store(0, std::memory_order_relaxed);
-        // A worker claims only when the ticket's generation matches this one.
-        size_.store(generation << 32 | count, std::memory_order_release);
-        {
-            std::lock_guard lock(mutex_);
-            ticket_.store(generation << 32, std::memory_order_release);
-        }
-        wake_.notify_all();
-        drain();
-        while (done_.load(std::memory_order_acquire) != count) { spin_hint(); }
-        if (failure_) {
-            auto failure = std::exchange(failure_, nullptr);
-            std::rethrow_exception(failure);
-        }
-    }
-
-private:
-    void drain() {
-        std::uint64_t ticket = ticket_.load(std::memory_order_acquire);
-        for (;;) {
-            const std::uint64_t size = size_.load(std::memory_order_acquire);
-            const std::size_t i      = std::size_t(ticket & 0xffffffffULL);
-            if ((size >> 32) != (ticket >> 32) || i >= (size & 0xffffffffULL)) { return; }
-            if (!ticket_.compare_exchange_weak(ticket, ticket + 1, std::memory_order_acq_rel,
-                                               std::memory_order_acquire)) {
-                continue;
-            }
-            try {
-                call_(context_, i);
-            } catch (...) {
-                std::lock_guard lock(failure_mutex_);
-                if (!failure_) { failure_ = std::current_exception(); }
-            }
-            done_.fetch_add(1, std::memory_order_release);
-            ticket = ticket_.load(std::memory_order_acquire);
-        }
-    }
-    void work(int pin_cpu) {
-        if (pin_cpu >= 0) { (void)bind_thread_to_cpu(pin_cpu); }
-        std::uint64_t seen = 0;
-        for (;;) {
-            if (stop_.load()) { return; }
-            const std::uint64_t generation = ticket_.load(std::memory_order_acquire) >> 32;
-            if (generation != seen) {
-                seen = generation;
-                drain();
-                continue;
-            }
-            if (spinning_.load(std::memory_order_relaxed)) {
-                spin_hint();
-                continue;
-            }
-            std::unique_lock lock(mutex_);
-            wake_.wait(lock, [&] {
-                return stop_.load() || spinning_.load() || (ticket_.load() >> 32) != seen;
-            });
-        }
-    }
-
-    std::vector<std::thread> workers_;
-    void (*call_)(void*, std::size_t) = nullptr;
-    void* context_                    = nullptr;
-    std::atomic<std::uint64_t> ticket_{0}; // generation << 32 | next index
-    std::atomic<std::uint64_t> size_{0};   // generation << 32 | count
-    std::atomic<std::size_t> done_{0};
-    std::atomic<bool> spinning_{false}, stop_{false};
-    std::mutex mutex_, failure_mutex_;
-    std::condition_variable wake_;
-    std::exception_ptr failure_;
-};
-
 } // namespace
 
 struct ExpertMisses::Impl {
@@ -619,21 +499,7 @@ struct ExpertMisses::Impl {
         MirrorBuffer mirror_buffer;
         std::vector<std::array<std::vector<const void*>, 3>> mirror_ptrs;
 
-        struct RemoteRunner {
-            std::thread thread;
-            std::mutex mutex;
-            std::condition_variable cv;
-            std::atomic<bool> spinning{false};
-            std::atomic<bool> stop{false};
-            std::atomic<std::uint64_t> pending_seq{0};
-            std::atomic<std::uint64_t> done_seq{0};
-            std::uint64_t expected_seq  = 0;
-            const MissLayer* layer      = nullptr;
-            bool cpu_ggml               = false;
-            ops::GgufCpuBackend backend = ops::GgufCpuBackend::Automatic;
-            std::exception_ptr failure;
-        };
-        std::unique_ptr<RemoteRunner> remote;
+        std::unique_ptr<RemoteNodeRunner> remote;
     };
     std::vector<std::unique_ptr<NodeContext>> nodes;
     std::vector<std::vector<std::uint16_t>> expert_home_node;
@@ -645,18 +511,25 @@ struct ExpertMisses::Impl {
     MissStats counters;
     std::atomic<std::int64_t> deadline{0};
     std::atomic<bool> sleeping{false}, stopping{false};
+    std::atomic<const std::atomic<bool>*> cancellation{nullptr};
     std::mutex wake_mutex;
     std::condition_variable wake;
     std::mutex failure_mutex;
     std::exception_ptr failure;
     std::thread service;
 
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        const auto* c = cancellation.load(std::memory_order_acquire);
+        return stopping.load(std::memory_order_acquire) ||
+               (c && c->load(std::memory_order_acquire));
+    }
+
     Impl(DeviceContext& d, std::vector<MissLayer> l, std::vector<std::filesystem::path> paths,
          MissOptions o, ExpertCache* c)
         : device(d), layers(std::move(l)), cache(c), options(o), ranks(d.size()) {
-        if (options.token_capacity == 0 || options.token_capacity > 64 || layers.empty() ||
-            !std::isfinite(options.cpu_share) || options.cpu_share < 0 || options.cpu_share > 1 ||
-            (options.cpu_balance && options.cpu_share != 0) ||
+        if (options.token_capacity == 0 || options.token_capacity > kMaxCallTokens ||
+            layers.empty() || !std::isfinite(options.cpu_share) || options.cpu_share < 0 ||
+            options.cpu_share > 1 || (options.cpu_balance && options.cpu_share != 0) ||
             options.tail_skip_rank >= std::uint32_t(kTop)) {
             throw std::invalid_argument("expert misses: invalid capacity, CPU share or tail skip");
         }
@@ -675,6 +548,9 @@ struct ExpertMisses::Impl {
             if (layer.admit && (cache == nullptr || !layer.projections[0].located.empty())) {
                 throw std::invalid_argument("expert misses: admission needs a cache of host experts");
             }
+        }
+        if (disk && options.numa_policy == NumaPolicy::Mirror) {
+            throw std::invalid_argument("--numa-policy mirror is incompatible with --expert-residency disk");
         }
         for (const auto& layer : layers) {
             RankBinding bind(device, layer.rank);
@@ -769,7 +645,7 @@ struct ExpertMisses::Impl {
         const std::size_t primary_rank_idx = !layers.empty() ? layers.front().rank : 0;
         primary_gpu_node = device_numa_node(device.rank(primary_rank_idx).device);
         if (cpu) {
-            std::uint64_t total_host_bytes = 0;
+            std::uint64_t total_host_bytes = disk ? kUnknownPinnedBytes : 0;
             if (!disk) {
                 for (const auto& layer : layers) {
                     std::uint64_t lb = 0;
@@ -813,9 +689,14 @@ struct ExpertMisses::Impl {
                     }
                     ctx->pool = std::make_unique<SpinPool>(
                         np.worker_threads > 1 ? np.worker_threads - 1 : 0, std::move(bg_pins));
-                    ctx->remote = std::make_unique<NodeContext::RemoteRunner>();
+                    ctx->remote          = std::make_unique<RemoteNodeRunner>();
                     NodeContext* raw_ctx = ctx.get();
-                    ctx->remote->thread  = std::thread([this, raw_ctx] { run_remote_node(*raw_ctx); });
+                    ctx->remote->thread  = std::thread([this, raw_ctx] {
+                        raw_ctx->remote->loop(
+                            raw_ctx->lead_cpu, raw_ctx->node_id, [this, raw_ctx](const void* p) {
+                                execute_node_experts(*raw_ctx, *static_cast<const MissLayer*>(p));
+                            });
+                    });
                 }
                 cpu_threads += ctx->worker_threads;
                 nodes.push_back(std::move(ctx));
@@ -1072,8 +953,9 @@ struct ExpertMisses::Impl {
             (gate_ggml ? ggml_layout(gate_p.format) == ggml_layout(up_p.format)
                        : up_p.format == gate_p.format);
 
-        constexpr int kRowsPerTask = 64;
-        const int gate_tasks = (kWidth + kRowsPerTask - 1) / kRowsPerTask;
+        const auto* cancel_ptr        = cancellation.load(std::memory_order_acquire);
+        constexpr int kRowsPerTask    = 64;
+        const int gate_tasks          = (kWidth + kRowsPerTask - 1) / kRowsPerTask;
         const std::size_t first_count = n_experts * std::size_t(2 * gate_tasks);
         ctx.pool->run(first_count, [&](std::size_t i) {
             auto& job        = ctx.cpu_experts[i / (2 * gate_tasks)];
@@ -1095,7 +977,7 @@ struct ExpertMisses::Impl {
                 ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth,
                                   backend);
             }
-        });
+        }, cancel_ptr, &stopping);
         // Parallel SwiGLU + middle activation preparation across every (expert, token) column.
         ctx.pool->run(ctx.mid_tasks.size(), [&](std::size_t i) {
             const MidTask task    = ctx.mid_tasks[i];
@@ -1113,7 +995,7 @@ struct ExpertMisses::Impl {
             } else {
                 job.middle.prepare_bf16_token(task.token, job.middle_bf16.data() + off);
             }
-        });
+        }, cancel_ptr, &stopping);
         const int down_tasks = kHidden / 128;
         ctx.pool->run(n_experts * std::size_t(down_tasks), [&](std::size_t i) {
             auto& job       = ctx.cpu_experts[i / down_tasks];
@@ -1127,40 +1009,7 @@ struct ExpertMisses::Impl {
                 ops::gguf_cpu_rows(w, job.middle, begin, begin + 128, job.down.data(), kHidden,
                                   backend);
             }
-        });
-    }
-
-    void run_remote_node(NodeContext& ctx) {
-        if (ctx.lead_cpu >= 0) {
-            (void)bind_thread_to_cpu(ctx.lead_cpu);
-        } else if (ctx.node_id >= 0) {
-            (void)bind_thread_to_node(ctx.node_id);
-        }
-        auto& r            = *ctx.remote;
-        std::uint64_t seen = 0;
-        for (;;) {
-            if (r.stop.load(std::memory_order_acquire)) { return; }
-            const std::uint64_t seq = r.pending_seq.load(std::memory_order_acquire);
-            if (seq != seen) {
-                seen = seq;
-                try {
-                    r.failure = nullptr;
-                    execute_node_experts(ctx, *r.layer);
-                } catch (...) { r.failure = std::current_exception(); }
-                r.done_seq.store(seq, std::memory_order_release);
-                continue;
-            }
-            if (r.spinning.load(std::memory_order_relaxed)) {
-                spin_hint();
-                continue;
-            }
-            std::unique_lock lock(r.mutex);
-            r.cv.wait(lock, [&] {
-                return r.stop.load(std::memory_order_acquire) ||
-                       r.spinning.load(std::memory_order_acquire) ||
-                       r.pending_seq.load(std::memory_order_acquire) != seen;
-            });
-        }
+        }, cancel_ptr, &stopping);
     }
 
     void compute_cpu(const MissLayer& layer, Rank& rank) {
@@ -1186,15 +1035,16 @@ struct ExpertMisses::Impl {
 
         // Deduplicate input quantization across all routed experts: at most token_capacity unique
         // tokens exist in a call, quantized once (in parallel when >= 2) into shared_in / shared_in_up.
-        std::array<int, 64> tok_slot;
+        static_assert(kMaxCallTokens >= 64, "token_capacity exceeds deduplication array");
+        std::array<int, kMaxCallTokens> tok_slot;
         tok_slot.fill(-1);
-        std::array<int, 64> unique_toks{};
+        std::array<int, kMaxCallTokens> unique_toks{};
         int unique_count = 0;
         for (const auto& ctx : nodes) {
             for (std::size_t ei = 0; ei < ctx->active_experts; ++ei) {
                 for (const std::int32_t tok : ctx->cpu_experts[ei].tokens) {
-                    if (tok >= 0 && tok < 64 && tok_slot[std::size_t(tok)] < 0) {
-                        tok_slot[std::size_t(tok)]             = unique_count;
+                    if (tok >= 0 && tok < kMaxCallTokens && tok_slot[std::size_t(tok)] < 0) {
+                        tok_slot[std::size_t(tok)]               = unique_count;
                         unique_toks[std::size_t(unique_count++)] = tok;
                     }
                 }
@@ -1369,30 +1219,18 @@ struct ExpertMisses::Impl {
         }
 
         // Launch remote socket nodes first so every NUMA domain computes in parallel using only
-        // its own socket-local SpinPool and local DRAM weights/mirrors.
+        // its own socket-local SpinPool and local DRAM weights/mirrors. dispatch_cpu_nodes
+        // drains every launched remote node even if primary throws, preserving the first error.
+        std::vector<RemoteNodeRunner*> active_remotes;
+        active_remotes.reserve(nodes.size() > 1 ? nodes.size() - 1 : 0);
         for (std::size_t ni = 1; ni < nodes.size(); ++ni) {
             NodeContext& ctx = *nodes[ni];
-            if (ctx.active_experts == 0 || !ctx.remote) { continue; }
-            auto& r = *ctx.remote;
-            {
-                std::lock_guard lock(r.mutex);
-                r.layer = &layer;
-                ++r.expected_seq;
-                r.pending_seq.store(r.expected_seq, std::memory_order_release);
-            }
-            r.cv.notify_one();
+            if (ctx.active_experts > 0 && ctx.remote) { active_remotes.push_back(ctx.remote.get()); }
         }
-        if (primary.active_experts > 0) { execute_node_experts(primary, layer); }
-
-        std::exception_ptr remote_err;
-        for (std::size_t ni = 1; ni < nodes.size(); ++ni) {
-            NodeContext& ctx = *nodes[ni];
-            if (ctx.active_experts == 0 || !ctx.remote) { continue; }
-            auto& r = *ctx.remote;
-            while (r.done_seq.load(std::memory_order_acquire) != r.expected_seq) { spin_hint(); }
-            if (r.failure && !remote_err) { remote_err = std::exchange(r.failure, nullptr); }
-        }
-        if (remote_err) { std::rethrow_exception(remote_err); }
+        dispatch_cpu_nodes(
+            primary.active_experts > 0, active_remotes, &layer,
+            [&] { execute_node_experts(primary, layer); },
+            [this] { return is_cancelled(); });
 
         auto* pairs        = static_cast<std::int32_t*>(rank.product_pairs->data());
         std::int32_t count = 0;
@@ -1916,6 +1754,9 @@ void ExpertMisses::await(std::size_t layer, cudaStream_t stream) { impl_->await(
 
 void ExpertMisses::await_up(std::size_t layer, cudaStream_t stream) { impl_->await_up(layer, stream); }
 void ExpertMisses::keep_alive() { impl_->keep_alive(); }
+void ExpertMisses::set_cancellation(const std::atomic<bool>* cancelled) noexcept {
+    impl_->cancellation.store(cancelled, std::memory_order_release);
+}
 
 void ExpertMisses::raise_failure() { impl_->raise_failure(); }
 void ExpertMisses::fence(cudaStream_t stream, std::size_t rank) { impl_->fence(stream, rank); }

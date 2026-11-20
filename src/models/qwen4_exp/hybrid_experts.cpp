@@ -72,29 +72,22 @@ struct HybridWorkerPlan {
 
 HybridWorkerPlan plan_hybrid_workers(DeviceContext& d,
                                      std::span<const HybridExpertLayer> inputs,
-                                     const HybridExpertOptions& o) {
-    const NumaTopology& topo = host_numa_topology();
-    const int gpu_node       = device_numa_node(d.rank(0).device);
-    std::uint64_t host_bytes = 0;
-    for (const auto& layer : inputs) {
-        if (layer.experts.empty()) { continue; }
-        host_bytes += std::uint64_t(expert_bytes(layer.experts.front())) * layer.experts.size();
-    }
-    const HostNumaPlan numa =
-        plan_host_numa(topo, gpu_node, host_bytes, o.cpu_threads, o.numa_policy);
-    HybridWorkerPlan out;
-    if (!topo.multi_node() && o.cpu_threads == 0) {
-        out.threads = std::clamp(std::thread::hardware_concurrency(), 1U, 16U);
-        if (const auto* primary = topo.find(numa.primary_node)) {
-            const auto& cpus = primary->physical_cpus.size() >= out.threads
-                                   ? primary->physical_cpus
-                                   : primary->logical_cpus;
-            for (std::size_t i = 0; i < cpus.size() && out.cpu_ids.size() < out.threads; ++i) {
-                out.cpu_ids.push_back(cpus[i]);
-            }
+                                     const HybridExpertOptions& o,
+                                     const std::optional<HostNumaPlan>& existing_plan) {
+    HostNumaPlan numa;
+    if (existing_plan) {
+        numa = *existing_plan;
+    } else {
+        const NumaTopology topo = host_numa_topology();
+        const int gpu_node      = device_numa_node(d.rank(0).device);
+        std::uint64_t host_bytes = 0;
+        for (const auto& layer : inputs) {
+            if (layer.experts.empty()) { continue; }
+            host_bytes += std::uint64_t(expert_bytes(layer.experts.front())) * layer.experts.size();
         }
-        return out;
+        numa = plan_host_numa(topo, gpu_node, host_bytes, o.cpu_threads, o.numa_policy);
     }
+    HybridWorkerPlan out;
     std::uint32_t total = 0;
     for (const auto& np : numa.node_plans) {
         total += np.worker_threads;
@@ -691,9 +684,10 @@ struct HybridExperts::Impl {
 
 HybridExperts::HybridExperts(DeviceContext& d, std::vector<HybridExpertLayer> layers,
                              std::uint32_t tokens, std::uint64_t cache_bytes,
-                             HybridExpertOptions options, std::function<void()> before_cpu) {
+                             HybridExpertOptions options, std::function<void()> before_cpu,
+                             std::optional<HostNumaPlan> numa_plan) {
     const HybridExpertOptions valid = validated(options);
-    const HybridWorkerPlan wp       = plan_hybrid_workers(d, layers, valid);
+    const HybridWorkerPlan wp       = plan_hybrid_workers(d, layers, valid, numa_plan);
     impl_ = std::make_unique<Impl>(d, std::move(layers), tokens, cache_bytes, valid,
                                    std::move(before_cpu), wp);
 }

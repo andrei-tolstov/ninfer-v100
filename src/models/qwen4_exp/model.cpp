@@ -487,11 +487,18 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
     artifact::MaterializeOptions mat_options;
+    mat_options.pinned_numa_policy = options.numa_policy;
     std::optional<HostNumaPlan> host_numa_plan;
     if (options.experts == ExpertResidency::Host) {
-        const auto& topo        = host_numa_topology();
+        const NumaTopology topo = host_numa_topology();
         const int gpu_node      = device_numa_node(device.rank(0).device);
-        const auto numa_plan    = plan_host_numa(topo, gpu_node, materialization.pinned_capacity_bytes,
+        std::uint64_t host_bytes = materialization.pinned_capacity_bytes;
+        for (const auto& h : materialization.host_objects) {
+            if (h.registered) {
+                host_bytes += artifact::object_bytes(reader.directory().object(h.object));
+            }
+        }
+        const auto numa_plan    = plan_host_numa(topo, gpu_node, host_bytes,
                                                  options.cpu_threads, options.numa_policy);
         host_numa_plan          = numa_plan;
         mat_options.pinned_numa_node = numa_plan.primary_node;

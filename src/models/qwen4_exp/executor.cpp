@@ -1442,7 +1442,8 @@ struct Executor::Impl {
                 }
             }
             hybrid = std::make_unique<HybridExperts>(device, std::move(host_layers),
-                options.prefill_chunk, options.expert_cache_bytes, options.hybrid_experts);
+                options.prefill_chunk, options.expert_cache_bytes, options.hybrid_experts,
+                std::function<void()>{}, model.numa_plan());
             for (std::size_t r = 0; r < ranks.size(); ++r) {
                 memory.ranks[r].expert_cache_bytes += hybrid->cache_bytes(r);
                 memory.ranks[r].workspace_bytes += hybrid->working_bytes(r);
@@ -3948,6 +3949,7 @@ void Executor::bind_cancellation(const std::atomic<bool>* cancelled) noexcept {
     // can die. Normal pass/draft boundaries have already drained and propagated any failure.
     if (!cancelled && impl_->hybrid) { try { impl_->hybrid->finish(); } catch (...) {} }
     impl_->cancelled = cancelled;
+    if (impl_->misses) { impl_->misses->set_cancellation(cancelled); }
 }
 
 void Executor::raise_service_failure() {

@@ -186,6 +186,26 @@ void overlay_placement(DeviceContext& device) {
         require(std::equal(actual.begin(), actual.end(), fixture.payload.begin() + 256),
                 "registered object DMA changed its encoded bytes");
     }
+    // T-21: Registered host_objects accept multi-shard MaterializeOptions and bind/register cleanly.
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const auto row  = binder.parameter("row", {1, 130}, Residency::Registered);
+        (void)binder.parameter("matrix", {2, 130}, Residency::Registered);
+        (void)binder.parameter("values", {2}, Residency::Registered);
+        const NumaTopology topo = host_numa_topology();
+        const int n0            = topo.nodes.front().node_id;
+        const int n1            = topo.multi_node() ? topo.nodes.back().node_id : n0;
+        MaterializeOptions opt;
+        opt.pinned_shards = {PinnedShardRange{0, 264, n0}, PinnedShardRange{264, 268, n1}};
+        auto backing = materialize(reader, std::move(binder).finish(), device, {}, nullptr, opt);
+        const auto view = bind_view(row, backing);
+        require(view.parts.front().parent->data != nullptr && backing.stats().pinned_object_count == 2,
+                "T-21 sharded registered host objects lost accounting");
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, view.parts.front().parent->data));
+        require(attributes.type == cudaMemoryTypeHost, "T-21 sharded host object was not registered");
+    }
 }
 
 void failure_and_host_only(DeviceContext& device) {

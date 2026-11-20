@@ -15,6 +15,7 @@
 #   NINFER_TESTS       ON or OFF: build the tests   (default ON)
 #   NINFER_MULTICALL   ON or OFF: the programs as one multi-call executable, ninfer-multicall,
 #                      with their names as symlinks (apps/CMakeLists.txt)   (default OFF)
+#   NINFER_GGML_CPU_AVX2 ON or OFF: build ggml-cpu host experts for AVX2+FMA (default ON)
 #   NINFER_PREFIX      prebuilt dependency prefix   (default none)
 #   NINFER_JOBS        build parallelism            (default: all cores)
 set -euo pipefail
@@ -24,6 +25,7 @@ arch="${NINFER_CUDA_ARCH:-86}"
 build_dir="${NINFER_BUILD_DIR:-build-native}"
 tests="${NINFER_TESTS:-ON}"
 multicall="${NINFER_MULTICALL:-OFF}"
+ggml_avx2="${NINFER_GGML_CPU_AVX2:-ON}"
 jobs="${NINFER_JOBS:-$(nproc)}"
 
 IFS=';' read -r -a arch_list <<<"$arch"
@@ -32,6 +34,7 @@ for one in "${arch_list[@]}"; do
 done
 case "$tests" in ON|OFF) ;; *) printf 'NINFER_TESTS must be ON or OFF, got %s\n' "$tests" >&2; exit 2 ;; esac
 case "$multicall" in ON|OFF) ;; *) printf 'NINFER_MULTICALL must be ON or OFF, got %s\n' "$multicall" >&2; exit 2 ;; esac
+case "$ggml_avx2" in ON|OFF) ;; *) printf 'NINFER_GGML_CPU_AVX2 must be ON or OFF, got %s\n' "$ggml_avx2" >&2; exit 2 ;; esac
 
 export CUDACXX="$cuda_path/bin/nvcc"
 export PATH="$cuda_path/bin:$PATH"
@@ -51,6 +54,7 @@ case "${1:-}" in
   configure)
     cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="$arch" -DBUILD_TESTING="$tests" -DNINFER_MULTICALL="$multicall" \
+      -DNINFER_GGML_CPU_AVX2="$ggml_avx2" \
       ${prefix_args[@]+"${prefix_args[@]}"} ${launcher_args[@]+"${launcher_args[@]}"} ;;
   build)
     cmake --build "$build_dir" --parallel "$jobs" ;;

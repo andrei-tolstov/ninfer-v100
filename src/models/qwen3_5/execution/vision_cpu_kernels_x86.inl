@@ -12,7 +12,6 @@ namespace ninfer::models::qwen3_5::execution::cpu_vision {
 namespace {
 
 constexpr std::int32_t kTileTokens = 16;
-constexpr std::int32_t kHeadDim    = 72;
 
 inline __m256 fmadd(__m256 a, __m256 b, __m256 c) {
 #if defined(NINFER_QWEN_VISION_AVX2)
@@ -36,14 +35,27 @@ inline float hsum_f32_8(__m256 x) {
     return _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps(h, h, 1)));
 }
 
+inline __m256 max_nan_ps(__m256 a, __m256 b) {
+    const __m256 m = _mm256_max_ps(a, b);
+    return _mm256_blendv_ps(m, a, _mm256_cmp_ps(a, a, _CMP_UNORD_Q));
+}
+
+inline __m128 max_nan_ps128(__m128 a, __m128 b) {
+    const __m128 nan_a = _mm_cmpunord_ps(a, a);
+    const __m128 m     = _mm_max_ps(a, b);
+    return _mm_or_ps(_mm_and_ps(nan_a, a), _mm_andnot_ps(nan_a, m));
+}
+
 inline float hmax_f32_8(__m256 x) {
-    const __m128 s = _mm_max_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
-    const __m128 h = _mm_max_ps(s, _mm_movehl_ps(s, s));
-    return _mm_cvtss_f32(_mm_max_ss(h, _mm_shuffle_ps(h, h, 1)));
+    const __m128 s = max_nan_ps128(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
+    const __m128 h = max_nan_ps128(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(max_nan_ps128(h, _mm_shuffle_ps(h, h, 1)));
 }
 
 __m256 exp_nonpositive(__m256 x) {
-    x              = _mm256_max_ps(x, _mm256_set1_ps(-87.3F));
+    // Keep -87.3F as the first operand: VMAXPS returns the second operand when either is NaN, so
+    // NaN propagates to the caller instead of turning into exp(-87.3F).
+    x              = _mm256_max_ps(_mm256_set1_ps(-87.3F), x);
     const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341F)),
                                      _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     x = fnmadd(n, _mm256_set1_ps(0.693359375F), x);
@@ -77,6 +89,7 @@ float exp_nonpositive_scalar(float x) {
 
 void pack_panel(const float* x, std::size_t x_stride, std::int32_t k, std::int32_t token,
                 std::int32_t width, float* panel) {
+    if (k <= 0 || width <= 0) { return; }
     if (width == kTileTokens) {
         for (std::int32_t inner = 0; inner < k; ++inner) {
             const float* source = x + std::size_t(inner) * x_stride + token;
@@ -109,6 +122,7 @@ inline void store_tile_row(float* dst, std::int32_t width, __m256 a0, __m256 a1)
 void gemm_packed_bias(const float* w, std::size_t w_stride, const float* bias, std::int32_t n,
                       std::int32_t k, const float* packed, std::int32_t tokens, float* y,
                       std::size_t y_stride) {
+    if (n <= 0 || k <= 0 || tokens <= 0) { return; }
     for (std::int32_t token = 0, p = 0; token < tokens; token += kTileTokens, ++p) {
         const std::int32_t width = std::min(kTileTokens, tokens - token);
         const float* panel       = packed + std::size_t(p) * k * kTileTokens;
@@ -216,6 +230,7 @@ void gemm_packed_bias(const float* w, std::size_t w_stride, const float* bias, s
 void layer_norm_cols(const float* x_data, std::size_t stride, std::int32_t features,
                      const float* weight, const float* bias, std::int32_t first,
                      std::int32_t count, float epsilon, float* y_data) {
+    if (features <= 0 || count <= 0) { return; }
     thread_local std::vector<float> mean;
     thread_local std::vector<float> variance;
     mean.assign(std::size_t(count), 0.0F);
@@ -319,6 +334,7 @@ void gelu_tanh(float* x, std::size_t count) {
 
 void rope_pair(float* first, float* second, const float* cosines, const float* sines,
                std::int32_t tokens) {
+    if (tokens <= 0) { return; }
     std::int32_t t = 0;
     for (; t + 8 <= tokens; t += 8) {
         const __m256 a = _mm256_loadu_ps(first + t);
@@ -340,6 +356,7 @@ void segment_attention_block(const float* qkv, std::size_t qkv_stride, std::int3
                              std::int32_t row_base, std::int32_t s0, std::int32_t q0,
                              std::int32_t qn, std::int32_t segment, float scale, float* scores,
                              float* out, std::size_t out_stride) {
+    if (qn <= 0 || segment <= 0) { return; }
     constexpr std::int32_t kKeys = 256;
     const float* q_base          = qkv + std::size_t(row_base) * qkv_stride + q0;
     const float* k_base          = qkv + std::size_t(hidden + row_base) * qkv_stride + s0;
@@ -421,9 +438,16 @@ void segment_attention_block(const float* qkv, std::size_t qkv_stride, std::int3
         float* line      = scores + std::size_t(q) * segment;
         __m256 vmax      = _mm256_set1_ps(-INFINITY);
         std::int32_t key = 0;
-        for (; key + 8 <= segment; key += 8) { vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(line + key)); }
+        for (; key + 8 <= segment; key += 8) {
+            vmax = max_nan_ps(vmax, _mm256_loadu_ps(line + key));
+        }
         float m = hmax_f32_8(vmax);
-        for (; key < segment; ++key) { m = std::max(m, line[key]); }
+        for (; key < segment; ++key) {
+            if (!std::isnan(m)) {
+                const float v = line[key];
+                if (std::isnan(v) || v > m) { m = v; }
+            }
+        }
 
         const __m256 vm = _mm256_set1_ps(m);
         __m256 vsum     = _mm256_setzero_ps();

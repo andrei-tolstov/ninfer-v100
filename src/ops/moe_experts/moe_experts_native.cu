@@ -101,7 +101,8 @@ __device__ int packed_four(const Weight& w, int row, int column, float& scale) {
     constexpr int groups = K / group_size;
     const int group = column / group_size, lane = column % group_size;
     const std::int64_t record = w.layout == QuantLayout::RowSplitPanel
-        ? (std::int64_t(row / 64) * groups + group) * 64 + row % 64
+        ? (std::int64_t(row / kRowSplitPanelRows) * groups + group) * kRowSplitPanelRows +
+              row % kRowSplitPanelRows
         : std::int64_t(row) * groups + group;
     scale = __half2float(static_cast<const __half*>(w.scales)[std::int64_t(row) * groups + group]);
     const auto* codes = static_cast<const unsigned char*>(w.qdata);

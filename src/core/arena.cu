@@ -498,28 +498,35 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes,
 #ifdef __linux__
     void* mapped = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapped != MAP_FAILED) {
-        for (const auto& s : shards) {
-            if (s.numa_node >= 0 && s.bytes > 0 && s.offset < size_bytes) {
-                const std::size_t clamped = std::min(s.bytes, size_bytes - s.offset);
-                // Set per-VMA MPOL_BIND before cudaHostRegister faults pages.
-                (void)bind_memory_to_node(static_cast<std::byte*>(mapped) + s.offset, clamped,
-                                          s.numa_node, /*move_pages=*/false);
-            }
-        }
-        const cudaError_t reg_err =
-            cudaHostRegister(mapped, size_bytes, cudaHostRegisterPortable);
-        if (reg_err == cudaSuccess) {
-            data_        = mapped;
-            size_        = size_bytes;
-            mmap_backed_ = true;
-            return;
-        }
-        (void)cudaGetLastError();
-        munmap(mapped, size_bytes);
+    if (mapped == MAP_FAILED) {
+        throw std::runtime_error("PinnedHostBuffer: mmap failed for sharded allocation of " +
+                                 std::to_string(size_bytes) + " bytes");
     }
-#endif
+    std::vector<int> failed_nodes;
+    // Set per-VMA MPOL_BIND before cudaHostRegister faults pages.
+    if (!bind_pinned_shards(mapped, size_bytes, shards, &failed_nodes)) {
+        shard_mbind_failures_ = failed_nodes.size();
+        std::fprintf(stderr,
+                     "ninfer: PinnedHostBuffer: mbind failed for %zu sharded region(s); node(s):",
+                     failed_nodes.size());
+        for (const int n : failed_nodes) { std::fprintf(stderr, " %d", n); }
+        std::fprintf(stderr, "\n");
+    }
+    // Drain any prior unrelated CUDA runtime error before checking cudaHostRegister.
+    (void)cudaGetLastError();
+    const cudaError_t reg_err =
+        cudaHostRegister(mapped, size_bytes, cudaHostRegisterPortable);
+    if (reg_err == cudaSuccess) {
+        data_        = mapped;
+        size_        = size_bytes;
+        mmap_backed_ = true;
+        return;
+    }
+    munmap(mapped, size_bytes);
+    throw std::runtime_error(cuda_error_message("cudaHostRegister failed for sharded PinnedHostBuffer", reg_err));
+#else
     *this = PinnedHostBuffer(size_bytes, kNoNumaNode, NumaPlacement::Interleave);
+#endif
 }
 
 PinnedHostBuffer::~PinnedHostBuffer() { free_pinned_storage(data_, size_, mmap_backed_); }
@@ -537,23 +544,27 @@ HostMemoryRegistration::~HostMemoryRegistration() {
 }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_), mmap_backed_(other.mmap_backed_) {
-    other.data_        = nullptr;
-    other.size_        = 0;
-    other.mmap_backed_ = false;
+    : data_(other.data_), size_(other.size_), mmap_backed_(other.mmap_backed_),
+      shard_mbind_failures_(other.shard_mbind_failures_) {
+    other.data_                 = nullptr;
+    other.size_                 = 0;
+    other.mmap_backed_          = false;
+    other.shard_mbind_failures_ = 0;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
     free_pinned_storage(data_, size_, mmap_backed_);
-    data_        = other.data_;
-    size_        = other.size_;
-    mmap_backed_ = other.mmap_backed_;
+    data_                 = other.data_;
+    size_                 = other.size_;
+    mmap_backed_          = other.mmap_backed_;
+    shard_mbind_failures_ = other.shard_mbind_failures_;
 
-    other.data_        = nullptr;
-    other.size_        = 0;
-    other.mmap_backed_ = false;
+    other.data_                 = nullptr;
+    other.size_                 = 0;
+    other.mmap_backed_          = false;
+    other.shard_mbind_failures_ = 0;
     return *this;
 }
 

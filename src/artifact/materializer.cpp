@@ -9,6 +9,7 @@
 #include "artifact/reader.h"
 #include "core/startup.h"
 #include "core/vmm.h"
+#include "core/wide_math.h"
 
 #include <cuda_runtime.h>
 
@@ -475,17 +476,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             out.pinned_ = std::make_unique<PinnedHostBuffer>(
                 pinned_bytes, options.pinned_numa_node, options.pinned_numa_placement);
         } else {
-            const auto& topo        = host_numa_topology();
+            const NumaTopology topo = host_numa_topology();
             const int gpu_node      = device_numa_node(device.rank(0).device);
             const auto plan_numa    = plan_host_numa(
                 topo, gpu_node, pinned_bytes, /*requested_threads=*/0,
-                topo.multi_node() ? NumaPolicy::Auto : NumaPolicy::Isolate);
+                topo.multi_node() ? options.pinned_numa_policy : NumaPolicy::Isolate);
             if (plan_numa.pinned_shards.size() > 1) {
-                std::vector<PinnedShardRange> shards;
-                shards.reserve(plan_numa.pinned_shards.size());
-                for (const auto& s : plan_numa.pinned_shards) {
-                    shards.push_back(PinnedShardRange{s.offset, s.bytes, s.numa_node});
-                }
+                std::vector<PinnedShardRange> shards = plan_numa.pinned_shards;
                 out.pinned_ = std::make_unique<PinnedHostBuffer>(pinned_bytes, shards);
             } else {
                 const int target_node = plan_numa.pinned_shards.empty()
@@ -522,6 +519,19 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.stats_.pinned_bytes        = plan.pinned_capacity_bytes;
         out.stats_.pinned_object_count = plan.pinned_objects.size();
     }
+    // Registered host_objects (native host-resident MoE) distribute across active NUMA shards when
+    // multi-node shards are provided, matching pinned_buffer sharding (P1-8).
+    std::uint64_t total_registered_host = 0;
+    std::uint64_t total_shard_bytes     = 0;
+    for (const auto& placement : plan.host_objects) {
+        if (placement.registered) {
+            reader.validate_object(placement.object);
+            total_registered_host += object_bytes(reader.directory().object(placement.object));
+        }
+    }
+    for (const auto& s : options.pinned_shards) { total_shard_bytes += s.bytes; }
+    std::uint64_t registered_cursor = 0;
+
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
@@ -537,9 +547,35 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         storage.host_data = std::move(placement.data);
         if (placement.registered) {
-            const int target_node = options.pinned_numa_node >= 0
-                                        ? options.pinned_numa_node
-                                        : device_numa_node(device.rank(0).device);
+            int target_node = options.pinned_numa_node >= 0
+                                  ? options.pinned_numa_node
+                                  : device_numa_node(device.rank(0).device);
+            if (options.pinned_shards.size() > 1 && total_registered_host > 0 &&
+                total_shard_bytes > 0) {
+                const std::uint64_t mid =
+                    registered_cursor + storage.host_data.size() / 2ULL;
+                const core::Uint128 scaled = core::wide_multiply(mid, total_shard_bytes);
+                std::uint64_t rem          = scaled.high % total_registered_host;
+                std::uint64_t shard_pos    = 0;
+                for (int bit = 63; bit >= 0; --bit) {
+                    const std::uint64_t bbit = (scaled.low >> bit) & 1ULL;
+                    const bool carry         = (rem >> 63) != 0ULL;
+                    rem                      = (rem << 1) | bbit;
+                    if (carry || rem >= total_registered_host) {
+                        rem -= total_registered_host;
+                        shard_pos |= (1ULL << bit);
+                    }
+                }
+                std::uint64_t acc = 0;
+                for (const auto& s : options.pinned_shards) {
+                    acc += s.bytes;
+                    if (shard_pos < acc && s.numa_node >= 0) {
+                        target_node = s.numa_node;
+                        break;
+                    }
+                }
+            }
+            registered_cursor += storage.host_data.size();
             if (target_node >= 0) {
                 (void)bind_memory_to_node(storage.host_data.data(), storage.host_data.size(),
                                           target_node, /*move_pages=*/true);
@@ -547,7 +583,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             storage.registration = std::make_unique<HostMemoryRegistration>(
                 storage.host_data.data(), storage.host_data.size());
             out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, storage.host_data.size(),
-                                                "registered Host bytes");
+                                                  "registered Host bytes");
             ++out.stats_.pinned_object_count;
         }
         out.stats_.retained_host_bytes =

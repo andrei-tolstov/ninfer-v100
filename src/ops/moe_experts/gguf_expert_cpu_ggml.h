@@ -41,6 +41,7 @@ public:
     [[nodiscard]] GgmlActLayout layout() const noexcept { return layout_; }
     [[nodiscard]] const void* codes(int token) const noexcept;
     [[nodiscard]] std::size_t row_bytes() const noexcept;
+    [[nodiscard]] bool all_prepared() const noexcept;
 
 private:
     int capacity_ = 0;
@@ -50,6 +51,7 @@ private:
     std::size_t row_bytes_ = 0;
     std::vector<std::uint8_t> data_;
     std::vector<float> scratch_;
+    std::vector<std::uint8_t> prepared_;
 };
 
 // y[t * y_stride + r] = row r . x[t] for rows [row_begin, row_end) and all prepared tokens.

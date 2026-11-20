@@ -403,3 +403,34 @@ jobs:
           path: dist/
           # Only the publishing run that follows reads them.
           retention-days: 1
+
+  cuda-ggml-avx1:
+    name: CUDA build and tests (sm_86, ggml AVX1 / AVX2=OFF, no GPU)
+    needs: build-inputs
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Toolchain image
+        run: .github/scripts/toolchain-image.sh
+      - name: Build tests (NINFER_GGML_CPU_AVX2=OFF)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e NINFER_CUDA_ARCH=86 -e NINFER_GGML_CPU_AVX2=OFF -e NINFER_BUILD_DIR=/src/build-avx1 \
+            ninfer-toolchain:ci bash -c \
+            'scripts/build-native.sh configure && scripts/build-native.sh target ninfer_tests'
+      - name: Run CTest (NINFER_GGML_CPU_AVX2=OFF)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e NINFER_BUILD_DIR=/src/build-avx1 \
+            ninfer-toolchain:ci bash -c 'mkdir -p /tmp/stub && \
+              ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1 && \
+              LD_LIBRARY_PATH=/tmp/stub scripts/build-native.sh test'

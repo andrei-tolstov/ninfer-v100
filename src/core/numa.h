@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <span>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 namespace ninfer {
 
 inline constexpr int kNoNumaNode = -1;
+inline constexpr std::uint64_t kUnknownPinnedBytes = std::numeric_limits<std::uint64_t>::max();
 
 // NUMA placement strategy for pinned buffers backing MoE experts and CPU worker pools.
 enum class NumaPlacement : std::uint8_t {
@@ -72,11 +74,12 @@ struct NumaTopology {
                                             std::uint32_t max_usable_cpus     = 0);
 
 // Queries the live host NUMA topology (intersected with sched_getaffinity and cgroup CPU quota on
-// Linux; returns a single logical node on platforms without sysfs NUMA).
-[[nodiscard]] const NumaTopology& host_numa_topology();
+// Linux; returns a single logical node on platforms without sysfs NUMA), sampling fresh per-node
+// free memory on each call.
+[[nodiscard]] NumaTopology host_numa_topology();
 
 // Returns the NUMA node attached to the CUDA device's PCIe root complex on Linux, or kNoNumaNode
-// when unknown / single-node virtualized / non-Linux.
+// when unknown / single-node virtualized / non-Linux. Results are cached per CUDA device.
 [[nodiscard]] int device_numa_node(int cuda_device);
 
 // Reads `/sys/bus/pci/devices/<bus_id>/numa_node` relative to an arbitrary `sys_base`.
@@ -90,11 +93,21 @@ bool bind_thread_to_cpu(int cpu_id) noexcept;
 // that node). Returns true on success.
 bool bind_thread_to_node(int node_id) noexcept;
 
+// Builds a Linux nodemask word bitset covering `nodes` (supporting node ids 0..1023).
+// Exposed for multi-word nodemask unit testing (>64 NUMA nodes).
+[[nodiscard]] bool build_nodemask(std::span<const int> nodes, std::vector<unsigned long>& mask,
+                                  unsigned long& maxnode_out);
+
 // Applies Linux `mbind` policy (`MPOL_BIND` or `MPOL_INTERLEAVE`) to the page-aligned range
 // covering `[addr, addr + bytes)`. Fails gracefully (returns false) in restricted containers
 // (`EPERM`/`ENOSYS`) or non-Linux builds.
 bool bind_memory_nodes(void* addr, std::size_t bytes, std::span<const int> nodes,
                        bool interleave = false, bool move_pages = true) noexcept;
+
+// Applies per-shard `MPOL_BIND` across `[base, base + size_bytes)`. Returns true if every bound
+// shard succeeded; optionally collects node ids whose `mbind` failed.
+bool bind_pinned_shards(void* base, std::size_t size_bytes, std::span<const HostNumaShard> shards,
+                        std::vector<int>* failed_nodes = nullptr) noexcept;
 
 // Convenience overload for binding to a single node.
 inline bool bind_memory_to_node(void* addr, std::size_t bytes, int node_id,
@@ -125,6 +138,7 @@ public:
 
 private:
     bool active_   = false;
+    bool captured_ = false;
     int prev_mode_ = -1;  // captured previous mode; -1: nothing captured
     std::vector<unsigned long> prev_mask_;
 };

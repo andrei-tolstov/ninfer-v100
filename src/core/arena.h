@@ -142,11 +142,7 @@ private:
     std::size_t active_rank_ = 0;
 };
 
-struct PinnedShardRange {
-    std::size_t offset = 0;
-    std::size_t bytes  = 0;
-    int numa_node      = kNoNumaNode;
-};
+using PinnedShardRange = HostNumaShard;
 
 // Page-locked host buffer allocated outside any VRAM budget, kept aligned and portable across CUDA
 // contexts. On Linux multi-socket NUMA systems, optional overloads bind pages at allocation time
@@ -167,11 +163,13 @@ public:
 
     void* data() const noexcept;
     std::size_t size() const noexcept;
+    [[nodiscard]] std::size_t shard_mbind_failures() const noexcept { return shard_mbind_failures_; }
 
 private:
-    void* data_        = nullptr;
-    std::size_t size_  = 0;
-    bool mmap_backed_  = false;
+    void* data_                       = nullptr;
+    std::size_t size_                 = 0;
+    bool mmap_backed_                 = false;
+    std::size_t shard_mbind_failures_ = 0;
 };
 
 // Registers an existing host allocation without moving its bytes. The allocation must outlive

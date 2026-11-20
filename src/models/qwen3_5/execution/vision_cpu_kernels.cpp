@@ -17,6 +17,7 @@ constexpr std::int32_t kHeadDim    = 72;
 
 void pack_panel(const float* x, std::size_t x_stride, std::int32_t k, std::int32_t token,
                 std::int32_t width, float* panel) {
+    if (k <= 0 || width <= 0) { return; }
     for (std::int32_t inner = 0; inner < k; ++inner) {
         const float* source = x + std::size_t(inner) * x_stride + token;
         float* target       = panel + std::size_t(inner) * kTileTokens;
@@ -28,6 +29,7 @@ void pack_panel(const float* x, std::size_t x_stride, std::int32_t k, std::int32
 void gemm_packed_bias(const float* w, std::size_t w_stride, const float* bias, std::int32_t n,
                       std::int32_t k, const float* packed, std::int32_t tokens, float* y,
                       std::size_t y_stride) {
+    if (n <= 0 || k <= 0 || tokens <= 0) { return; }
     for (std::int32_t token = 0, p = 0; token < tokens; token += kTileTokens, ++p) {
         const std::int32_t width = std::min(kTileTokens, tokens - token);
         const float* panel       = packed + std::size_t(p) * k * kTileTokens;
@@ -54,6 +56,7 @@ void gemm_packed_bias(const float* w, std::size_t w_stride, const float* bias, s
 void layer_norm_cols(const float* x_data, std::size_t stride, std::int32_t features,
                      const float* weight, const float* bias, std::int32_t first,
                      std::int32_t count, float epsilon, float* y_data) {
+    if (features <= 0 || count <= 0) { return; }
     std::vector<float> mean(std::size_t(count), 0.0F);
     std::vector<float> variance(std::size_t(count), 0.0F);
     for (std::int32_t r = 0; r < features; ++r) {
@@ -94,6 +97,7 @@ void gelu_tanh(float* x, std::size_t count) {
 
 void rope_pair(float* first, float* second, const float* cosines, const float* sines,
                std::int32_t tokens) {
+    if (tokens <= 0) { return; }
     for (std::int32_t t = 0; t < tokens; ++t) {
         const float a = first[t];
         const float b = second[t];
@@ -106,6 +110,7 @@ void segment_attention_block(const float* qkv, std::size_t qkv_stride, std::int3
                              std::int32_t row_base, std::int32_t s0, std::int32_t q0,
                              std::int32_t qn, std::int32_t segment, float scale, float* scores,
                              float* out, std::size_t out_stride) {
+    if (qn <= 0 || segment <= 0) { return; }
     constexpr std::int32_t kKeys = 256;
     for (std::int32_t k0 = 0; k0 < segment; k0 += kKeys) {
         const std::int32_t kn = std::min(kKeys, segment - k0);
@@ -123,8 +128,16 @@ void segment_attention_block(const float* qkv, std::size_t qkv_stride, std::int3
         }
     }
     for (std::int32_t q = 0; q < qn; ++q) {
-        float* line   = scores + std::size_t(q) * segment;
-        const float m = *std::max_element(line, line + segment);
+        float* line = scores + std::size_t(q) * segment;
+        float m     = -INFINITY;
+        for (std::int32_t key = 0; key < segment; ++key) {
+            const float v = line[key];
+            if (std::isnan(v)) {
+                m = v;
+                break;
+            }
+            if (v > m) { m = v; }
+        }
         float sum     = 0.0F;
         for (std::int32_t key = 0; key < segment; ++key) {
             line[key] = std::exp(line[key] - m);

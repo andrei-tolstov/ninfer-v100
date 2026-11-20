@@ -248,13 +248,30 @@ inline void decode_iq_slice(const std::uint8_t* block, int sub, float d, std::ui
     }
 }
 
+inline void dot_iq_slice(const std::int8_t* a, int sub, __m128i mag_lo, __m128i mag_hi,
+                         __m128i sgn_lo, __m128i sgn_hi, __m128i& u_lo, __m128i& u_hi) {
+    const __m128i v_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 32 * sub));
+    const __m128i v_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 32 * sub + 16));
+    u_lo               = dot_u8s8_128(mag_lo, _mm_sign_epi8(v_lo, sgn_lo));
+    u_hi               = dot_u8s8_128(mag_hi, _mm_sign_epi8(v_hi, sgn_hi));
+}
+
 template <QType F>
-inline void decode_iq(const std::uint8_t* block, __m128i table_iq4, __m128i table_iq4_abs,
+inline void decode_iq(const std::uint8_t* block, int live, __m128i table_iq4, __m128i table_iq4_abs,
                       Group& out) {
     const float d = half_at(block);
     std::uint16_t iq4_high = 0;
     if constexpr (F == QType::GGUF_IQ4_XS) { std::memcpy(&iq4_high, block + 2, 2); }
     for (int sub = 0; sub < 8; ++sub) {
+        if (sub >= live) {
+            out.magnitude[sub][0] = _mm_setzero_si128();
+            out.magnitude[sub][1] = _mm_setzero_si128();
+            out.sign[sub][0]      = _mm_setzero_si128();
+            out.sign[sub][1]      = _mm_setzero_si128();
+            out.factor[0][sub]    = 0.0F;
+            out.factor[1][sub]    = 0.0F;
+            continue;
+        }
         decode_iq_slice<F>(block, sub, d, iq4_high, table_iq4, table_iq4_abs, out.magnitude[sub][0],
                            out.magnitude[sub][1], out.sign[sub][0], out.sign[sub][1],
                            out.factor[0][sub], out.factor[1][sub]);
@@ -307,12 +324,7 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
                         decode_iq_slice<F>(block, sub, d, iq4_high, table_iq4, table_iq4_abs,
                                            mag_lo, mag_hi, sgn_lo, sgn_hi, factor0[sub],
                                            factor1[sub]);
-                        const __m128i v_lo = _mm_loadu_si128(
-                            reinterpret_cast<const __m128i*>(a + 32 * sub));
-                        const __m128i v_hi = _mm_loadu_si128(
-                            reinterpret_cast<const __m128i*>(a + 32 * sub + 16));
-                        u_lo[k] = dot_u8s8_128(mag_lo, _mm_sign_epi8(v_lo, sgn_lo));
-                        u_hi[k] = dot_u8s8_128(mag_hi, _mm_sign_epi8(v_hi, sgn_hi));
+                        dot_iq_slice(a, sub, mag_lo, mag_hi, sgn_lo, sgn_hi, u_lo[k], u_hi[k]);
                     }
                     if constexpr (halves) {
                         out_lo = hsum4_epi32(u_lo[0], u_lo[1], u_lo[2], u_lo[3]);
@@ -351,17 +363,21 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
         return;
     }
 
-    const auto decode = [table_iq4, table_iq4_abs](const std::uint8_t* row, int g, int, Group& group) {
-        decode_iq<F>(row + std::size_t(g) * bytes, table_iq4, table_iq4_abs, group);
+    const auto decode = [table_iq4, table_iq4_abs](const std::uint8_t* row, int g, int live,
+                                                   Group& group) {
+        decode_iq<F>(row + std::size_t(g) * bytes, live, table_iq4, table_iq4_abs, group);
     };
-    const auto dot = [&x](int t, int g, int, const Group& group) {
+    const auto dot = [&x](int t, int g, int live, const Group& group) {
         const std::int8_t* a = x.codes(t) + g * 256;
         __m128i u_lo[8], u_hi[8];
         for (int i = 0; i < 8; ++i) {
-            const __m128i v_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 32 * i));
-            const __m128i v_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 32 * i + 16));
-            u_lo[i] = dot_u8s8_128(group.magnitude[i][0], _mm_sign_epi8(v_lo, group.sign[i][0]));
-            u_hi[i] = dot_u8s8_128(group.magnitude[i][1], _mm_sign_epi8(v_hi, group.sign[i][1]));
+            if (i >= live) {
+                u_lo[i] = _mm_setzero_si128();
+                u_hi[i] = _mm_setzero_si128();
+                continue;
+            }
+            dot_iq_slice(a, i, group.magnitude[i][0], group.magnitude[i][1], group.sign[i][0],
+                         group.sign[i][1], u_lo[i], u_hi[i]);
         }
         __m128i lo0123, lo4567, hi0123, hi4567;
         sum_hadd8(u_lo, lo0123, lo4567);
@@ -627,7 +643,10 @@ inline void swiglu_impl(const float* gate, const float* up, std::size_t count, s
         const __m256 prod = _mm256_mul_ps(silu, _mm256_loadu_ps(up + i));
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), pack_bf16_8(prod));
     }
-    for (; i < count; ++i) { out[i] = float_to_bf16(ops::silu(gate[i]) * up[i]); }
+    for (; i < count; ++i) {
+        const float s = kExactFma ? ops::silu(gate[i]) : silu_fast_scalar(gate[i]);
+        out[i]        = float_to_bf16(s * up[i]);
+    }
 }
 
 // silu.h eight values at a time using AVX 1.0 + SSE4.1 (with emulated FMA): same operations
@@ -648,7 +667,8 @@ void prepare_bf16_avx(QType, const std::uint16_t* values, std::size_t stride, in
     const __m128i ones_u8     = _mm_set1_epi8(1);
     const __m128i ones_i16    = _mm_set1_epi16(1);
     const __m256 sign_bit     = _mm256_set1_ps(-0.0F);
-    const __m256 half_minus   = _mm256_set1_ps(0.49999997F);
+    const __m256 half         = _mm256_set1_ps(0.5F);
+    const __m256 one          = _mm256_set1_ps(1.0F);
     auto bf16x8_to_ps = [&](__m128i raw) {
         const __m128i lo = _mm_unpacklo_epi16(zero128, raw);
         const __m128i hi = _mm_unpackhi_epi16(zero128, raw);
@@ -697,10 +717,15 @@ void prepare_bf16_avx(QType, const std::uint16_t* values, std::size_t stride, in
             scales[g]      = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtps_ph(_mm_set_ss(d),
                                                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
             const __m256 vd = _mm256_set1_ps(d);
-            auto q8         = [&](__m256 v) {
-                const __m256 q    = _mm256_div_ps(v, vd);
-                const __m256 bias = _mm256_or_ps(_mm256_and_ps(q, sign_bit), half_minus);
-                return _mm256_cvttps_epi32(_mm256_add_ps(q, bias));
+            // std::round (ties away from zero), matching quantize().
+            auto q8 = [&](__m256 v) {
+                const __m256 q     = _mm256_div_ps(v, vd);
+                const __m256 abs_q = _mm256_andnot_ps(sign_bit, q);
+                const __m256 abs_t = _mm256_round_ps(abs_q, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+                const __m256 ge    = _mm256_cmp_ps(_mm256_sub_ps(abs_q, abs_t), half, _CMP_GE_OQ);
+                const __m256 rounded = _mm256_or_ps(_mm256_add_ps(abs_t, _mm256_and_ps(ge, one)),
+                                                    _mm256_and_ps(q, sign_bit));
+                return _mm256_cvttps_epi32(rounded);
             };
             const __m256i i0 = q8(v0);
             const __m256i i1 = q8(v1);

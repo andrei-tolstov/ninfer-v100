@@ -101,7 +101,9 @@ void ggml_vec_dot_iq1_m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
-// Batched multi-token / multi-row host-expert helpers (defined in arch/x86/quants.c).
+// NInfer: batched multi-token / multi-row host-expert helpers (defined in arch/x86/quants.c).
+// Contract: k / n must be a positive multiple of QK8_0 (32) for _q8_0* and QK_K (256) for _q8_K*,
+// enforced by GGML_ASSERT; on non-x86 targets these helpers are not implemented.
 void ggml_quantize_bf16_q8_0(const uint16_t * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_bf16_q8_K(const uint16_t * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 

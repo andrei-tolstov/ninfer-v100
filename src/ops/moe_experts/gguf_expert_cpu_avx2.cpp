@@ -152,9 +152,16 @@ void rows_in_lane_order(const GgufCpuMatrix& w, const GgufCpuActivation& x, int 
 
 // An i-quant group is one 256-value block.
 template <QType F>
-inline void decode_iq(const std::uint8_t* block, Group& out) {
+inline void decode_iq(const std::uint8_t* block, int live, Group& out) {
     const float d = half_at(block);
     for (int sub = 0; sub < 8; ++sub) {
+        if (sub >= live) {
+            out.magnitude[sub] = _mm256_setzero_si256();
+            out.sign[sub]      = _mm256_setzero_si256();
+            out.factor[0][sub] = 0.0F;
+            out.factor[1][sub] = 0.0F;
+            continue;
+        }
         if constexpr (F == QType::GGUF_IQ2_S) {
             const std::uint8_t* qs = block + 2 + 4 * sub;
             const unsigned qh      = block[66 + sub];
@@ -217,13 +224,17 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
              float* y, std::size_t y_stride) {
     constexpr int bytes   = gguf_block_shape(F).bytes;
     constexpr bool halves = F == QType::GGUF_IQ2_S;
-    const auto decode     = [](const std::uint8_t* row, int g, int, Group& group) {
-        decode_iq<F>(row + std::size_t(g) * bytes, group);
+    const auto decode     = [](const std::uint8_t* row, int g, int live, Group& group) {
+        decode_iq<F>(row + std::size_t(g) * bytes, live, group);
     };
-    const auto dot = [&x](int t, int g, int, const Group& group) {
+    const auto dot = [&x](int t, int g, int live, const Group& group) {
         const std::int8_t* a = x.codes(t) + g * 256;
         __m256i u[8];
         for (int i = 0; i < 8; ++i) {
+            if (i >= live) {
+                u[i] = _mm256_setzero_si256();
+                continue;
+            }
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i));
             u[i]            = dot_u8s8(group.magnitude[i], _mm256_sign_epi8(v, group.sign[i]));
         }
@@ -334,24 +345,31 @@ void rows_avx2(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin
     }
 }
 
-// silu.h eight values at a time: the same operations in the same order, so the same bits.
-void swiglu_avx2(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
+template <bool kFma>
+inline void swiglu_avx2_impl(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
     const __m256 one = _mm256_set1_ps(1.0F);
-    std::size_t i    = 0;
+    auto fm          = [&](__m256 a, __m256 b, __m256 c) {
+        if constexpr (kFma) {
+            return _mm256_fmadd_ps(a, b, c);
+        } else {
+            return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+        }
+    };
+    std::size_t i = 0;
     alignas(32) float products[8];
     for (; i + 8 <= count; i += 8) {
         const __m256 x = _mm256_loadu_ps(gate + i);
         const __m256 v = _mm256_xor_ps(x, _mm256_set1_ps(-0.0F)); // e^v, v = -x
         const __m256 n = _mm256_round_ps(_mm256_mul_ps(v, _mm256_set1_ps(1.44269504F)),
                                          _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-        __m256 r = _mm256_fmadd_ps(n, _mm256_set1_ps(-0.693145751953125F), v);
-        r        = _mm256_fmadd_ps(n, _mm256_set1_ps(-1.42860677e-6F), r);
-        __m256 p = _mm256_fmadd_ps(_mm256_set1_ps(1.9875691500e-4F), r, _mm256_set1_ps(1.3981999507e-3F));
-        p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073e-3F));
-        p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894e-2F));
-        p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459e-1F));
-        p        = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201e-1F));
-        p        = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r);
+        __m256 r = fm(n, _mm256_set1_ps(-0.693145751953125F), v);
+        r        = fm(n, _mm256_set1_ps(-1.42860677e-6F), r);
+        __m256 p = fm(_mm256_set1_ps(1.9875691500e-4F), r, _mm256_set1_ps(1.3981999507e-3F));
+        p        = fm(p, r, _mm256_set1_ps(8.3334519073e-3F));
+        p        = fm(p, r, _mm256_set1_ps(4.1665795894e-2F));
+        p        = fm(p, r, _mm256_set1_ps(1.6666665459e-1F));
+        p        = fm(p, r, _mm256_set1_ps(5.0000001201e-1F));
+        p        = fm(p, _mm256_mul_ps(r, r), r);
         p        = _mm256_add_ps(p, one);
         // n is -126 .. 128 where the polynomial's value is kept; 2^128 is 2^127 times 2.
         const __m256i k = _mm256_cvttps_epi32(n);
@@ -370,7 +388,19 @@ void swiglu_avx2(const float* gate, const float* up, std::size_t count, std::uin
         _mm256_store_ps(products, _mm256_mul_ps(silu, _mm256_loadu_ps(up + i)));
         for (int j = 0; j < 8; ++j) { out[i + j] = float_to_bf16(products[j]); }
     }
-    for (; i < count; ++i) { out[i] = float_to_bf16(ops::silu(gate[i]) * up[i]); }
+    for (; i < count; ++i) {
+        const float s = kFma ? ops::silu(gate[i]) : silu_fast_scalar(gate[i]);
+        out[i]        = float_to_bf16(s * up[i]);
+    }
+}
+
+// silu.h eight values at a time: the same operations in the same order, so the same bits.
+void swiglu_avx2(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
+    swiglu_avx2_impl<true>(gate, up, count, out);
+}
+
+void swiglu_fast_avx2(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
+    swiglu_avx2_impl<false>(gate, up, count, out);
 }
 
 } // namespace ninfer::ops::gguf_cpu_detail

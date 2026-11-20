@@ -5,6 +5,8 @@
 
 namespace ninfer::models::qwen3_5::execution::cpu_vision {
 
+inline constexpr std::int32_t kHeadDim = 72;
+
 struct Kernels {
     void (*pack_panel)(const float* x, std::size_t x_stride, std::int32_t k, std::int32_t token,
                        std::int32_t width, float* panel);

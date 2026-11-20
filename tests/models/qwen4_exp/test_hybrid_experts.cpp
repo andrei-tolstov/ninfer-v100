@@ -1,5 +1,8 @@
 #include "models/qwen4_exp/hybrid_experts.h"
+#include "artifact/permute_row_split.h"
 #include "core/decode_graph.h"
+#include "core/weight_view.h"
+#include "models/qwen4_exp/expert_misses.h"
 #include "ops/op_tester.h"
 
 #include <array>
@@ -8,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -35,7 +39,9 @@ struct Projection {
             // Binary16 1/32 (Q2) or 1/256 (Q4/Q5), including negative scales.
             scales[std::size_t(r) * (k / 64) + g] =
                 std::uint16_t((b == 2 ? 0x2800 : 0x1c00) | ((r + g) % 3 == 0 ? 0x8000 : 0));
-            const auto record = panel ? (std::size_t(r / 64) * (k / 64) + g) * 64 + r % 64
+            const auto record = panel ? (std::size_t(r / kRowSplitPanelRows) * (k / 64) + g) *
+                                                kRowSplitPanelRows +
+                                            r % kRowSplitPanelRows
                                       : std::size_t(r) * (k / 64) + g;
             for (int c = 0; c < 64; ++c) {
                 seed = 1664525U * seed + 1013904223U;
@@ -60,7 +66,9 @@ struct Projection {
     // Decode independently from actual stored bytes; no CPU/GPU production decoder is called.
     double at(int row, int column) const {
         const int group = column / 64, lane = column % 64;
-        const auto record = panel ? (std::size_t(row / 64) * (k / 64) + group) * 64 + row % 64
+        const auto record = panel ? (std::size_t(row / kRowSplitPanelRows) * (k / 64) + group) *
+                                            kRowSplitPanelRows +
+                                        row % kRowSplitPanelRows
                                   : std::size_t(row) * (k / 64) + group;
         unsigned code = bits == 2 ? (low[record * 16 + lane / 4] >> (2 * (lane % 4))) & 3U
                                   : (low[record * 32 + lane / 2] >> (4 * (lane % 2))) & 15U;
@@ -262,6 +270,195 @@ void run(DeviceContext& device, std::array<int, 3> bits, bool a8, bool panel,
     if (cached) { require(hybrid.stats().hits > 0, "hybrid never read its resident cache"); }
     if (adaptive) { require(hybrid.stats().admitted > initial_admissions, "hybrid adaptive cache never admitted a miss"); }
 }
+
+// T-06: Permute genuine RowSplit projections via artifact::permute_row_split_to_panel() on the
+// GPU, then evaluate the resulting RowSplitPanel weights through BOTH CPU exact (Scalar + Avx)
+// and GPU ops::moe_experts_native against the independent FP64 oracle.
+void test_panel_real_permute(DeviceContext& device) {
+    struct PermutedWeight {
+        WeightGeometry panel_geom;
+        std::vector<std::uint8_t> bytes;
+        DeviceBuffer gpu_bytes;
+        Weight host_weight{};
+
+        PermutedWeight(const Projection& src, cudaStream_t stream)
+            : panel_geom(weight_geometry(src.weight.qtype, QuantLayout::RowSplit,
+                                         std::array<std::uint64_t, 2>{unsigned(src.n), unsigned(src.k)})),
+              bytes(panel_geom.bytes, 0), gpu_bytes(panel_geom.bytes) {
+            require(!src.panel, "T-06 expects unpermuted RowSplit input");
+            std::memcpy(bytes.data(), src.low.data(), src.low.size());
+            if (!src.high.empty()) {
+                std::memcpy(bytes.data() + panel_geom.high_offset, src.high.data(), src.high.size());
+            }
+            std::memcpy(bytes.data() + panel_geom.scale_offset, src.scales.data(),
+                        src.scales.size() * 2);
+            gpu_bytes.copy_from_host(bytes.data(), bytes.size());
+            artifact::permute_row_split_to_panel(panel_geom, static_cast<std::byte*>(gpu_bytes.p),
+                                                 stream);
+            if (cudaStreamSynchronize(stream) != cudaSuccess) {
+                throw std::runtime_error("T-06 permute synchronize failed");
+            }
+            gpu_bytes.copy_to_host(bytes.data(), bytes.size());
+            panel_geom.layout = QuantLayout::RowSplitPanel;
+
+            host_weight              = src.weight;
+            host_weight.layout       = QuantLayout::RowSplitPanel;
+            host_weight.qdata        = bytes.data();
+            host_weight.qhigh        = src.high.empty() ? nullptr : bytes.data() + panel_geom.high_offset;
+            host_weight.scales       = bytes.data() + panel_geom.scale_offset;
+            host_weight.payload      = bytes.data();
+            host_weight.payload_bytes = bytes.size();
+        }
+    };
+
+    Projection raw_gate(5, I, H, false, 101), raw_up(4, I, H, false, 203), raw_down(2, H, I, false, 307);
+    PermutedWeight gate(raw_gate, device.stream), up(raw_up, device.stream), down(raw_down, device.stream);
+
+    std::vector<std::uint16_t> x(H);
+    for (int h = 0; h < H; ++h) { x[h] = test::f32_to_bf16(std::sin(float(h * 11 + 3)) * 0.7F); }
+    const std::vector<double> expected = oracle(raw_gate, raw_up, raw_down, x);
+
+    auto check_oracle = [&](const std::vector<float>& actual, bool a8, const char* tag) {
+        double err = 0, norm = 0, max_err = 0, peak = 0;
+        for (int i = 0; i < H; ++i) {
+            const double d = actual[i] - expected[i];
+            err += d * d;
+            norm += expected[i] * expected[i];
+            max_err = std::max(max_err, std::abs(d));
+            peak    = std::max(peak, std::abs(expected[i]));
+        }
+        const double rel = std::sqrt(err / std::max(norm, 1e-30));
+        require(rel < (a8 ? 0.04 : 0.001) && max_err / std::max(peak, 1e-15) < (a8 ? 0.16 : 0.004), tag);
+    };
+
+    ops::CpuExpertWorkspace cpu_ws(4);
+    for (const bool a8 : {false, true}) {
+        const ops::CpuExpertWeights cpu_w{{gate.host_weight, a8},
+                                          {up.host_weight, a8},
+                                          {down.host_weight, a8}};
+        std::vector<float> scalar_out(H), avx_out(H);
+        ops::moe_expert_cpu(x, cpu_w, cpu_ws, scalar_out, ops::CpuExpertBackend::Scalar);
+        check_oracle(scalar_out, a8, "T-06 CPU Scalar RowSplitPanel from permute_row_split failed FP64 oracle");
+        if (ops::cpu_expert_backend_available(ops::CpuExpertBackend::Avx)) {
+            ops::moe_expert_cpu(x, cpu_w, cpu_ws, avx_out, ops::CpuExpertBackend::Avx);
+            check_oracle(avx_out, a8, "T-06 CPU Avx RowSplitPanel from permute_row_split failed FP64 oracle");
+            if (a8) {
+                require(std::memcmp(scalar_out.data(), avx_out.data(), scalar_out.size() * 4) == 0,
+                        "T-06 CPU a8=true Scalar vs Avx diverged on RowSplitPanel");
+            }
+        }
+    }
+
+    // Verify GPU native MoE consumes the exact same GPU-permuted buffer.
+    Weight g_dev = gate.host_weight, u_dev = up.host_weight, d_dev = down.host_weight;
+    g_dev.qdata = gate.gpu_bytes.p;
+    g_dev.qhigh = static_cast<const std::byte*>(gate.gpu_bytes.p) + gate.panel_geom.high_offset;
+    g_dev.scales = static_cast<const std::byte*>(gate.gpu_bytes.p) + gate.panel_geom.scale_offset;
+    g_dev.payload = gate.gpu_bytes.p;
+    u_dev.qdata = up.gpu_bytes.p;
+    u_dev.scales = static_cast<const std::byte*>(up.gpu_bytes.p) + up.panel_geom.scale_offset;
+    u_dev.payload = up.gpu_bytes.p;
+    d_dev.qdata = down.gpu_bytes.p;
+    d_dev.scales = static_cast<const std::byte*>(down.gpu_bytes.p) + down.panel_geom.scale_offset;
+    d_dev.payload = down.gpu_bytes.p;
+
+    DeviceBuffer zero_bf16(std::size_t(H) * I * 2);
+    zero_bf16.fill(0);
+    Weight shared;
+    shared.qdata = zero_bf16.p;
+    shared.qtype = QType::BF16;
+    shared.layout = QuantLayout::Contiguous;
+    shared.n = I;
+    shared.k = H;
+    std::vector<Weight> table_host(E * 3 + 3, shared);
+    for (int e = 0; e < E; ++e) {
+        table_host[e]         = g_dev;
+        table_host[E + e]     = u_dev;
+        table_host[2 * E + e] = d_dev;
+    }
+    table_host[3 * E + 2].n = H;
+    table_host[3 * E + 2].k = I;
+    DeviceBuffer table_dev(table_host.size() * sizeof(Weight));
+    table_dev.copy_from_host(table_host.data(), table_dev.bytes);
+    const auto* tp = static_cast<const Weight*>(table_dev.p);
+
+    const ops::NativeMoeWeights banks{{QType::Q5_G64_FP16, tp, false},
+                                      {QType::Q4_G64_FP16, tp + E, false},
+                                      {QType::Q2_G64_FP16, tp + 2 * E, false},
+                                      {QType::BF16, tp + 3 * E, false},
+                                      {QType::BF16, tp + 3 * E + 1, false},
+                                      {QType::BF16, tp + 3 * E + 2, false},
+                                      E};
+    DeviceBuffer dx(H * 2), di(TOP * 4), dw(TOP * 4), ds(4), dy(H * 4);
+    dx.copy_from_host(x.data(), dx.bytes);
+    std::vector<std::int32_t> ids(TOP, 0);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::vector<float> rw(TOP, 0.1F), sg(1, 0.0F);
+    di.copy_from_host(ids.data(), di.bytes);
+    dw.copy_from_host(rw.data(), dw.bytes);
+    ds.copy_from_host(sg.data(), ds.bytes);
+    const Tensor tx(dx.p, DType::BF16, {H, 1}), ti(di.p, DType::I32, {TOP, 1}),
+                 tw(dw.p, DType::FP32, {TOP, 1}), ts(ds.p, DType::FP32, {1});
+    Tensor ty(dy.p, DType::FP32, {H, 1});
+    WorkspaceArena ws(ops::moe_experts_native_workspace_bytes(1));
+    ops::moe_experts_native(tx, ti, tw, ts, banks, nullptr, ws, ty, device.stream);
+    if (cudaStreamSynchronize(device.stream) != cudaSuccess) {
+        throw std::runtime_error("T-06 GPU moe_experts_native synchronize failed");
+    }
+    std::vector<float> gpu_out(H);
+    dy.copy_to_host(gpu_out.data(), dy.bytes);
+    check_oracle(gpu_out, false, "T-06 GPU RowSplitPanel from permute_row_split failed FP64 oracle");
+    std::cout << "T-06_PANEL_REAL_PERMUTE_PASS\n";
+}
+
+// T-18 & T-19 (GPU part): Passing a 2-node HostNumaPlan explicitly into ExpertMisses / HybridExperts
+// adopts that single plan directly (2 pools, total workers = sum, description prints "N@nodeX"),
+// and Mirror + Disk is rejected explicitly rather than silently downgraded.
+void test_single_numa_plan_and_mirror_disk(DeviceContext& device) {
+    HostNumaPlan two_node;
+    two_node.mode         = HostNumaMode::Sharded;
+    two_node.primary_node = 0;
+    two_node.service_cpu  = 0;
+    two_node.node_plans.push_back(HostNumaNodePlan{0, 3, {0, 0}});
+    two_node.node_plans.push_back(HostNumaNodePlan{1, 2, {0, 0}});
+
+    std::vector<const void*> fake_ptrs(16, reinterpret_cast<const void*>(0x1000));
+    MissLayer layer;
+    layer.rank       = 0;
+    layer.experts    = 16;
+    layer.gate_table = fake_ptrs.data();
+    for (int k = 0; k < 3; ++k) {
+        layer.projections[std::size_t(k)].format       = QType::GGUF_IQ4_NL;
+        layer.projections[std::size_t(k)].row_bytes    = 64;
+        layer.projections[std::size_t(k)].rows         = 640;
+        layer.projections[std::size_t(k)].k            = 2560;
+        layer.projections[std::size_t(k)].expert_bytes = 64 * 640;
+        layer.projections[std::size_t(k)].host         = fake_ptrs;
+    }
+    MissOptions mo;
+    mo.cpu_share   = 1.0;
+    mo.numa_policy = NumaPolicy::Sharded;
+    mo.numa_plan   = two_node;
+    ExpertMisses misses(device, {layer}, {}, mo, nullptr);
+    const std::string desc = misses.cpu_description();
+    require(desc.find("5 threads (3@node0, 2@node1)") != std::string::npos,
+            ("T-18 unexpected cpu_description: " + desc).c_str());
+
+    // T-19: Mirror + Disk must throw invalid_argument instead of silently ignoring Mirror.
+    std::vector<ExpertLocation> fake_loc(16);
+    MissLayer disk_layer = layer;
+    disk_layer.projections[0].host.clear();
+    disk_layer.projections[0].located = fake_loc;
+    MissOptions bad_disk = mo;
+    bad_disk.numa_plan   = std::nullopt;
+    bad_disk.numa_policy = NumaPolicy::Mirror;
+    bool rejected_mirror_disk = false;
+    try {
+        ExpertMisses should_fail(device, {disk_layer}, {}, bad_disk, nullptr);
+    } catch (const std::invalid_argument&) { rejected_mirror_disk = true; }
+    require(rejected_mirror_disk, "T-19 Mirror + Disk must throw invalid_argument");
+    std::cout << "T-18_T-19_NUMA_CONTRACT_PASS\n";
+}
 } // namespace
 
 int main() {
@@ -269,6 +466,8 @@ int main() {
     std::cout << std::unitbuf;
     try {
         DeviceContext device;
+        test_single_numa_plan_and_mirror_disk(device);
+        test_panel_real_permute(device);
         run(device, {2, 2, 2}, true, false, 0, 0, false);
         run(device, {2, 5, 4}, false, true, 4, 0.5F, false);
         run(device, {5, 4, 5}, true, false, 0, 1, false);

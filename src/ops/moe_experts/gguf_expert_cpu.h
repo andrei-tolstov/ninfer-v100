@@ -72,6 +72,7 @@ public:
     [[nodiscard]] const std::int32_t* sums(int token) const noexcept {
         return sums_.data() + std::size_t(token) * groups_;
     }
+    [[nodiscard]] bool all_prepared() const noexcept;
 
 private:
     void quantize(QType format, int token, const float* values);
@@ -80,6 +81,7 @@ private:
     std::vector<std::int8_t> codes_;
     std::vector<float> scales_, scratch_;
     std::vector<std::int32_t> sums_;
+    std::vector<std::uint8_t> prepared_;
 };
 
 // y[t * y_stride + r] = row r . x[t] for rows [row_begin, row_end) and every prepared token.
@@ -97,6 +99,8 @@ using Rows = void (*)(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, 
                       std::size_t);
 void rows_scalar(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
+void swiglu_fast_scalar(const float*, const float*, std::size_t, std::uint16_t*);
+float silu_fast_scalar(float x) noexcept;
 #if defined(NINFER_CPU_EXPERT_X86)
 void rows_avx(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx(const float*, const float*, std::size_t, std::uint16_t*);
@@ -105,6 +109,7 @@ void prepare_bf16_avx(QType format, const std::uint16_t* values, std::size_t str
                       int k, std::int8_t* codes, float* scales, std::int32_t* sums);
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
+void swiglu_fast_avx2(const float*, const float*, std::size_t, std::uint16_t*);
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 void fma_avx(const float* a, const float* b, const float* c, float* out, std::size_t count);

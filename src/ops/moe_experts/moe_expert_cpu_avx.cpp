@@ -211,7 +211,7 @@ void quantized_avx(const Weight& weight, const Activations& x, bool a8, float* o
     constexpr int group_size = Bits == 8 ? 32 : 64;
     constexpr std::size_t low_stride  = Bits == 2 ? 16 : 32;
     constexpr std::size_t high_stride = Bits == 5 ? 8 : (Bits == 6 ? 16 : 0);
-    constexpr std::size_t rec_step    = Panel ? 64 : 1;
+    constexpr std::size_t rec_step    = Panel ? kRowSplitPanelRows : 1;
 
     const int n      = weight.n;
     const int k      = weight.k;
@@ -227,11 +227,11 @@ void quantized_avx(const Weight& weight, const Activations& x, bool a8, float* o
                 throw CpuExpertCancelled();
             }
             const std::size_t rec_base = Panel
-                ? (std::size_t(row / 64) * groups) * 64 + std::size_t(row % 64)
+                ? (std::size_t(row / kRowSplitPanelRows) * groups) * kRowSplitPanelRows +
+                      std::size_t(row % kRowSplitPanelRows)
                 : std::size_t(row) * groups;
             const std::size_t scale_base = std::size_t(row) * groups;
-            float acc0 = 0.0F;
-            float acc1 = 0.0F;
+            float acc = 0.0F;
 
             for (int g = 0; g < groups; ++g) {
                 const std::size_t record = rec_base + std::size_t(g) * rec_step;
@@ -245,24 +245,24 @@ void quantized_avx(const Weight& weight, const Activations& x, bool a8, float* o
                 if (a8) {
                     if constexpr (Bits == 8) {
                         const int d = dot32_i8(w0, w1, x.codes + g * 32, ones16);
-                        acc0 += (float(d) * x.scales[g]) * scale;
+                        acc += (float(d) * x.scales[g]) * scale;
                     } else {
                         const int b0 = g * 2;
                         const int d0 = dot32_i8(w0, w1, x.codes + g * 64, ones16);
                         const int d1 = dot32_i8(w2, w3, x.codes + g * 64 + 32, ones16);
-                        acc0 += (float(d0) * x.scales[b0]) * scale;
-                        acc1 += (float(d1) * x.scales[b0 + 1]) * scale;
+                        acc += (float(d0) * x.scales[b0]) * scale;
+                        acc += (float(d1) * x.scales[b0 + 1]) * scale;
                     }
                 } else {
                     if constexpr (Bits == 8) {
-                        acc0 += dot32_i8_f32(w0, w1, x.values + g * 32) * scale;
+                        acc += dot32_i8_f32(w0, w1, x.values + g * 32) * scale;
                     } else {
-                        acc0 += dot32_i8_f32(w0, w1, x.values + g * 64) * scale;
-                        acc1 += dot32_i8_f32(w2, w3, x.values + g * 64 + 32) * scale;
+                        acc += dot32_i8_f32(w0, w1, x.values + g * 64) * scale;
+                        acc += dot32_i8_f32(w2, w3, x.values + g * 64 + 32) * scale;
                     }
                 }
             }
-            output[row] = acc0 + acc1;
+            output[row] = acc;
         }
         return;
     }
@@ -288,7 +288,8 @@ void quantized_avx(const Weight& weight, const Activations& x, bool a8, float* o
                 throw CpuExpertCancelled();
             }
             const std::size_t rec_base = Panel
-                ? (std::size_t(row / 64) * groups) * 64 + std::size_t(row % 64)
+                ? (std::size_t(row / kRowSplitPanelRows) * groups) * kRowSplitPanelRows +
+                      std::size_t(row % kRowSplitPanelRows)
                 : std::size_t(row) * groups;
             const std::size_t scale_base = std::size_t(row) * groups;
             float acc[kTokChunk] = {};
@@ -369,22 +370,13 @@ void project_bf16_avx(const Weight& weight, const Activations& x, float* output)
             }
             const auto* row_ptr = wbytes + std::size_t(row) * k * 2;
             __m256 sum0 = _mm256_setzero_ps();
-            __m256 sum1 = _mm256_setzero_ps();
             int col = 0;
-            for (; col + 16 <= k; col += 16) {
-                const __m256 w0 = bf16x8_to_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_ptr + col * 2)));
-                const __m256 w1 = bf16x8_to_ps(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_ptr + col * 2 + 16)));
-                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(w0, _mm256_loadu_ps(xv + col)));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(w1, _mm256_loadu_ps(xv + col + 8)));
-            }
             for (; col + 8 <= k; col += 8) {
                 const __m256 w0 = bf16x8_to_ps(
                     _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_ptr + col * 2)));
                 sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(w0, _mm256_loadu_ps(xv + col)));
             }
-            float acc = hsum_f32_8(_mm256_add_ps(sum0, sum1));
+            float acc = hsum_f32_8(sum0);
             for (; col < k; ++col) {
                 std::uint16_t raw;
                 std::memcpy(&raw, row_ptr + col * 2, 2);

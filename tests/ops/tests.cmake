@@ -370,6 +370,9 @@ ninfer_add_op_test(ninfer_gguf_expert_cpu_test
   LIBRARIES ninfer_ops)
 target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  target_compile_definitions(ninfer_gguf_expert_cpu_test PRIVATE NINFER_CPU_EXPERT_X86=1)
+endif()
 
 # The fast ggml-cpu arithmetic of the CPU experts: its own FP64-oracle qualification and its
 # drift from the exact path.
@@ -380,6 +383,11 @@ target_include_directories(ninfer_gguf_expert_cpu_ggml_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src"
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src/ggml-cpu")
+if(NINFER_GGML_CPU_AVX2)
+  target_compile_definitions(ninfer_gguf_expert_cpu_ggml_test PRIVATE NINFER_GGML_CPU_REQUIRES_AVX2=1)
+else()
+  target_compile_definitions(ninfer_gguf_expert_cpu_ggml_test PRIVATE NINFER_GGML_CPU_REQUIRES_AVX2=0)
+endif()
 
 
 # The vendored ggml CUDA headers' two host helpers: the test links them, so a missing definition is
