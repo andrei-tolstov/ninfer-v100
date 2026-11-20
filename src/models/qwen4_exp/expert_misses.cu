@@ -514,6 +514,9 @@ struct ExpertMisses::Impl {
     std::atomic<const std::atomic<bool>*> cancellation{nullptr};
     std::mutex wake_mutex;
     std::condition_variable wake;
+    std::mutex request_mutex;
+    std::condition_variable request_done;
+    bool serving_request = false;
     std::mutex failure_mutex;
     std::exception_ptr failure;
     std::thread service;
@@ -1600,6 +1603,22 @@ struct ExpertMisses::Impl {
                     Atomic(rank.box->requested).load(cuda::memory_order_acquire);
                 if (sequence == rank.served) { continue; }
                 try {
+                    {
+                        std::lock_guard lock(request_mutex);
+                        serving_request = true;
+                    }
+                    struct RequestDoneGuard {
+                        std::mutex& m;
+                        std::condition_variable& cv;
+                        bool& flag;
+                        ~RequestDoneGuard() {
+                            {
+                                std::lock_guard lock(m);
+                                flag = false;
+                            }
+                            cv.notify_all();
+                        }
+                    } request_guard{request_mutex, request_done, serving_request};
                     serve_request(rank, sequence);
                 } catch (...) {
                     remember_failure();
@@ -1756,6 +1775,10 @@ void ExpertMisses::await_up(std::size_t layer, cudaStream_t stream) { impl_->awa
 void ExpertMisses::keep_alive() { impl_->keep_alive(); }
 void ExpertMisses::set_cancellation(const std::atomic<bool>* cancelled) noexcept {
     impl_->cancellation.store(cancelled, std::memory_order_release);
+    if (!cancelled) {
+        std::unique_lock lock(impl_->request_mutex);
+        impl_->request_done.wait(lock, [this] { return !impl_->serving_request; });
+    }
 }
 
 void ExpertMisses::raise_failure() { impl_->raise_failure(); }

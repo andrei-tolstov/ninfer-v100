@@ -125,8 +125,8 @@ public:
     // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it
     // before its first layer. Rethrows a service failure.
     void keep_alive();
-    // Binds an active request cancellation flag (pass nullptr to unbind); must outlive any
-    // in-flight pass.
+    // Binds an active request cancellation flag; pass nullptr to unbind and drain any in-flight
+    // service call before the caller destroys its flag.
     void set_cancellation(const std::atomic<bool>* cancelled) noexcept;
     // Rethrows a failure the service recorded while serving a call. A failed call released the
     // GPU with its missing experts left out, so a pass checks this once it has completed, before

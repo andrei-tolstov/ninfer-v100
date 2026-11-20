@@ -427,7 +427,7 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src \
             -e NINFER_CUDA_ARCH=86 -e NINFER_GGML_CPU_AVX2=OFF -e NINFER_BUILD_DIR=/src/build-avx1 \
             ninfer-toolchain:ci bash -c \
-            'scripts/build-native.sh configure && scripts/build-native.sh target ninfer_tests'
+            'scripts/build-native.sh configure && scripts/build-native.sh target ninfer_all_tests'
       - name: Run CTest (NINFER_GGML_CPU_AVX2=OFF)
         run: |
           docker run --rm -v "$PWD:/src" -w /src -e NINFER_BUILD_DIR=/src/build-avx1 \

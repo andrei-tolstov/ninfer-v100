@@ -29,7 +29,13 @@ void pack_panel(const float* x, std::size_t x_stride, std::int32_t k, std::int32
 void gemm_packed_bias(const float* w, std::size_t w_stride, const float* bias, std::int32_t n,
                       std::int32_t k, const float* packed, std::int32_t tokens, float* y,
                       std::size_t y_stride) {
-    if (n <= 0 || k <= 0 || tokens <= 0) { return; }
+    if (n <= 0 || k < 0 || tokens <= 0) { return; }
+    if (k == 0) {
+        for (std::int32_t row = 0; row < n; ++row) {
+            std::fill_n(y + std::size_t(row) * y_stride, tokens, bias[row]);
+        }
+        return;
+    }
     for (std::int32_t token = 0, p = 0; token < tokens; token += kTileTokens, ++p) {
         const std::int32_t width = std::min(kTileTokens, tokens - token);
         const float* panel       = packed + std::size_t(p) * k * kTileTokens;

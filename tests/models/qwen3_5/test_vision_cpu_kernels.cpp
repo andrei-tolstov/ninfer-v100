@@ -400,6 +400,17 @@ void test_degenerate_sizes(const cv::Kernels& kernels) {
                                     buf.data(), 16);
     const bool untouched = std::all_of(buf.begin(), buf.end(), [&](float v) { return v == kPoison; });
     expect(untouched, std::string(kernels.name) + " degenerate size wrote to output");
+
+    // k == 0 must fill every token with bias[row], matching origin/main linear_tile behavior.
+    const std::array<float, 3> bias0{1.25F, -2.5F, 0.75F};
+    std::vector<float> y0(3 * 5, kPoison);
+    kernels.gemm_packed_bias(dummy.data(), 1, bias0.data(), 3, 0, dummy.data(), 5, y0.data(), 5);
+    for (int r = 0; r < 3; ++r) {
+        for (int t = 0; t < 5; ++t) {
+            expect(y0[static_cast<std::size_t>(r) * 5 + t] == bias0[static_cast<std::size_t>(r)],
+                   std::string(kernels.name) + " gemm_packed_bias k=0 did not write bias");
+        }
+    }
 }
 
 #if defined(NINFER_VISION_CPU_X86)

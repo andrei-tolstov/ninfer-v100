@@ -12,6 +12,7 @@
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -315,8 +316,10 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
         throw std::invalid_argument("CPU Vision item does not match its control");
     }
     const auto worker_cpus = select_worker_cpus(device_numa_node(cuda_device), threads);
-    const unsigned team_threads =
-        threads != 0 ? threads : static_cast<unsigned>(std::max<std::size_t>(1, worker_cpus.size()));
+    const unsigned default_threads =
+        !worker_cpus.empty() ? static_cast<unsigned>(worker_cpus.size())
+                             : std::max(1U, std::thread::hardware_concurrency());
+    const unsigned team_threads = threads != 0 ? threads : default_threads;
     Team team(team_threads, worker_cpus);
     const auto stop = [&] { return cancelled != nullptr && cancelled->load(); };
 

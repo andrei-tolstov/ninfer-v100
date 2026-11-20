@@ -362,20 +362,30 @@ void test_numa_review_fixes() {
     require(!bind_thread_to_cpu(-1), "bind_thread_to_cpu must reject negative cpu_id");
 
     // ScopedThreadMemPolicy restores a non-default pre-existing policy (mode AND word-by-word
-    // nodemask), and a rejected/failed scope preserves the caller's pre-existing policy.
+    // nodemask), and a failure in capture_thread_mempolicy (`captured_ == false`) preserves the
+    // caller's pre-existing policy instead of resetting it to MPOL_DEFAULT on scope exit.
     {
         auto read_policy = [](int& mode, std::array<unsigned long, 16>& mask) -> bool {
             mask.fill(0UL);
             return syscall(__NR_get_mempolicy, &mode, mask.data(), 1024UL + 1UL, nullptr, 0UL) == 0;
         };
+        const NumaTopology live = host_numa_topology();
+        const int live_node     = live.nodes.empty() ? 0 : live.nodes.front().node_id;
         std::array<unsigned long, 16> want_mask{};
-        want_mask[0] = 1UL;
+        want_mask[0] = 1UL << static_cast<unsigned>(live_node % 64);
         if (syscall(__NR_set_mempolicy, MPOL_INTERLEAVE, want_mask.data(), 1024UL + 1UL) == 0) {
             int before_mode = -1;
             std::array<unsigned long, 16> before_mask{};
             require(read_policy(before_mode, before_mask) && before_mode == MPOL_INTERLEAVE,
                     "failed to establish non-default MPOL_INTERLEAVE policy");
-            { ScopedThreadMemPolicy scope(0, NumaPlacement::Bind); }
+            {
+                ScopedThreadMemPolicy scope(live_node, NumaPlacement::Bind);
+                require(scope.active(), "T-12 ScopedThreadMemPolicy must activate Bind policy");
+                int inside_mode = -1;
+                std::array<unsigned long, 16> inside_mask{};
+                require(read_policy(inside_mode, inside_mask) && inside_mode == MPOL_BIND,
+                        "T-12 active scope must report MPOL_BIND");
+            }
             int after_mode = -1;
             std::array<unsigned long, 16> after_mask{};
             require(read_policy(after_mode, after_mask), "get_mempolicy failed after scope");
@@ -391,6 +401,24 @@ void test_numa_review_fixes() {
             require(read_policy(after_mode, after_mask) && after_mode == before_mode &&
                         after_mask == before_mask,
                     "rejected ScopedThreadMemPolicy clobbered pre-existing policy");
+
+            // T-13: Inject get_mempolicy failure (`captured_ == false`) and verify destructor
+            // does NOT call set_mempolicy(MPOL_DEFAULT).
+            auto fail_capture = [](int*, unsigned long*, unsigned long) -> long {
+                errno = EPERM;
+                return -1L;
+            };
+            detail::set_get_mempolicy_hook(fail_capture);
+            {
+                ScopedThreadMemPolicy uncaptured(live_node, NumaPlacement::Bind);
+                require(!uncaptured.active(),
+                        "T-13 capture failure must leave ScopedThreadMemPolicy inactive");
+            }
+            detail::set_get_mempolicy_hook(nullptr);
+            require(read_policy(after_mode, after_mask) && after_mode == before_mode &&
+                        after_mask == before_mask,
+                    "T-13 failed capture reset caller's pre-existing mempolicy");
+
             (void)syscall(__NR_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL);
         }
     }
@@ -634,6 +662,71 @@ void test_numa_pr1_regressions() {
         require(saw_non_interleave, "T-14 could not inspect /proc/self/numa_maps for mmap shard");
         ::munmap(region, 2 * half);
     }
+
+    // N2, N4, N5, N6, kUnknownPinnedBytes, N10 Round 2 NUMA regression checks:
+    {
+        // N2: Explicit --expert-cpu-threads > available logical CPUs clamps cleanly without
+        // oversubscribing spinning pools or overlapping `service_cpu`.
+        const NumaTopology t2p = make_2p(64, 64, 128); // 2 x 8 = 16 logical CPUs
+        const auto plan2p = plan_host_numa(t2p, 0, 80ULL * kGiB, 100, NumaPolicy::Sharded);
+        std::uint32_t sum_w = 0;
+        std::set<int> used_cpus;
+        if (plan2p.service_cpu >= 0) { used_cpus.insert(plan2p.service_cpu); }
+        for (const auto& np : plan2p.node_plans) {
+            sum_w += np.worker_threads;
+            for (const int c : np.worker_cpus) {
+                require(used_cpus.insert(c).second, "N2 duplicate worker/service CPU pin on 2P");
+            }
+        }
+        require(sum_w == 16 && used_cpus.size() == 16,
+                "N2 explicit requested_threads=100 on 16-CPU 2P must clamp to 16 distinct CPUs");
+
+        NumaTopology t1p;
+        t1p.nodes.push_back(t2p.nodes[0]); // 1 x 8 = 8 logical CPUs
+        const auto plan1p = plan_host_numa(t1p, 0, 10ULL * kGiB, 100, NumaPolicy::Isolate);
+        require(plan1p.node_plans[0].worker_threads == 8 && plan1p.service_cpu >= 0 &&
+                    plan1p.node_plans[0].worker_cpus.size() == 7,
+                "N2 explicit requested_threads=100 on 8-CPU 1P must clamp to 8 distinct CPUs");
+
+        // N4: When GPU's node has empty CPU affinity while another node has CPUs, `service_cpu`
+        // falls back to a valid CPU from the other node rather than staying -1.
+        NumaTopology empty_gpu_aff = t2p;
+        empty_gpu_aff.nodes[0].logical_cpus.clear();
+        empty_gpu_aff.nodes[0].physical_cpus.clear();
+        const auto plan_n4 = plan_host_numa(empty_gpu_aff, 0, 80ULL * kGiB, 0, NumaPolicy::Auto);
+        require(plan_n4.service_cpu >= 0 && empty_gpu_aff.node_for_cpu(plan_n4.service_cpu) == 1,
+                "N4 empty GPU-node affinity must assign service_cpu from active node 1");
+
+        // N5: Explicit Sharded/Mirror on single-node falls back to Isolate (and uses requested
+        // policy label if headroom check fails); out-of-range gpu_node falls back safely.
+        const auto p_single_sharded = plan_host_numa(t1p, 99, 10ULL * kGiB, 0, NumaPolicy::Sharded);
+        require(p_single_sharded.mode == HostNumaMode::Isolate &&
+                    p_single_sharded.primary_node == 0,
+                "N5 single-node Sharded / invalid gpu_node must fall back to Isolate on node 0");
+
+        // N6: bind_pinned_shards counts out-of-range shard (`offset >= size_bytes`) as failure.
+        char dummy_buf[4096]{};
+        const std::array<HostNumaShard, 2> oob_shards{
+            HostNumaShard{0, 4096, valid_node},
+            HostNumaShard{4096, 4096, 1},
+        };
+        std::vector<int> oob_failed;
+        const bool oob_ok = bind_pinned_shards(dummy_buf, 4096, oob_shards, &oob_failed);
+        require(!oob_ok && oob_failed.size() == 1 && oob_failed[0] == 1,
+                "N6 bind_pinned_shards must mark offset >= size_bytes as failed");
+
+        // kUnknownPinnedBytes (disk residency) test coverage on 2P and 1P.
+        const auto plan_unk_2p =
+            plan_host_numa(t2p, 0, kUnknownPinnedBytes, 0, NumaPolicy::Auto);
+        require(plan_unk_2p.mode == HostNumaMode::Sharded && plan_unk_2p.pinned_shards.empty() &&
+                    plan_unk_2p.node_plans.size() == 2,
+                "kUnknownPinnedBytes Auto on 2P must keep Sharded pools with empty shards");
+        const auto plan_unk_1p =
+            plan_host_numa(t1p, 0, kUnknownPinnedBytes, 0, NumaPolicy::Auto);
+        require(plan_unk_1p.mode == HostNumaMode::Isolate && plan_unk_1p.pinned_shards.empty() &&
+                    plan_unk_1p.node_plans.size() == 1,
+                "kUnknownPinnedBytes Auto on 1P must stay Isolate with empty shards");
+    }
 #endif
 }
 
@@ -646,6 +739,8 @@ void test_live_host_and_cuda_numa() {
 
     const std::vector<int> cpus = select_worker_cpus(topo.nodes[0].node_id, 0);
     require(!cpus.empty(), "select_worker_cpus must select at least 1 CPU");
+    require(cpus.size() == topo.nodes[0].logical_cpus.size(),
+            "N10 select_worker_cpus(node, 0) must include all allowed hardware threads on socket");
     std::set<int> uniq(cpus.begin(), cpus.end());
     require(uniq.size() == cpus.size(), "select_worker_cpus must return distinct CPUs");
 

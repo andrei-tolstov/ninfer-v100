@@ -512,18 +512,29 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes,
         for (const int n : failed_nodes) { std::fprintf(stderr, " %d", n); }
         std::fprintf(stderr, "\n");
     }
-    // Drain any prior unrelated CUDA runtime error before checking cudaHostRegister.
-    (void)cudaGetLastError();
+    const cudaError_t pending = cudaGetLastError();
     const cudaError_t reg_err =
         cudaHostRegister(mapped, size_bytes, cudaHostRegisterPortable);
     if (reg_err == cudaSuccess) {
+        if (pending != cudaSuccess) {
+            std::fprintf(stderr,
+                         "ninfer: pinning %zu bytes of sharded host memory succeeded, but cleared an "
+                         "unretrieved earlier CUDA error: %s: %s\n",
+                         size_bytes, cudaGetErrorName(pending), cudaGetErrorString(pending));
+        }
         data_        = mapped;
         size_        = size_bytes;
         mmap_backed_ = true;
         return;
     }
     munmap(mapped, size_bytes);
-    throw std::runtime_error(cuda_error_message("cudaHostRegister failed for sharded PinnedHostBuffer", reg_err));
+    std::string prefix = "cudaHostRegister failed for sharded PinnedHostBuffer";
+    if (pending != cudaSuccess) {
+        prefix += ", after an unretrieved earlier error (";
+        prefix += cudaGetErrorName(pending);
+        prefix += ")";
+    }
+    throw std::runtime_error(cuda_error_message(prefix.c_str(), reg_err));
 #else
     *this = PinnedHostBuffer(size_bytes, kNoNumaNode, NumaPlacement::Interleave);
 #endif

@@ -289,7 +289,13 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
     std::vector<float> scalar(oracle.size());
     gguf_cpu_rows(w, a, 0, m.rows, scalar.data(), m.rows, GgufCpuBackend::Scalar);
     for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
-        if (!gguf_cpu_backend_available(backend)) { continue; }
+        if (!gguf_cpu_backend_available(backend)) {
+#if defined(NINFER_CPU_EXPERT_X86)
+            require(backend != GgufCpuBackend::Avx,
+                    "x86_64 runner must support GgufCpuBackend::Avx");
+#endif
+            continue;
+        }
         std::vector<float> y(oracle.size()), again(oracle.size()), y_poison(oracle.size());
         // Two row ranges, as workers split them.
         gguf_cpu_rows(w, a, 0, m.rows / 3, y.data(), m.rows, backend);
@@ -365,7 +371,13 @@ void check_silu(std::mt19937& rng) {
         require(std::abs(got - exact) <= step, "the BF16 middle strays from FP64");
     }
     for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
-        if (!gguf_cpu_backend_available(backend)) { continue; }
+        if (!gguf_cpu_backend_available(backend)) {
+#if defined(NINFER_CPU_EXPERT_X86)
+            require(backend != GgufCpuBackend::Avx,
+                    "x86_64 runner must support GgufCpuBackend::Avx");
+#endif
+            continue;
+        }
         std::vector<std::uint16_t> y(gate.size());
         gguf_cpu_swiglu_bf16(gate.data(), up.data(), gate.size(), y.data(), backend);
         require(y == scalar, "a vector backend's BF16 middle differs from the scalar one");
@@ -375,7 +387,12 @@ void check_silu(std::mt19937& rng) {
 
 void check_fma_avx([[maybe_unused]] std::mt19937& rng) {
 #if defined(__x86_64__) || defined(_M_X64)
+#    if defined(NINFER_CPU_EXPERT_X86)
+    require(gguf_cpu_backend_available(GgufCpuBackend::Avx),
+            "x86_64 runner must support GgufCpuBackend::Avx");
+#    else
     if (!gguf_cpu_backend_available(GgufCpuBackend::Avx)) { return; }
+#    endif
     std::vector<float> a, b, c;
     auto push = [&](float x, float y, float z) {
         a.push_back(x);
@@ -522,19 +539,37 @@ void check_activation_ties() {
 }
 
 void check_swiglu_fast(std::mt19937& rng) {
-    // P1-10: gguf_cpu_swiglu_bf16_fast must be accurate vs FP64 and identical across Avx/Avx2/Scalar
-    // (or explicitly bounded), and must honour GgufCpuBackend::Scalar.
+    // P1-10 + N9: gguf_cpu_swiglu_bf16_fast must handle edge/extreme finite inputs accurately vs
+    // FP64, match across Scalar/Avx/Avx2, and honor GgufCpuBackend::Scalar.
+    const std::vector<float> edge_gates = {
+        0.0F,    -0.0F,  1e-30F, -1e-30F, 1e-3F, -1e-3F, 0.5F,   -0.5F,
+        1.0F,    -1.0F,  10.0F,  -10.0F,  20.0F, -20.0F, 87.0F,  -87.0F,
+        88.0F,   -88.0F, 100.0F, -100.0F, 3e38F, -3e38F};
     std::normal_distribution<float> dist(0.0F, 3.0F);
     std::vector<float> gate(1027), up(1027);
     for (std::size_t i = 0; i < gate.size(); ++i) {
-        gate[i] = dist(rng);
-        up[i]   = dist(rng);
+        gate[i] = (i < edge_gates.size()) ? edge_gates[i] : dist(rng);
+        up[i]   = (i < edge_gates.size()) ? ((i % 2 == 0) ? 1.0F : -1.5F) : dist(rng);
     }
     std::vector<std::uint16_t> scalar_out(gate.size());
     gguf_cpu_swiglu_bf16_fast(gate.data(), up.data(), gate.size(), scalar_out.data(),
                               GgufCpuBackend::Scalar);
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+        if (std::abs(gate[i]) >= 88.0F) { continue; }
+        const double exact = silu64(double(gate[i])) * double(up[i]);
+        const double got   = double(std::bit_cast<float>(std::uint32_t(scalar_out[i]) << 16));
+        const double step  = std::ldexp(1.0, std::ilogb(std::max(std::abs(exact), 1e-38)) - 7);
+        require(std::isfinite(got) && std::abs(got - exact) <= 2.0 * step + 1e-37,
+                "gguf_cpu_swiglu_bf16_fast scalar strayed from FP64 oracle");
+    }
     for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
-        if (!gguf_cpu_backend_available(backend)) { continue; }
+        if (!gguf_cpu_backend_available(backend)) {
+#if defined(NINFER_CPU_EXPERT_X86)
+            require(backend != GgufCpuBackend::Avx,
+                    "x86_64 runner must support GgufCpuBackend::Avx");
+#endif
+            continue;
+        }
         std::vector<std::uint16_t> vec_out(gate.size());
         gguf_cpu_swiglu_bf16_fast(gate.data(), up.data(), gate.size(), vec_out.data(), backend);
         require(vec_out == scalar_out,

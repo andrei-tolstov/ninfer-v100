@@ -153,12 +153,18 @@ private:
                                           std::uint64_t page_size = 0);
 
 // Returns worker CPU IDs pinned to `preferred_node` (physical cores first, then local SMT
-// siblings) when `threads` fits on that node (0 picks physical cores of `preferred_node`), or
-// spans physical then logical CPUs across all nodes when `threads` exceeds one node's capacity.
+// siblings). When `requested_threads == 0`, returns all allowed hardware threads on
+// `preferred_node`; when non-zero and exceeding one node's capacity, spans physical then logical
+// CPUs across all nodes.
 [[nodiscard]] std::vector<int> select_worker_cpus(int preferred_node,
                                                   std::uint32_t requested_threads = 0);
 
 // Returns CPU ids formatted cleanly (e.g. "0-7,16-23") for startup diagnostics.
 [[nodiscard]] std::string format_numa_summary(const NumaTopology& topo);
+
+namespace detail {
+using GetMempolicyHook = long (*)(int* mode, unsigned long* nodemask, unsigned long maxnode);
+void set_get_mempolicy_hook(GetMempolicyHook hook) noexcept;
+} // namespace detail
 
 } // namespace ninfer

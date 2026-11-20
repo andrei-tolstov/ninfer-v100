@@ -636,8 +636,8 @@ void ggml_quantize_bf16_q8_K(const uint16_t * GGML_RESTRICT x, void * GGML_RESTR
         if (amax == 0.0f) {
             y[i].d = 0.0f;
             memset(y[i].qs, 0, QK_K);
-            // Unlike quantize_row_q8_K_ref (which leaves bsums untouched), zero bsums for
-            // deterministic output across uninitialized caller buffers.
+            // On all-zero blocks, unlike quantize_row_q8_K_ref (which returns early and leaves bsums
+            // untouched), zero bsums for deterministic output across uninitialized caller buffers.
             memset(y[i].bsums, 0, sizeof(y[i].bsums));
             continue;
         }

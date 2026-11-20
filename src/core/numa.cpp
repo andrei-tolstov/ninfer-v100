@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#    define _GNU_SOURCE 1
+#endif
+
 #include "core/numa.h"
 
 #include "core/wide_math.h"
@@ -5,9 +9,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -299,39 +305,66 @@ NumaTopology parse_numa_sysfs(const std::filesystem::path& sys_base,
     return topo;
 }
 
-NumaTopology host_numa_topology() {
-    NumaTopology out;
+struct CachedStaticTopology {
+    NumaTopology topo;
+    bool from_sysfs = false;
+};
+
+const CachedStaticTopology& cached_static_topology() {
+    static const CachedStaticTopology cached = [] {
+        CachedStaticTopology result;
 #ifdef __linux__
-    std::uint32_t quota_cap     = 0;
-    const std::vector<int> mask = current_allowed_cpus(quota_cap);
-    out                         = parse_numa_sysfs("/sys", mask, quota_cap);
-    if (out.nodes.empty()) {
-        NumaNodeInfo fallback;
-        fallback.node_id = 0;
+        std::uint32_t quota_cap     = 0;
+        std::vector<int> mask       = current_allowed_cpus(quota_cap);
+        result.topo                 = parse_numa_sysfs("/sys", mask, quota_cap);
+        result.from_sysfs           = !result.topo.nodes.empty();
+        if (result.topo.nodes.empty()) {
+            NumaNodeInfo fallback;
+            fallback.node_id = 0;
+            if (mask.empty()) {
+                const unsigned count = std::max(1U, std::thread::hardware_concurrency());
+                for (unsigned i = 0; i < count; ++i) { mask.push_back(static_cast<int>(i)); }
+            }
+            fallback.logical_cpus  = mask;
+            fallback.physical_cpus = mask;
+            result.topo.nodes.push_back(std::move(fallback));
+        }
+#else
+        NumaNodeInfo single;
+        single.node_id       = 0;
+        const unsigned count = std::max(1U, std::thread::hardware_concurrency());
+        for (unsigned i = 0; i < count; ++i) {
+            single.logical_cpus.push_back(static_cast<int>(i));
+            single.physical_cpus.push_back(static_cast<int>(i));
+        }
+        result.topo.nodes.push_back(std::move(single));
+#endif
+        return result;
+    }();
+    return cached;
+}
+
+NumaTopology host_numa_topology() {
+    const CachedStaticTopology& base = cached_static_topology();
+    NumaTopology out                 = base.topo;
+#ifdef __linux__
+    if (base.from_sysfs) {
+        const std::filesystem::path node_root = "/sys/devices/system/node";
+        for (auto& info : out.nodes) {
+            parse_node_meminfo(node_root / ("node" + std::to_string(info.node_id)) / "meminfo",
+                               info.total_bytes, info.free_bytes);
+        }
+    } else if (!out.nodes.empty()) {
         const long pages = sysconf(_SC_PHYS_PAGES);
         const long psize = sysconf(_SC_PAGESIZE);
         const long avail = sysconf(_SC_AVPHYS_PAGES);
         if (pages > 0 && psize > 0) {
-            fallback.total_bytes = static_cast<std::uint64_t>(pages) * psize;
+            out.nodes[0].total_bytes = static_cast<std::uint64_t>(pages) * psize;
         }
         if (avail > 0 && psize > 0) {
-            fallback.free_bytes = static_cast<std::uint64_t>(avail) * psize;
-        }
-        fallback.logical_cpus  = mask;
-        fallback.physical_cpus = mask;
-        if (!fallback.logical_cpus.empty() || fallback.total_bytes > 0) {
-            out.nodes.push_back(std::move(fallback));
+            out.nodes[0].free_bytes = static_cast<std::uint64_t>(avail) * psize;
         }
     }
-#else
-    NumaNodeInfo single;
-    single.node_id       = 0;
-    const unsigned count = std::max(1U, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < count; ++i) {
-        single.logical_cpus.push_back(static_cast<int>(i));
-        single.physical_cpus.push_back(static_cast<int>(i));
-    }
-    out.nodes.push_back(std::move(single));
 #endif
     return out;
 }
@@ -389,7 +422,7 @@ bool bind_thread_to_cpu(int cpu_id) noexcept {
 bool bind_thread_to_node(int node_id) noexcept {
     if (node_id < 0) { return false; }
 #ifdef __linux__
-    const NumaTopology topo  = host_numa_topology();
+    const NumaTopology& topo = cached_static_topology().topo;
     const NumaNodeInfo* info = topo.find(node_id);
     if (!info || info->logical_cpus.empty()) { return false; }
     cpu_set_t set;
@@ -469,7 +502,13 @@ bool bind_pinned_shards(void* base, std::size_t size_bytes, std::span<const Host
     if (!base || size_bytes == 0) { return false; }
     bool all_ok = true;
     for (const auto& s : shards) {
-        if (s.numa_node >= 0 && s.bytes > 0 && s.offset < size_bytes) {
+        if (s.bytes == 0) { continue; }
+        if (s.offset >= size_bytes) {
+            all_ok = false;
+            if (failed_nodes && s.numa_node >= 0) { failed_nodes->push_back(s.numa_node); }
+            continue;
+        }
+        if (s.numa_node >= 0) {
             const std::size_t clamped = std::min(s.bytes, size_bytes - s.offset);
             if (!bind_memory_to_node(static_cast<std::byte*>(base) + s.offset, clamped,
                                      s.numa_node, /*move_pages=*/false)) {
@@ -494,20 +533,20 @@ int query_page_numa_node(const void* addr) noexcept {
 #endif
 }
 
+static std::atomic<detail::GetMempolicyHook> g_get_mempolicy_hook{nullptr};
+
 #if defined(__linux__) && defined(__NR_set_mempolicy) && defined(__NR_get_mempolicy)
 // Captures the calling thread's current memory policy so it can be restored when a
 // ScopedThreadMemPolicy scope exits. `get_mempolicy` with a null address returns the thread-wide
 // policy; MPOL_DEFAULT carries no nodemask, and the other modes fill `mask`/`maxnode`.
 static bool capture_thread_mempolicy(int& mode_out, std::vector<unsigned long>& mask_out) noexcept {
-    unsigned long maxnode = 0;
     constexpr std::size_t mask_words = 1024 / (8 * sizeof(unsigned long));
     mask_out.assign(mask_words, 0UL);
-    const long rc = syscall(__NR_get_mempolicy, &mode_out, mask_out.data(), 1024UL + 1UL,
-                            static_cast<void*>(nullptr), 0UL);
-    if (rc != 0) { return false; }
-    maxnode = 1024UL + 1UL;
-    (void)maxnode;
-    return true;
+    const auto hook = g_get_mempolicy_hook.load(std::memory_order_acquire);
+    const long rc   = hook ? hook(&mode_out, mask_out.data(), 1024UL + 1UL)
+                           : syscall(__NR_get_mempolicy, &mode_out, mask_out.data(), 1024UL + 1UL,
+                                     static_cast<void*>(nullptr), 0UL);
+    return rc == 0;
 }
 
 static void restore_thread_mempolicy(int mode, const std::vector<unsigned long>& mask) noexcept {
@@ -549,7 +588,7 @@ ScopedThreadMemPolicy::ScopedThreadMemPolicy(int node_id, NumaPlacement placemen
             active_ = true;
         }
     } else if (placement == NumaPlacement::Interleave) {
-        const auto& topo = host_numa_topology();
+        const NumaTopology& topo = cached_static_topology().topo;
         if (topo.nodes.size() > 1) {
             std::vector<int> ids;
             ids.reserve(topo.nodes.size());
@@ -596,7 +635,15 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
     }
 
     const NumaNodeInfo* gpu_info = (gpu_node >= 0) ? topo.find(gpu_node) : nullptr;
-    if (!gpu_info) { gpu_info = &topo.nodes.front(); }
+    if (!gpu_info) {
+        if (gpu_node >= 0) {
+            std::fprintf(stderr,
+                         "ninfer: plan_host_numa: GPU node %d not found in host topology; falling "
+                         "back to node %d\n",
+                         gpu_node, topo.nodes.front().node_id);
+        }
+        gpu_info = &topo.nodes.front();
+    }
     plan.primary_node = gpu_info->node_id;
 
     const auto headroom_for = [](const NumaNodeInfo& n) -> std::uint64_t {
@@ -657,6 +704,12 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
                 mode = HostNumaMode::Sharded;
             }
         }
+    } else if (policy == NumaPolicy::Sharded || policy == NumaPolicy::Mirror) {
+        std::fprintf(stderr,
+                     "ninfer: NUMA policy %s requested on single-node topology; using isolate on "
+                     "node %d\n",
+                     policy == NumaPolicy::Sharded ? "sharded" : "mirror",
+                     gpu_info->node_id);
     }
     plan.mode = mode;
 
@@ -678,8 +731,11 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         } else if (policy != NumaPolicy::Auto) {
             const std::uint64_t headroom = headroom_for(*gpu_info);
             if (gpu_info->total_bytes > 0 && gpu_info->free_bytes < effective_pinned + headroom) {
+                const char* policy_label = (policy == NumaPolicy::Mirror)    ? "mirror"
+                                           : (policy == NumaPolicy::Sharded) ? "sharded"
+                                                                             : "isolate";
                 throw std::runtime_error(
-                    std::string("NUMA ") + (mode == HostNumaMode::Mirror ? "mirror" : "isolate") +
+                    std::string("NUMA ") + policy_label +
                     ": node " + std::to_string(gpu_info->node_id) + " has only " +
                     std::to_string(gpu_info->free_bytes) + " B free (needs " +
                     std::to_string(effective_pinned + headroom) + " B including headroom)");
@@ -707,10 +763,13 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         const auto& phys      = node_phys(*gpu_info);
         const auto cpus       = node_ordered_cpus(*gpu_info);
         std::uint32_t workers = 0;
-        if (phys.empty()) {
+        if (cpus.empty()) {
             workers = 0;
         } else if (requested_threads > 0) {
-            workers = requested_threads;
+            // Clamp explicit requests to distinct logical CPUs on this node so spinning pools
+            // never oversubscribe a core or duplicate pins onto `service_cpu`.
+            workers = std::min<std::uint32_t>(requested_threads,
+                                              static_cast<std::uint32_t>(cpus.size()));
         } else {
             const std::uint32_t count = static_cast<std::uint32_t>(phys.size());
             workers = std::min(kMaxSocketAutoWorkers,
@@ -724,14 +783,14 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
         // the remaining distinct CPU.
         if (!cpus.empty() && workers > 0) {
             const std::uint32_t bg_needed = workers > 1 ? workers - 1U : 0U;
-            if (cpus.size() >= workers) {
-                for (std::uint32_t i = 0; i < bg_needed; ++i) { np.worker_cpus.push_back(cpus[i]); }
-                plan.service_cpu = cpus[bg_needed];
-            } else {
-                // Fewer logical CPUs than requested threads: wrap cleanly across available slots.
-                plan.service_cpu = cpus.back();
-                for (std::uint32_t i = 0; i < bg_needed; ++i) {
-                    np.worker_cpus.push_back(cpus[i % cpus.size()]);
+            for (std::uint32_t i = 0; i < bg_needed; ++i) { np.worker_cpus.push_back(cpus[i]); }
+            plan.service_cpu = cpus[bg_needed];
+        } else {
+            for (const auto& candidate : topo.nodes) {
+                const auto fallback_cpus = node_ordered_cpus(candidate);
+                if (!fallback_cpus.empty()) {
+                    plan.service_cpu = fallback_cpus.front();
+                    break;
                 }
             }
         }
@@ -784,45 +843,77 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
             plan.node_plans.push_back(std::move(np));
         }
     } else {
+        std::vector<std::vector<int>> ordered_cpus(ordered.size());
+        std::size_t total_cap  = 0;
         std::size_t total_phys = 0;
-        for (const auto* n : ordered) { total_phys += node_phys(*n).size(); }
+        for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
+            ordered_cpus[idx] = node_ordered_cpus(*ordered[idx]);
+            total_cap += ordered_cpus[idx].size();
+            total_phys += node_phys(*ordered[idx]).size();
+        }
+        const std::uint32_t clamped_req =
+            std::min<std::uint32_t>(requested_threads, static_cast<std::uint32_t>(total_cap));
         std::vector<std::uint32_t> counts(ordered.size(), 0);
-        if (total_phys > 0) {
-            std::uint32_t remaining = requested_threads;
+        if (total_cap > 0 && clamped_req > 0) {
+            std::uint32_t remaining = clamped_req;
+            const std::size_t denom = total_phys > 0 ? total_phys : total_cap;
             for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
-                const std::size_t p = node_phys(*ordered[idx]).size();
-                if (p == 0) { continue; }
-                const auto w = static_cast<std::uint32_t>(
-                    (static_cast<std::uint64_t>(requested_threads) * p) / total_phys);
+                const std::size_t cap = ordered_cpus[idx].size();
+                if (cap == 0) { continue; }
+                const std::size_t weight =
+                    total_phys > 0 ? node_phys(*ordered[idx]).size() : cap;
+                const auto w = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    cap, (static_cast<std::uint64_t>(clamped_req) * weight) / denom));
                 counts[idx] = w;
                 remaining -= w;
             }
-            for (std::size_t idx = 0; idx < ordered.size() && remaining > 0; ++idx) {
-                if (node_phys(*ordered[idx]).empty()) { continue; }
-                ++counts[idx];
-                --remaining;
+            bool progressed = true;
+            while (remaining > 0 && progressed) {
+                progressed = false;
+                for (std::size_t idx = 0; idx < ordered.size() && remaining > 0; ++idx) {
+                    if (counts[idx] < ordered_cpus[idx].size()) {
+                        ++counts[idx];
+                        --remaining;
+                        progressed = true;
+                    }
+                }
             }
         }
         for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
-            const auto& n    = *ordered[idx];
-            const auto cpus  = node_ordered_cpus(n);
+            const auto& cpus = ordered_cpus[idx];
             HostNumaNodePlan np;
-            np.node_id        = n.node_id;
+            np.node_id        = ordered[idx]->node_id;
             np.worker_threads = counts[idx];
             if (!cpus.empty() && counts[idx] > 0) {
                 if (idx == 0) {
                     const std::uint32_t bg = counts[idx] > 1 ? counts[idx] - 1U : 0U;
-                    plan.service_cpu = cpus[std::min<std::size_t>(bg, cpus.size() - 1U)];
-                    for (std::uint32_t j = 0; j < bg; ++j) {
-                        np.worker_cpus.push_back(cpus[j % cpus.size()]);
-                    }
+                    plan.service_cpu       = cpus[bg];
+                    for (std::uint32_t j = 0; j < bg; ++j) { np.worker_cpus.push_back(cpus[j]); }
                 } else {
                     for (std::uint32_t j = 0; j < counts[idx]; ++j) {
-                        np.worker_cpus.push_back(cpus[j % cpus.size()]);
+                        np.worker_cpus.push_back(cpus[j]);
                     }
                 }
             }
             plan.node_plans.push_back(std::move(np));
+        }
+    }
+    // If the primary GPU node had empty CPU affinity, place `service_cpu` on a spare CPU from
+    // another node (or its last logical CPU if all CPUs are active) rather than leaving it -1.
+    if (plan.service_cpu < 0) {
+        for (std::size_t idx = 0; idx < ordered.size() && plan.service_cpu < 0; ++idx) {
+            const auto cpus         = node_ordered_cpus(*ordered[idx]);
+            const std::uint32_t w   = plan.node_plans[idx].worker_threads;
+            if (w < cpus.size()) { plan.service_cpu = cpus[w]; }
+        }
+        if (plan.service_cpu < 0) {
+            for (const auto* n : ordered) {
+                const auto cpus = node_ordered_cpus(*n);
+                if (!cpus.empty()) {
+                    plan.service_cpu = cpus.back();
+                    break;
+                }
+            }
         }
     }
 
@@ -913,7 +1004,7 @@ HostNumaPlan plan_host_numa(const NumaTopology& topo, int gpu_node,
 }
 
 std::vector<int> select_worker_cpus(int preferred_node, std::uint32_t requested_threads) {
-    const NumaTopology& topo = host_numa_topology();
+    const NumaTopology& topo = cached_static_topology().topo;
     if (topo.nodes.empty()) { return {}; }
     const NumaNodeInfo* primary = (preferred_node >= 0) ? topo.find(preferred_node) : nullptr;
     if (!primary) { primary = &topo.nodes.front(); }
@@ -930,9 +1021,7 @@ std::vector<int> select_worker_cpus(int preferred_node, std::uint32_t requested_
 
     std::vector<int> cpus;
     if (requested_threads == 0) {
-        const auto& phys =
-            !primary->physical_cpus.empty() ? primary->physical_cpus : primary->logical_cpus;
-        cpus.assign(phys.begin(), phys.end());
+        append_ordered(*primary, cpus);
         return cpus;
     }
     append_ordered(*primary, cpus);
@@ -972,5 +1061,11 @@ std::string format_numa_summary(const NumaTopology& topo) {
     }
     return os.str();
 }
+
+namespace detail {
+void set_get_mempolicy_hook(GetMempolicyHook hook) noexcept {
+    g_get_mempolicy_hook.store(hook, std::memory_order_release);
+}
+} // namespace detail
 
 } // namespace ninfer
