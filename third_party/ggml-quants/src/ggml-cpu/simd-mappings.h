@@ -63,6 +63,9 @@ extern "C" {
         #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) _cvtsh_ss(x)
         #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) _cvtss_sh(x, 0)
     #endif
+    // NInfer: keep 256 KiB LUT for scalar FP16->FP32 (faster than F16C vcvtph2ps on Ivy Bridge due
+    // to GPR->XMM crossing in hot inner loops), while using hardware F16C for FP32->FP16.
+    #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 #elif defined(__POWER9_VECTOR__)
     #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) power_compute_fp16_to_fp32(x)
     #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) power_compute_fp32_to_fp16(x)

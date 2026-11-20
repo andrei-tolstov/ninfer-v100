@@ -76,8 +76,11 @@ struct Bank {
                     if (bits != 2 && scale == 0x8000) { scale = 0; }
                     const std::size_t si = scale_offset + (std::size_t(r) * groups + g) * 2;
                     raw[si] = scale & 255; raw[si + 1] = scale >> 8;
-                    const std::size_t record = panel ? (std::size_t(r / 64) * groups + g) * 64 + r % 64
-                                                     : std::size_t(r) * groups + g;
+                    const std::size_t record =
+                        panel ? (std::size_t(r / kRowSplitPanelRows) * groups + g) *
+                                        kRowSplitPanelRows +
+                                    r % kRowSplitPanelRows
+                              : std::size_t(r) * groups + g;
                     for (int lane = 0; lane < group; ++lane) {
                         unsigned u = random() & ((1u << bits) - 1);
                         if (bits != 2 && scale == 0) { u = 0; }

@@ -5,6 +5,7 @@ add_library(ninfer_core STATIC
   dtype.cpp
   gpu_clock_floor.cpp
   host_worker_pool.cpp
+  numa.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_kv_arena.cpp

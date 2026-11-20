@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/numa.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -200,7 +201,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         }
     }
     if (vision == models::gemma4::VisionPlacement::Host) {
-        instance->cpu_vision = std::make_unique<models::gemma4::CpuVisionTower>(*model);
+        instance->cpu_vision =
+            std::make_unique<models::gemma4::CpuVisionTower>(*model, device.entry().device);
     }
     device.synchronize();
     program.complete();
@@ -218,6 +220,11 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                        executor.sequences, executor.prefill_chunk,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (host_numa_topology().multi_node()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Host NUMA topology: %s",
+                           format_numa_summary(host_numa_topology()).c_str());
+    }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,

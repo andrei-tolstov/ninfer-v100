@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <limits>
@@ -9,6 +10,10 @@
 #include <stdexcept>
 #include <utility>
 #include <string>
+
+#ifdef __linux__
+#    include <sys/mman.h>
+#endif
 
 namespace ninfer {
 namespace {
@@ -46,11 +51,20 @@ void free_device(void*& ptr) noexcept {
     }
 }
 
-void free_pinned(void*& ptr) noexcept {
+void free_pinned_storage(void*& ptr, std::size_t& size_bytes, bool& mmap_backed) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        if (mmap_backed) {
+#ifdef __linux__
+            log_cuda_error("cudaHostUnregister", cudaHostUnregister(ptr));
+            munmap(ptr, size_bytes);
+#endif
+        } else {
+            log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        }
         ptr = nullptr;
     }
+    size_bytes  = 0;
+    mmap_backed = false;
 }
 
 std::atomic<bool> g_wddm_evictable_budget{false};
@@ -398,8 +412,15 @@ ScopedArenaRank::~ScopedArenaRank() noexcept {
     if (arena_.active_rank() != previous_rank_) { arena_.activate_rank(previous_rank_); }
 }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes)
+    : PinnedHostBuffer(size_bytes, kNoNumaNode, NumaPlacement::Default) {}
+
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, int numa_node, NumaPlacement placement) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+
+    // Apply requested NUMA mempolicy around cudaHostAlloc so the driver faults pinned pages onto
+    // the local socket at allocation time; restricted containers without mempolicy fall back cleanly.
+    ScopedThreadMemPolicy mem_policy(numa_node, placement);
 
     // A pending error from an earlier call is returned by whatever runs next, so read and clear it
     // first. Without this, a failure here can be somebody else's error wearing this message.
@@ -457,7 +478,69 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes,
+                                   std::span<const PinnedShardRange> shards) {
+    if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+    std::vector<int> unique_nodes;
+    for (const auto& s : shards) {
+        if (s.numa_node >= 0 &&
+            std::find(unique_nodes.begin(), unique_nodes.end(), s.numa_node) ==
+                unique_nodes.end()) {
+            unique_nodes.push_back(s.numa_node);
+        }
+    }
+    if (unique_nodes.size() <= 1) {
+        *this = PinnedHostBuffer(
+            size_bytes, unique_nodes.empty() ? kNoNumaNode : unique_nodes.front(),
+            unique_nodes.empty() ? NumaPlacement::Default : NumaPlacement::Bind);
+        return;
+    }
+#ifdef __linux__
+    void* mapped = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        throw std::runtime_error("PinnedHostBuffer: mmap failed for sharded allocation of " +
+                                 std::to_string(size_bytes) + " bytes");
+    }
+    std::vector<int> failed_nodes;
+    // Set per-VMA MPOL_BIND before cudaHostRegister faults pages.
+    if (!bind_pinned_shards(mapped, size_bytes, shards, &failed_nodes)) {
+        shard_mbind_failures_ = failed_nodes.size();
+        std::fprintf(stderr,
+                     "ninfer: PinnedHostBuffer: mbind failed for %zu sharded region(s); node(s):",
+                     failed_nodes.size());
+        for (const int n : failed_nodes) { std::fprintf(stderr, " %d", n); }
+        std::fprintf(stderr, "\n");
+    }
+    const cudaError_t pending = cudaGetLastError();
+    const cudaError_t reg_err =
+        cudaHostRegister(mapped, size_bytes, cudaHostRegisterPortable);
+    if (reg_err == cudaSuccess) {
+        if (pending != cudaSuccess) {
+            std::fprintf(stderr,
+                         "ninfer: pinning %zu bytes of sharded host memory succeeded, but cleared an "
+                         "unretrieved earlier CUDA error: %s: %s\n",
+                         size_bytes, cudaGetErrorName(pending), cudaGetErrorString(pending));
+        }
+        data_        = mapped;
+        size_        = size_bytes;
+        mmap_backed_ = true;
+        return;
+    }
+    munmap(mapped, size_bytes);
+    std::string prefix = "cudaHostRegister failed for sharded PinnedHostBuffer";
+    if (pending != cudaSuccess) {
+        prefix += ", after an unretrieved earlier error (";
+        prefix += cudaGetErrorName(pending);
+        prefix += ")";
+    }
+    throw std::runtime_error(cuda_error_message(prefix.c_str(), reg_err));
+#else
+    *this = PinnedHostBuffer(size_bytes, kNoNumaNode, NumaPlacement::Interleave);
+#endif
+}
+
+PinnedHostBuffer::~PinnedHostBuffer() { free_pinned_storage(data_, size_, mmap_backed_); }
 
 HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes) {
     if (!data || !bytes) { throw std::invalid_argument("host registration needs a nonempty allocation"); }
@@ -472,20 +555,27 @@ HostMemoryRegistration::~HostMemoryRegistration() {
 }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
-    other.data_ = nullptr;
-    other.size_ = 0;
+    : data_(other.data_), size_(other.size_), mmap_backed_(other.mmap_backed_),
+      shard_mbind_failures_(other.shard_mbind_failures_) {
+    other.data_                 = nullptr;
+    other.size_                 = 0;
+    other.mmap_backed_          = false;
+    other.shard_mbind_failures_ = 0;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_pinned(data_);
-    data_ = other.data_;
-    size_ = other.size_;
+    free_pinned_storage(data_, size_, mmap_backed_);
+    data_                 = other.data_;
+    size_                 = other.size_;
+    mmap_backed_          = other.mmap_backed_;
+    shard_mbind_failures_ = other.shard_mbind_failures_;
 
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_                 = nullptr;
+    other.size_                 = 0;
+    other.mmap_backed_          = false;
+    other.shard_mbind_failures_ = 0;
     return *this;
 }
 

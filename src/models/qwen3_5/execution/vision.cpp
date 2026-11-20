@@ -484,7 +484,8 @@ VisionPrefillSession::VisionPrefillSession(
     : device_(device), parameters_(parameters), workspace_{}, workspace_plan_(cpu_plan),
       prompt_(prompt), plan_(plan), handoff_peak_bytes_(handoff_peak_bytes),
       bridge_staging_(bridge_staging) {
-    cpu_ = std::make_unique<CpuVisionSession>(parameters.model.cpu_vision());
+    cpu_ = std::make_unique<CpuVisionSession>(parameters.model.cpu_vision(),
+                                              device_.entry().device);
     const std::size_t column_bytes = static_cast<std::size_t>(cpu_plan.output_hidden) * 2;
     if (bridge_staging_.data == nullptr || bridge_staging_.bytes < column_bytes) {
         throw std::invalid_argument("CPU Vision bridge staging is too small");

@@ -61,8 +61,11 @@ Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or veri
 routed experts that the device cache lacks, CPU threads may compute a share from the host copy
 while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share
 the engine chooses from measured CPU and bus speeds; develop it where measurements show a gain.
-The CPU's GGUF expert products reproduce the GPU's decode products bit for bit
-(`gguf_expert_cpu`); a change to either side keeps them equal.
+With `--expert-cpu-arithmetic exact` (the default), the CPU's GGUF expert products reproduce
+the GPU's decode products bit for bit (`gguf_expert_cpu`); a change to either side keeps them
+equal. With `--expert-cpu-arithmetic ggml` (`gguf_expert_cpu_ggml`), supported
+i-quant/`Q8_0`/`IQ4_NL` projections use vendored ggml vecdot kernels (`Q8_K`/`Q8_0` activations and
+non-FMA fast SwiGLU) as a faster non-bit-identical approximation.
 Develop the existing GGUF host-RAM and disk-streaming paths;
 reuse published weights and the published IQ4 table when adding MTP. Disk residency uses the OS
 page cache. An additional application-managed RAM cache of experts is excluded from this delivery

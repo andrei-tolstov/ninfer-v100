@@ -1,11 +1,13 @@
 #pragma once
 
 #include "core/dtype.h"
+#include "core/numa.h"
 #include "core/tensor.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <vector>
 
 namespace ninfer {
@@ -140,9 +142,18 @@ private:
     std::size_t active_rank_ = 0;
 };
 
+using PinnedShardRange = HostNumaShard;
+
+// Page-locked host buffer allocated outside any VRAM budget, kept aligned and portable across CUDA
+// contexts. On Linux multi-socket NUMA systems, optional overloads bind pages at allocation time
+// (`ScopedThreadMemPolicy` around `cudaHostAlloc`, or per-shard `mmap` + `mbind` + `cudaHostRegister`)
+// so GPU DMA and local CPU threads stay off QPI/UPI links.
 class PinnedHostBuffer {
 public:
     explicit PinnedHostBuffer(std::size_t size_bytes);
+    PinnedHostBuffer(std::size_t size_bytes, int numa_node,
+                     NumaPlacement placement = NumaPlacement::Bind);
+    PinnedHostBuffer(std::size_t size_bytes, std::span<const PinnedShardRange> shards);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
@@ -152,10 +163,13 @@ public:
 
     void* data() const noexcept;
     std::size_t size() const noexcept;
+    [[nodiscard]] std::size_t shard_mbind_failures() const noexcept { return shard_mbind_failures_; }
 
 private:
-    void* data_       = nullptr;
-    std::size_t size_ = 0;
+    void* data_                       = nullptr;
+    std::size_t size_                 = 0;
+    bool mmap_backed_                 = false;
+    std::size_t shard_mbind_failures_ = 0;
 };
 
 // Registers an existing host allocation without moving its bytes. The allocation must outlive

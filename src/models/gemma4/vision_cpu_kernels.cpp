@@ -73,6 +73,44 @@ void geglu(const float* gate, const float* up, float* out, std::size_t count) {
     }
 }
 
+void pack_panel(const float* x, std::size_t x_stride, int k, int token, int width, float* panel) {
+    pack(x, x_stride, k, token, width, panel);
+}
+
+void gemm_packed(const float* w, std::size_t w_stride, int n, int k, const float* packed,
+                 int tokens, float* y, std::size_t y_stride) {
+    for (int token = 0, p = 0; token < tokens; token += kTileTokens, ++p) {
+        const int width    = std::min(kTileTokens, tokens - token);
+        const float* panel = packed + std::size_t(p) * k * kTileTokens;
+        for (int row = 0; row < n; row += kTileRows) {
+            const int rows = std::min(kTileRows, n - row);
+            float acc[kTileRows][kTileTokens] = {};
+            for (int inner = 0; inner < k; ++inner) {
+                const float* xs = panel + std::size_t(inner) * kTileTokens;
+                for (int r = 0; r < rows; ++r) {
+                    const float weight = w[std::size_t(row + r) * w_stride + inner];
+                    for (int t = 0; t < kTileTokens; ++t) { acc[r][t] += weight * xs[t]; }
+                }
+            }
+            for (int r = 0; r < rows; ++r) {
+                std::copy_n(acc[r], width, y + std::size_t(row + r) * y_stride + token);
+            }
+        }
+    }
+}
+
+void rms_accum_sq(const float* row, int count, double* sums) {
+    for (int t = 0; t < count; ++t) { sums[t] += double(row[t]) * row[t]; }
+}
+
+void scale_mul_row(const float* in, const float* scale, float gamma, int count, float* out) {
+    for (int t = 0; t < count; ++t) { out[t] = in[t] * scale[t] * gamma; }
+}
+
+void add_scaled_row(const float* in, const float* scale, float gamma, int count, float* inout) {
+    for (int t = 0; t < count; ++t) { inout[t] += in[t] * scale[t] * gamma; }
+}
+
 bool avx2_fma() noexcept {
 #if defined(NINFER_VISION_CPU_X86)
 #    if defined(_MSC_VER)
@@ -95,16 +133,39 @@ bool avx2_fma() noexcept {
 #endif
 }
 
+bool avx_supported() noexcept {
+#if defined(NINFER_VISION_CPU_X86)
+#    if defined(_MSC_VER)
+    int basic[4];
+    __cpuid(basic, 0);
+    if (basic[0] < 1) { return false; }
+    __cpuid(basic, 1);
+    if ((basic[2] & (1 << 27)) == 0 || (basic[2] & (1 << 28)) == 0 || (_xgetbv(0) & 6) != 6) {
+        return false;
+    }
+    return true;
+#    else
+    return __builtin_cpu_supports("avx");
+#    endif
+#else
+    return false;
+#endif
+}
+
 } // namespace
 
 const Kernels& portable_kernels() noexcept {
-    static const Kernels kernels{gemm, softmax_columns, geglu, "portable"};
+    static const Kernels kernels{gemm,        softmax_columns, geglu,         pack_panel,
+                                 gemm_packed, rms_accum_sq,    scale_mul_row, add_scaled_row,
+                                 "portable"};
     return kernels;
 }
 
 const Kernels& kernels() noexcept {
 #if defined(NINFER_VISION_CPU_X86)
-    static const Kernels& chosen = avx2_fma() ? avx2_kernels() : portable_kernels();
+    static const Kernels& chosen = avx2_fma() ? avx2_kernels() :
+                                   avx_supported() ? avx_kernels() :
+                                   portable_kernels();
     return chosen;
 #else
     return portable_kernels();

@@ -132,10 +132,12 @@ HBM. That is the structure's floor, not the card's ceiling.
 ### CPU arithmetic for the host experts, one V100
 
 The host experts the CPU computes (the `--expert-dma-share` share of a call's missing experts)
-run on the exact q8_1 products (the default, bit for bit with the GPU) or on ggml-cpu's AVX2
-vecdot kernels (`--expert-cpu-arithmetic ggml`), which quantize the activation to q8_K for the
-i-quant gate/up and to q8_0 for the IQ4_NL and Q8_0 down; a projection ggml-cpu does not cover
-(GSQ-RCO's Q2_0) keeps the exact products, so both modes run the same artifact.
+run on the exact q8_1 products (the default, bit for bit with the GPU, dispatched to AVX2+FMA+F16C
+or AVX+F16C+SSSE3+SSE4.1 where available) or on ggml-cpu's vecdot kernels (`--expert-cpu-arithmetic ggml`,
+compiled for AVX2+FMA+F16C by default or AVX+F16C+SSSE3+SSE4.1 when configured with `-DNINFER_GGML_CPU_AVX2=OFF`),
+which quantize the activation to q8_K for the i-quant gate/up and to q8_0 for the IQ4_NL and Q8_0
+down; a projection ggml-cpu does not cover (GSQ-RCO's Q2_0) keeps the exact products, so both modes
+run the same artifact.
 
 Tesla V100-PCIE-32GB, the IQ3_S release, host experts, an 8,192-position context, INT8 KV, MTP
 with three drafts, a 512-token prompt and 128 generated tokens of a 7,051-token code corpus,
@@ -165,6 +167,70 @@ costs about 35%, because the CPU's i-quant vecdot products run at a few GB/s of 
 (compute-bound on this Xeon, ~0.6-2 GB/s effective), far slower than the 13 GB/s bus they replace,
 so the round ends up waiting on the CPU. **The all-GPU miss path (`--expert-dma-share 1`) is the
 fastest configuration on this host.**
+
+On an AVX-only Xeon E5-2650 v2 host (8 physical cores / 16 threads, AVX 1.0 + F16C + SSSE3 + SSE4.1,
+without AVX2/FMA) with `NINFER_GGML_CPU_AVX2=OFF` (using the persistent worker pool in
+`ninfer_gguf_expert_cpu_bench`), the exact q8_1 (`Avx`) and `ggml` kernels measured on
+`640x2560` projections (`iters=15`):
+
+- `IQ3_S`: `Avx` `0.5754 ms` (`19.75x`) at `T=1 thr=1` -> `0.0743 ms` (`15.38x` vs scalar) at
+  `thr=8`, and `1.3649 -> 0.1760 ms` (`18.68x`) at `T=8`; `ggml` (with AVX1 `quantize_row_q8_K`,
+  direct BF16->q8_K and batched `*_rows`) measured `0.5039 -> 0.0696 ms` (`T=1`, `22.56x / 16.41x`)
+  and `1.1047 -> 0.1547 ms` (`T=8`, `23.80x / 21.25x`).
+- `IQ4_NL`: `Avx` with precomputed abs-LUT and `T==1` streaming measured `0.2172 -> 0.0288 ms` at
+  `T=1` and `1.0915 -> 0.1462 ms` (`18.91x`) at `T=8 thr=8`, faster than `ggml` (`0.0339 / 0.1576 ms`)
+  at 8 threads.
+- `Q8_0`: `Avx` measured `0.1787 -> 0.0240 ms` (`T=1`) and `1.0688 -> 0.1425 ms` (`T=8`).
+- `IQ2_S`: `Avx` with register IEEE-754 `fma8` measured `0.4681 -> 0.0613 ms` (`T=1`) and
+  `2.1237 -> 0.2843 ms` (`22.79x`) at `T=8`, while batched multi-token `ggml` (`*_rows`) reached
+  `1.0190 -> 0.1448 ms` (`50.43x / 44.74x`).
+- `Q2_0`: `Avx` measured `0.2748 -> 0.0357 ms` (`T=1`, `26.71x` at `thr=8`).
+- `SwiGLU n=5120`: `swiglu_avx` measured `0.0963 ms` (`32.45x` vs `3.1254 ms` scalar).
+- With the persistent barrier pool removing per-iteration `std::thread` creation overhead, `8`
+  workers (1 per physical core) beat `6` across exact formats (`~25%` lower latency) and most multi-token
+  `ggml` cases, while the engine default remains `6` to avoid SMT contention alongside GPU serving.
+
+Additional AVX 1.0 (`no AVX2/FMA`) CPU paths measured on the same E5-2650 v2 host:
+`moe_expert_cpu` (`Q4_G64 a8=1 T=1`) improved from `9.3887 ms` to `0.7026 ms` (`13.06x` vs scalar),
+Gemma 4 CPU vision `6x16` `gemm` reached `17.56 ms` (`1152x1152x256`, `16.26x` vs portable) and
+`67.51 ms` (`4320x1152x256`, `15.91x`), and Qwen3.5 CPU vision (2 layers, 256 patches) dropped
+from `4100.95 -> 606.82 ms` (`6.76x`, 1 thread) and `242.62 -> 94.46 ms` (`2.57x`, 8 threads).
+
+Prior to the post-`e2dc1705` AVX-1.0 passes above, on
+the same host with 31 GiB RAM (insufficient for the 54.2 GiB IQ3_S artifact in pinned host RAM) and
+one Tesla V100-PCIE-32GB in `--expert-residency disk` (`rk4v4` KV, 18,432 MiB expert cache,
+`--prefill-chunk 2048`), `ninfer_bench` measured `53.11` (`pp512`), `118.74` (`pp2048`), and
+`19.89` tok/s (`tg128`, `spec=none`), versus `11.32` tok/s with cold `spec=mtp --draft-tokens 3`
+(`56.7%` acceptance, where 3-draft verification stresses uncached disk misses under 31 GiB host RAM).
+On build `092383bc` in `--expert-residency disk` (`ExpertStream`, which does not invoke CPU expert
+computation so `expert_cpu_routes = 0` regardless of `--expert-dma-share`), `ninfer_bench` on the
+same 48-layer IQ3_S artifact measured `pp512 = 58.21 tok/s` (`spec=none`, warm page cache) and
+`tg128 = 21.16 ± 0.09 tok/s` (`85.5%` cache hit rate, `spec=none`), or `pp512 = 52.54 ± 0.12 tok/s`
+and `tg128 = 14.33 ± 0.11 tok/s` with `spec=mtp --draft-tokens 3` (`56.7%` acceptance, `2.70`
+tokens/round, `52.6%` hit rate on `bench_corpus.ids`).
+
+To measure the actual `ExpertMisses` GPU+CPU hybrid path (`--expert-residency host`) on this 31 GiB
+RAM / E5-2650 v2 / V100 host, an 8-layer real-weight qualification slice (`layers 0..7` copied
+verbatim from the IQ3_S artifact: `11.41 GiB`, containing `gguf_iq2_s`, `gguf_iq3_xxs`,
+`gguf_iq4_nl` and `gguf_q2_0` experts plus PLE/MTP, `rk4v4` KV, `bench_corpus.ids`, `tg128`, 3 reps
++ 1 warmup) was benchmarked across cache sizes, `--expert-dma-share` splits and thread counts.
+Under `--greedy`, `exact` matched GPU-only (`--expert-dma-share 1`) token-for-token with both
+`spec=none` (`30.9%` CPU routes) and `spec=mtp --draft-tokens 3` (`25.5%` CPU routes):
+
+| Regime (`8L host slice`) | GPU-only (`share=1`) | `exact auto 6t / 8t` | `exact 0.5 8t` | `ggml auto 6t / 8t` | `ggml 0.5 8t` | `exact / ggml 0.0 8t` |
+|---|---:|---:|---:|---:|---:|---:|
+| `cache=512 MiB`, `spec=none` (~49% hits) | `80.13 ± 1.17` | `86.19` / `89.35` (**+11.5%**) | `88.65` (+10.6%) | `90.67` / `97.80` (+22.1%) | **`99.31 ± 0.73`** (**+23.9%**) | `56.36` / `67.95` |
+| `cache=512 MiB`, `mtp 3` (~38% hits, 4-tok verify stress) | `23.20 ± 0.12` | `26.70` / `28.63` (+23.4%) | `28.80` (`0.7`: `29.10`, **+25.4%**) | `28.38` / **`30.28 ± 0.17`** (**+30.5%**) | `30.23` (+30.3%) | — |
+| `cache=2048 MiB`, `spec=none` (~86% hits) | `155.78 ± 1.79` | — / `156.61` | — | — / `157.58` (`0.7`: **`157.60`**) | — | — |
+| `cache=2048 MiB`, `mtp 3` (~75% hits, 4-tok verify stress) | `39.52 ± 0.20` | — / `44.58` (**+12.8%**) | — | — / **`46.80 ± 0.78`** (**+18.4%**) | (`0.7`: `45.11`) | — |
+
+In all miss-bound cases on this AVX-1.0 CPU + PCIe 3.0 V100 system, `auto` overlaps the CPU share
+with PCIe transfers cleanly (`dma`: `76.04 -> 29.95 GiB` for `ggml auto 8t`, `235.34 -> 120.55 GiB`
+under `mtp 3`), `8` worker threads beat `6` end-to-end (`+3.7%` to `+7.9%`), and `ggml` adds up to
+`+11%` over `exact`; on the partial 8L slice `mtp 3` acceptance is near zero (`0.0-0.4%`), so those
+rows specifically measure 4-token verification miss batching. When 100% of misses are forced onto
+the CPU (`--expert-dma-share 0`), both `exact` (`56.36 tok/s`) and `ggml` (`67.95 tok/s`) fall below
+GPU-only (`80.13 tok/s`), confirming PCIe+CPU co-execution is required rather than pure CPU misses.
 
 Making the CPU skip the device cache (a CPU-computed expert is no longer re-copied into a slot)
 removes its bytes from the bus — a 50% share cuts the round's host-to-device expert traffic

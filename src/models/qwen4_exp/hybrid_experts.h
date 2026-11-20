@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/numa.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/expert_profile.h"
 #include "ninfer/ops/moe_expert_cpu.h"
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,7 +33,8 @@ public:
                   std::uint32_t token_capacity, std::uint64_t cache_bytes,
                   HybridExpertOptions options,
                   // Internal injection point for a delayed-worker cancellation check.
-                  std::function<void()> before_cpu = {});
+                  std::function<void()> before_cpu = {},
+                  std::optional<HostNumaPlan> numa_plan = std::nullopt);
     ~HybridExperts();
     HybridExperts(const HybridExperts&) = delete;
     HybridExperts& operator=(const HybridExperts&) = delete;

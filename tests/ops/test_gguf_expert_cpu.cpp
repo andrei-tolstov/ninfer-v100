@@ -177,18 +177,23 @@ Matrix make(QType format, int rows, int k, std::mt19937& rng) {
     if (format != QType::GGUF_Q2_0 && format != QType::GGUF_Q8_0) {
         // Every byte pattern is a valid i-quant or IQ4_NL block; d is set to a sensible size.
         const auto [group, block] = gguf_block_shape(format);
-        Matrix m{format, rows, k, std::int64_t(k / group) * block, {}, {}};
+        const int blocks          = (k + group - 1) / group;
+        Matrix m{format, rows, k, std::int64_t(blocks) * block, {}, {}};
         m.bytes.resize(std::size_t(rows) * m.row_bytes);
         for (auto& byte : m.bytes) { byte = static_cast<std::uint8_t>(rng()); }
         std::uniform_real_distribution<float> scale(0.0005F, 0.004F);
         m.values.resize(std::size_t(rows) * k);
+        std::vector<double> tmp(static_cast<std::size_t>(group));
         for (int r = 0; r < rows; ++r) {
-            for (int b = 0; b < k / group; ++b) {
+            for (int b = 0; b < blocks; ++b) {
                 std::uint8_t* p = m.bytes.data() + std::size_t(r) * m.row_bytes + std::size_t(b) * block;
                 const auto d    = half_bits(scale(rng));
                 const std::uint16_t signed_d = (rng() % 4 == 0) ? std::uint16_t(d | 0x8000) : d;
                 std::memcpy(p, &signed_d, 2);
-                reference_block(format, p, m.values.data() + std::size_t(r) * k + std::size_t(b) * group);
+                reference_block(format, p, tmp.data());
+                const int take = std::min(group, k - b * group);
+                std::copy_n(tmp.data(), take,
+                            m.values.data() + std::size_t(r) * k + std::size_t(b) * group);
             }
         }
         return m;
@@ -270,24 +275,41 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
             magnitude[std::size_t(t) * m.rows + r] = size;
         }
     }
-    GgufCpuActivation a(16, m.k);
+    // Allocate exact token capacity so ASan traps any OOB read past the last token's codes/scales,
+    // plus a second buffer whose trailing capacity slot is pre-poisoned with +Inf scales.
+    GgufCpuActivation a(tokens, m.k);
     a.prepare_bf16(m.format, x.data(), m.k, tokens);
+    GgufCpuActivation poisoned(tokens + 1, m.k);
+    {
+        std::vector<std::uint16_t> max_finite(std::size_t(tokens + 1) * m.k, 0x7F7F);
+        poisoned.prepare_bf16(m.format, max_finite.data(), m.k, tokens + 1);
+        poisoned.prepare_bf16(m.format, x.data(), m.k, tokens);
+    }
     const GgufCpuMatrix w{m.format, m.bytes.data(), m.row_bytes, m.rows, m.k};
     std::vector<float> scalar(oracle.size());
     gguf_cpu_rows(w, a, 0, m.rows, scalar.data(), m.rows, GgufCpuBackend::Scalar);
-    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx2}) {
-        if (!gguf_cpu_backend_available(backend)) { continue; }
-        std::vector<float> y(oracle.size()), again(oracle.size());
+    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
+        if (!gguf_cpu_backend_available(backend)) {
+#if defined(NINFER_CPU_EXPERT_X86)
+            require(backend != GgufCpuBackend::Avx,
+                    "x86_64 runner must support GgufCpuBackend::Avx");
+#endif
+            continue;
+        }
+        std::vector<float> y(oracle.size()), again(oracle.size()), y_poison(oracle.size());
         // Two row ranges, as workers split them.
         gguf_cpu_rows(w, a, 0, m.rows / 3, y.data(), m.rows, backend);
         gguf_cpu_rows(w, a, m.rows / 3, m.rows, y.data(), m.rows, backend);
         gguf_cpu_rows(w, a, 0, m.rows, again.data(), m.rows, backend);
+        gguf_cpu_rows(w, poisoned, 0, m.rows, y_poison.data(), m.rows, backend);
         double error = 0, norm = 0, peak = 0, worst = 0, q8_drift = 0;
         for (std::size_t i = 0; i < y.size(); ++i) {
             q8_drift = std::max(q8_drift, std::abs(double(y[i]) - q8[i]) / (magnitude[i] + 1e-30));
             require(std::isfinite(y[i]), "nonfinite output");
             require(std::bit_cast<std::uint32_t>(y[i]) == std::bit_cast<std::uint32_t>(again[i]),
                     "a row split changed the result or a repeat differed");
+            require(std::bit_cast<std::uint32_t>(y[i]) == std::bit_cast<std::uint32_t>(y_poison[i]),
+                    "poisoned trailing activation capacity changed the result");
             require(std::bit_cast<std::uint32_t>(y[i]) == std::bit_cast<std::uint32_t>(scalar[i]),
                     "a vector backend's bits differ from the scalar products'");
             error += (double(y[i]) - oracle[i]) * (double(y[i]) - oracle[i]);
@@ -348,12 +370,210 @@ void check_silu(std::mt19937& rng) {
         const double step  = std::ldexp(1.0, std::ilogb(std::max(std::abs(exact), 1e-38)) - 7);
         require(std::abs(got - exact) <= step, "the BF16 middle strays from FP64");
     }
-    for (const auto backend : {GgufCpuBackend::Avx2}) {
-        if (!gguf_cpu_backend_available(backend)) { continue; }
+    for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
+        if (!gguf_cpu_backend_available(backend)) {
+#if defined(NINFER_CPU_EXPERT_X86)
+            require(backend != GgufCpuBackend::Avx,
+                    "x86_64 runner must support GgufCpuBackend::Avx");
+#endif
+            continue;
+        }
         std::vector<std::uint16_t> y(gate.size());
         gguf_cpu_swiglu_bf16(gate.data(), up.data(), gate.size(), y.data(), backend);
         require(y == scalar, "a vector backend's BF16 middle differs from the scalar one");
         std::cout << gguf_cpu_backend_name(backend) << " middle: " << y.size() << " words equal\n";
+    }
+}
+
+void check_fma_avx([[maybe_unused]] std::mt19937& rng) {
+#if defined(__x86_64__) || defined(_M_X64)
+#    if defined(NINFER_CPU_EXPERT_X86)
+    require(gguf_cpu_backend_available(GgufCpuBackend::Avx),
+            "x86_64 runner must support GgufCpuBackend::Avx");
+#    else
+    if (!gguf_cpu_backend_available(GgufCpuBackend::Avx)) { return; }
+#    endif
+    std::vector<float> a, b, c;
+    auto push = [&](float x, float y, float z) {
+        a.push_back(x);
+        b.push_back(y);
+        c.push_back(z);
+    };
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float sub = std::ldexp(3.0F, -149);
+    // Exact zeros, infinities, NaNs, subnormals and exact cancellations.
+    push(0.0F, 0.0F, -0.0F);
+    push(-0.0F, 0.0F, -0.0F);
+    push(1.0F, -0.0F, 0.0F);
+    push(-1.0F, 0.0F, -0.0F);
+    push(inf, 0.0F, 1.0F);
+    push(2e38F, 2e38F, -inf);
+    push(1e38F, 1e38F, -1e38F);
+    push(nan, 1.0F, 2.0F);
+    push(sub, 0.5F, std::ldexp(1.0F, -148));
+    push(1.25F, -1.25F, 1.5625F);
+    // Midpoint / double-rounding edge cases: construct c so double(a)*double(b)+double(c) lands
+    // near or exactly on the midpoint between two adjacent float values.
+    std::uniform_real_distribution<float> base(0.5F, 4.0F);
+    for (int i = 0; i < 4096; ++i) {
+        const float x   = base(rng) * ((i & 1) ? -1.0F : 1.0F);
+        const float y   = std::ldexp(base(rng), -24);
+        const float hi  = std::nextafter(x, (x >= 0.0F) ? inf : -inf);
+        const double mid = 0.5 * (double(x) + double(hi));
+        const double gap = mid - double(x) * double(y);
+        const float z0  = static_cast<float>(gap);
+        for (int delta = -2; delta <= 2; ++delta) {
+            float z = z0;
+            if (delta < 0) {
+                for (int k = 0; k < -delta; ++k) { z = std::nextafter(z, -inf); }
+            } else {
+                for (int k = 0; k < delta; ++k) { z = std::nextafter(z, inf); }
+            }
+            push(x, y, z);
+        }
+    }
+    // 1,000,000 random triples across exponent gaps (plus odd tail length % 8 != 0).
+    std::uniform_int_distribution<int> exp_dist(-40, 20);
+    std::uniform_real_distribution<float> mant(-2.0F, 2.0F);
+    for (int i = 0; i < 1000003; ++i) {
+        push(std::ldexp(mant(rng), exp_dist(rng)), std::ldexp(mant(rng), exp_dist(rng)),
+             std::ldexp(mant(rng), exp_dist(rng)));
+    }
+    std::vector<float> got(a.size());
+    gguf_cpu_detail::fma_avx(a.data(), b.data(), c.data(), got.data(), a.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float expected = std::fma(a[i], b[i], c[i]);
+        if (std::isnan(expected)) {
+            require(std::isnan(got[i]), "fma_avx failed to preserve NaN");
+            continue;
+        }
+        require(std::bit_cast<std::uint32_t>(got[i]) == std::bit_cast<std::uint32_t>(expected),
+                "fma_avx bit mismatch vs std::fma");
+    }
+    std::cout << "fma_avx: " << a.size() << " cases match std::fma bitwise\n";
+#endif
+}
+
+void check_unavailable_backend(const Matrix& m) {
+    GgufCpuActivation a(1, m.k);
+    std::vector<std::uint16_t> x(std::size_t(m.k), 0);
+    a.prepare_bf16(m.format, x.data(), m.k, 1);
+    const GgufCpuMatrix w{m.format, m.bytes.data(), m.row_bytes, m.rows, m.k};
+    std::vector<float> y(std::size_t(m.rows), 0.0F);
+    std::vector<float> gate(32, 0.0F), up(32, 0.0F);
+    std::vector<std::uint16_t> mid(32, 0);
+    for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
+        if (gguf_cpu_backend_available(backend)) { continue; }
+        bool rows_refused = false;
+        try {
+            gguf_cpu_rows(w, a, 0, m.rows, y.data(), m.rows, backend);
+        } catch (const std::invalid_argument&) { rows_refused = true; }
+        require(rows_refused, "gguf_cpu_rows accepted an unsupported CPU backend");
+        bool swiglu_refused = false;
+        try {
+            gguf_cpu_swiglu_bf16(gate.data(), up.data(), gate.size(), mid.data(), backend);
+        } catch (const std::invalid_argument&) { swiglu_refused = true; }
+        require(swiglu_refused, "gguf_cpu_swiglu_bf16 accepted an unsupported CPU backend");
+    }
+}
+
+void check_activation_ties() {
+    // T-05: BF16 row with amax = 127 and exact ties (+/-0.5, +/-1.5, +/-63.5), +/-127, 0, -0.0,
+    // and subnormals must match scalar round-half-away-from-zero (std::round) in prepare_bf16_avx.
+    std::vector<std::uint16_t> row(64, 0);
+    row[0]  = bf16(127.0F);
+    row[1]  = bf16(0.5F);
+    row[2]  = bf16(-0.5F);
+    row[3]  = bf16(1.5F);
+    row[4]  = bf16(-1.5F);
+    row[5]  = bf16(63.5F);
+    row[6]  = bf16(-63.5F);
+    row[7]  = bf16(-127.0F);
+    row[8]  = 0x0000U; // +0.0
+    row[9]  = 0x8000U; // -0.0
+    row[10] = 0x0001U; // +subnormal
+    row[11] = 0x8001U; // -subnormal
+    // Second 32-element block: subnormal-only block (d < 2^-130, scale rounds to 0 in fp16).
+    row[32] = 0x0001U;
+    row[33] = 0x8001U;
+
+    // Scalar oracle (Q2_0 goes through GgufCpuActivation::quantize scalar path).
+    GgufCpuActivation scalar_act(1, 64);
+    scalar_act.prepare_bf16(QType::GGUF_Q2_0, row.data(), 64, 1);
+
+    std::vector<std::int8_t> expected_codes(64);
+    std::vector<float> expected_scales(2);
+    std::vector<std::int32_t> expected_sums(2, 0);
+    for (int g = 0; g < 2; ++g) {
+        float amax = 0.0F;
+        for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::abs(std::bit_cast<float>(std::uint32_t(row[32 * g + i]) << 16)));
+        }
+        const float d     = amax / 127.0F;
+        expected_scales[g] = static_cast<float>(nearest_half(d));
+        for (int i = 0; i < 32; ++i) {
+            const float v = std::bit_cast<float>(std::uint32_t(row[32 * g + i]) << 16);
+            const auto c  = amax == 0.0F ? std::int8_t(0) : static_cast<std::int8_t>(std::round(v / d));
+            expected_codes[32 * g + i] = c;
+            expected_sums[g] += c;
+        }
+    }
+    for (int g = 0; g < 2; ++g) {
+        require(scalar_act.scales(0)[g] == expected_scales[g], "scalar tie scale mismatch");
+        require(scalar_act.sums(0)[g] == expected_sums[g], "scalar tie sum mismatch");
+    }
+
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (gguf_cpu_backend_available(GgufCpuBackend::Avx)) {
+        std::vector<std::int8_t> avx_codes(64);
+        std::vector<float> avx_scales(2);
+        std::vector<std::int32_t> avx_sums(2);
+        gguf_cpu_detail::prepare_bf16_avx(QType::GGUF_Q8_0, row.data(), 64, 1, 64,
+                                          avx_codes.data(), avx_scales.data(), avx_sums.data());
+        require(avx_codes == expected_codes, "prepare_bf16_avx codes disagree on .5 ties");
+        require(avx_scales == expected_scales, "prepare_bf16_avx scales disagree");
+        require(avx_sums == expected_sums, "prepare_bf16_avx sums disagree");
+    }
+#endif
+}
+
+void check_swiglu_fast(std::mt19937& rng) {
+    // P1-10 + N9: gguf_cpu_swiglu_bf16_fast must handle edge/extreme finite inputs accurately vs
+    // FP64, match across Scalar/Avx/Avx2, and honor GgufCpuBackend::Scalar.
+    const std::vector<float> edge_gates = {
+        0.0F,    -0.0F,  1e-30F, -1e-30F, 1e-3F, -1e-3F, 0.5F,   -0.5F,
+        1.0F,    -1.0F,  10.0F,  -10.0F,  20.0F, -20.0F, 87.0F,  -87.0F,
+        88.0F,   -88.0F, 100.0F, -100.0F, 3e38F, -3e38F};
+    std::normal_distribution<float> dist(0.0F, 3.0F);
+    std::vector<float> gate(1027), up(1027);
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+        gate[i] = (i < edge_gates.size()) ? edge_gates[i] : dist(rng);
+        up[i]   = (i < edge_gates.size()) ? ((i % 2 == 0) ? 1.0F : -1.5F) : dist(rng);
+    }
+    std::vector<std::uint16_t> scalar_out(gate.size());
+    gguf_cpu_swiglu_bf16_fast(gate.data(), up.data(), gate.size(), scalar_out.data(),
+                              GgufCpuBackend::Scalar);
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+        if (std::abs(gate[i]) >= 88.0F) { continue; }
+        const double exact = silu64(double(gate[i])) * double(up[i]);
+        const double got   = double(std::bit_cast<float>(std::uint32_t(scalar_out[i]) << 16));
+        const double step  = std::ldexp(1.0, std::ilogb(std::max(std::abs(exact), 1e-38)) - 7);
+        require(std::isfinite(got) && std::abs(got - exact) <= 2.0 * step + 1e-37,
+                "gguf_cpu_swiglu_bf16_fast scalar strayed from FP64 oracle");
+    }
+    for (const auto backend : {GgufCpuBackend::Avx, GgufCpuBackend::Avx2}) {
+        if (!gguf_cpu_backend_available(backend)) {
+#if defined(NINFER_CPU_EXPERT_X86)
+            require(backend != GgufCpuBackend::Avx,
+                    "x86_64 runner must support GgufCpuBackend::Avx");
+#endif
+            continue;
+        }
+        std::vector<std::uint16_t> vec_out(gate.size());
+        gguf_cpu_swiglu_bf16_fast(gate.data(), up.data(), gate.size(), vec_out.data(), backend);
+        require(vec_out == scalar_out,
+                "gguf_cpu_swiglu_bf16_fast vector backend differs from Scalar fast");
     }
 }
 
@@ -362,21 +582,41 @@ void check_silu(std::mt19937& rng) {
 int main() {
     try {
         std::mt19937 rng(20261009);
+        check_fma_avx(rng);
         check_silu(rng);
+        check_activation_ties();
+        check_swiglu_fast(rng);
         for (const QType format : {QType::GGUF_Q2_0, QType::GGUF_Q8_0, QType::GGUF_IQ4_NL}) {
             const Matrix gate = make(format, 640, 2560, rng);
+            if (format == QType::GGUF_Q2_0) { check_unavailable_backend(gate); }
             const Matrix down = make(format, 2560, 640, rng);
             for (const int tokens : {1, 2, 3, 4, 5, 8, 9}) {
                 check(gate, tokens, rng);
                 check(down, tokens, rng);
             }
         }
-        // The i-quants hold the gate and up projections (k = 2560, ten 256-value blocks).
+        // The i-quants hold the gate and up projections (k = 2560) and also exercise trailing-slice
+        // live < 8 boundaries (k = 640 -> live = 4, and k in {96, 160, 224, 320, 416}).
         for (const QType format : {QType::GGUF_IQ2_S, QType::GGUF_IQ3_XXS, QType::GGUF_IQ3_S,
                                    QType::GGUF_IQ4_XS}) {
             const Matrix gate = make(format, 640, 2560, rng);
-            for (const int tokens : {1, 2, 3, 4, 5, 8, 9}) { check(gate, tokens, rng); }
+            const Matrix down = make(format, 2560, 640, rng);
+            for (const int tokens : {1, 2, 3, 5, 9}) {
+                check(gate, tokens, rng);
+                check(down, tokens, rng);
+            }
+            for (const int k_edge : {96, 160, 224, 320, 416}) {
+                const Matrix edge = make(format, 19, k_edge, rng);
+                for (int tokens = 2; tokens <= 8; ++tokens) { check(edge, tokens, rng); }
+            }
             require(gguf_cpu_supported(format), "an i-quant is not supported");
+        }
+        for (const QType format : {QType::GGUF_Q8_0, QType::GGUF_IQ4_NL, QType::GGUF_Q2_0}) {
+            for (const int k_edge : {96, 160, 224, 320, 416}) {
+                if (format == QType::GGUF_Q2_0 && k_edge % 64 != 0) { continue; }
+                const Matrix edge = make(format, 19, k_edge, rng);
+                for (int tokens = 2; tokens <= 8; ++tokens) { check(edge, tokens, rng); }
+            }
         }
         require(!gguf_cpu_supported(QType::GGUF_IQ2_XS), "an unimplemented format is supported");
         bool refused = false;
@@ -386,6 +626,23 @@ int main() {
             a.prepare_bf16(QType::GGUF_Q2_0, x.data(), 2560, 2);
         } catch (const std::invalid_argument&) { refused = true; }
         require(refused, "an activation above its capacity was accepted");
+        // Skipping a prepared token after prepare_bf16_start must be caught instead of silently
+        // feeding stale codes from an earlier call.
+        {
+            GgufCpuActivation partial(2, 64);
+            std::vector<std::uint16_t> row(64, bf16(1.0F));
+            partial.prepare_bf16_start(QType::GGUF_Q8_0, 2);
+            partial.prepare_bf16_token(0, row.data());
+            const Matrix tiny = make(QType::GGUF_Q8_0, 8, 64, rng);
+            const GgufCpuMatrix tw{tiny.format, tiny.bytes.data(), tiny.row_bytes, tiny.rows, tiny.k};
+            std::vector<float> ty(std::size_t(2) * tiny.rows);
+            bool missed_caught = false;
+            try {
+                gguf_cpu_rows(tw, partial, 0, tiny.rows, ty.data(), tiny.rows,
+                              GgufCpuBackend::Scalar);
+            } catch (const std::logic_error&) { missed_caught = true; }
+            require(missed_caught, "missing token in prepare_bf16_start was silently consumed");
+        }
         std::cout << "gguf_expert_cpu: OK\n";
         return 0;
     } catch (const std::exception& error) {

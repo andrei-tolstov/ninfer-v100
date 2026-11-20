@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/cuda_host_handshake.h"
 #include "core/file_read_queue.h"
+#include "core/numa.h"
 #include "core/vmm.h"
 
 #include <algorithm>
@@ -281,11 +282,13 @@ struct ExpertDelivery::Impl {
                                         checked_add(checked_mul(count, layer.stride.back()), tail[b]));
             }
             layer.slot_of.assign(count, -1);
-            const auto bytes = count * spec.aliases.size() * sizeof(void*);
-            layer.mirror = std::make_unique<PinnedHostBuffer>(bytes);
+            const auto bytes   = count * spec.aliases.size() * sizeof(void*);
+            const int node     = device_numa_node(rank.device);
+            const auto place   = node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default;
+            layer.mirror = std::make_unique<PinnedHostBuffer>(bytes, node, place);
             std::memset(layer.mirror->data(), 0, bytes);
             for (int u = 0; u < 2; ++u) {
-                layer.upload[u] = std::make_unique<PinnedHostBuffer>(bytes);
+                layer.upload[u] = std::make_unique<PinnedHostBuffer>(bytes, node, place);
                 CUDA_CHECK(cudaEventCreateWithFlags(&layer.uploaded[u], cudaEventDisableTiming));
                 allocation.pinned_bytes += bytes;
             }
@@ -300,7 +303,10 @@ struct ExpertDelivery::Impl {
         cached_ids = Storage(std::size_t(options.pair_capacity) * 4, rank.device, options.suspendable);
         missing_ids = Storage(std::size_t(options.pair_capacity) * 4, rank.device, options.suspendable);
         needed_device = Storage(std::size_t(max_experts) * 4, rank.device, options.suspendable);
-        needed_host = std::make_unique<PinnedHostBuffer>(std::size_t(max_experts) * 4);
+        const int rank_node  = device_numa_node(rank.device);
+        const auto pin_place = rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default;
+        needed_host = std::make_unique<PinnedHostBuffer>(std::size_t(max_experts) * 4, rank_node,
+                                                         pin_place);
         std::memset(needed_host->data(), 0, needed_host->size());
         allocation.metadata_bytes = cached_ids.backing_bytes() + missing_ids.backing_bytes() +
                                      needed_device.backing_bytes();
@@ -313,7 +319,7 @@ struct ExpertDelivery::Impl {
         }
         if (disk) {
             half_bytes = aligned(std::max<std::uint64_t>(options.staging_bytes / 2, 256));
-            staging = std::make_unique<PinnedHostBuffer>(2 * half_bytes);
+            staging = std::make_unique<PinnedHostBuffer>(2 * half_bytes, rank_node, pin_place);
             allocation.pinned_bytes += staging->size();
             for (const auto& path : paths) {
                 files.emplace_back(path, std::ios::binary);

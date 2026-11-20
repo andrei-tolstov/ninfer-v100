@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/file_read_error.h"
+#include "core/numa.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -210,6 +211,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
+    load.numa_policy  = options.hybrid_experts.numa_policy;
+    load.cpu_threads  = options.hybrid_experts.cpu_threads;
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::qwen4_exp::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
@@ -301,6 +304,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (host_numa_topology().multi_node()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Host NUMA topology: %s",
+                           format_numa_summary(host_numa_topology()).c_str());
+    }
     if (const std::string cpu = instance->executor->expert_cpu_description(); !cpu.empty()) {
         const std::string share =
             options.hybrid_experts.dma_share_auto

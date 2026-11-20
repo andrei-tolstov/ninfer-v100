@@ -196,7 +196,7 @@ int main() {
     if (cpu != nullptr && std::string(cpu) == "1") {
         auto host_model = gemma4::load_model(
             reader, {.artifact = artifact_path, .vision = gemma4::VisionPlacement::Host}, device);
-        const gemma4::CpuVisionTower cpu_tower(*host_model);
+        const gemma4::CpuVisionTower cpu_tower(*host_model, device.entry().device);
         const auto start = std::chrono::steady_clock::now();
         const auto words = cpu_tower.encode(host_patches, 1, gw, gh);
         std::cout << "CPU tower: " << std::chrono::duration<double>(

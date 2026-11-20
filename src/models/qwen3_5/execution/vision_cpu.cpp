@@ -1,13 +1,18 @@
 #include "models/qwen3_5/execution/vision_cpu.h"
+#include "models/qwen3_5/execution/vision_cpu_kernels.h"
+#include "core/numa.h"
 
 #include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -17,7 +22,7 @@ constexpr float kNormEpsilon = 1.0e-6F;
 // The two-axis rotary geometry of the Qwen3.5 tower: 72-wide heads rotate 36 pairs, the first 18
 // by the patch row and the rest by its column, at 10000^(-2i/36) for i = pair % 18 -- the device
 // kernel's constant table (ops/kernel/rope.cuh), so both encoders rotate by the same angles.
-constexpr std::int32_t kHeadDim                   = 72;
+constexpr std::int32_t kHeadDim                   = cpu_vision::kHeadDim;
 constexpr std::int32_t kAxisPairs                 = 18;
 constexpr std::int32_t kRotaryPairs               = 2 * kAxisPairs;
 constexpr float kRopeInverseFrequency[kAxisPairs] = {
@@ -42,10 +47,12 @@ std::uint16_t f32_to_bf16(float value) {
 // each create threads.
 class Team {
 public:
-    explicit Team(unsigned threads) : size_(std::max(1U, threads)) {
+    explicit Team(unsigned threads, std::span<const int> worker_cpus = {})
+        : size_(std::max(1U, threads)) {
         workers_.reserve(size_ - 1);
         for (unsigned index = 1; index < size_; ++index) {
-            workers_.emplace_back([this, index] { serve(index); });
+            const int cpu_id = index < worker_cpus.size() ? worker_cpus[index] : -1;
+            workers_.emplace_back([this, index, cpu_id] { serve(index, cpu_id); });
         }
     }
 
@@ -91,7 +98,8 @@ public:
     }
 
 private:
-    void serve(unsigned index) {
+    void serve(unsigned index, int cpu_id) {
+        if (cpu_id >= 0) { (void)bind_thread_to_cpu(cpu_id); }
         std::uint64_t seen = 0;
         for (;;) {
             std::function<void(unsigned)> job;
@@ -145,48 +153,8 @@ struct Matrix {
     }
 };
 
-constexpr std::int32_t kTileRows   = 4;
-constexpr std::int32_t kTileTokens = 16;
-
-// y rows [row, row + kTileRows) of W x + bias over one packed token panel ([k, kTileTokens],
-// contiguous), accumulated as a register tile over the whole inner dimension.
-void linear_tile(const float* w, std::int32_t k, const float* bias, const float* panel,
-                 std::int32_t width, Matrix& y, std::int32_t row, std::int32_t token) {
-    float acc[kTileRows][kTileTokens];
-    for (int r = 0; r < kTileRows; ++r) {
-        for (int t = 0; t < kTileTokens; ++t) { acc[r][t] = bias[row + r]; }
-    }
-    const float* rows[kTileRows];
-    for (int r = 0; r < kTileRows; ++r) { rows[r] = w + static_cast<std::size_t>(row + r) * k; }
-    for (std::int32_t inner = 0; inner < k; ++inner) {
-        const float* xs = panel + static_cast<std::size_t>(inner) * kTileTokens;
-        for (int r = 0; r < kTileRows; ++r) {
-            const float weight = rows[r][inner];
-            for (int t = 0; t < kTileTokens; ++t) { acc[r][t] += weight * xs[t]; }
-        }
-    }
-    for (int r = 0; r < kTileRows; ++r) {
-        float* out = y.row(row + r) + token;
-        for (std::int32_t t = 0; t < width; ++t) { out[t] = acc[r][t]; }
-    }
-}
-
-void linear_row(const float* w, std::int32_t k, const float* bias, const float* panel,
-                std::int32_t width, Matrix& y, std::int32_t row, std::int32_t token) {
-    float acc[kTileTokens];
-    for (float& value : acc) { value = bias[row]; }
-    const float* weights = w + static_cast<std::size_t>(row) * k;
-    for (std::int32_t inner = 0; inner < k; ++inner) {
-        const float* xs = panel + static_cast<std::size_t>(inner) * kTileTokens;
-        for (int t = 0; t < kTileTokens; ++t) { acc[t] += weights[inner] * xs[t]; }
-    }
-    float* out = y.row(row) + token;
-    for (std::int32_t t = 0; t < width; ++t) { out[t] = acc[t]; }
-}
-
-// y = W x + bias, W row-major [n, k], x feature-major [k, T], y feature-major [n, T]. Each member
-// copies one token panel at a time into contiguous storage: rows of x sit a power-of-two stride
-// apart at typical token counts, which would fold a whole panel onto a few cache sets.
+// y = W x + bias, W row-major [n, k], x feature-major [k, T], y feature-major [n, T]: pack panels
+// once across the team and split rows in 12-row tiles (LCM of 4x16 and 6x16 microkernels).
 void linear(const std::vector<float>& w, const std::vector<float>& bias, std::int32_t n,
             const Matrix& x, Matrix& y, Team& team) {
     const std::int32_t k = x.rows;
@@ -194,80 +162,59 @@ void linear(const std::vector<float>& w, const std::vector<float>& bias, std::in
         bias.size() != static_cast<std::size_t>(n) || y.rows != n || y.cols != x.cols) {
         throw std::logic_error("CPU Vision: projection extents do not match");
     }
-    const std::int32_t tokens = x.cols;
-    const std::int32_t groups = (n + kTileRows - 1) / kTileRows;
-    team.run(static_cast<std::size_t>(groups), 4, [&](std::size_t begin, std::size_t end) {
-        std::vector<float> panel(static_cast<std::size_t>(k) * kTileTokens);
-        for (std::int32_t token = 0; token < tokens; token += kTileTokens) {
-            const std::int32_t width = std::min(kTileTokens, tokens - token);
-            for (std::int32_t inner = 0; inner < k; ++inner) {
-                float* target = panel.data() + static_cast<std::size_t>(inner) * kTileTokens;
-                std::copy_n(x.row(inner) + token, width, target);
-                std::fill(target + width, target + kTileTokens, 0.0F);
-            }
-            for (auto group = static_cast<std::int32_t>(begin);
-                 group < static_cast<std::int32_t>(end); ++group) {
-                const std::int32_t row = group * kTileRows;
-                if (row + kTileRows <= n) {
-                    linear_tile(w.data(), k, bias.data(), panel.data(), width, y, row, token);
-                } else {
-                    for (std::int32_t r = row; r < n; ++r) {
-                        linear_row(w.data(), k, bias.data(), panel.data(), width, y, r, token);
-                    }
-                }
-            }
+    const auto& kernels          = cpu_vision::kernels();
+    const std::int32_t tokens    = x.cols;
+    const std::int32_t panels    = (tokens + 15) / 16;
+    const std::size_t panel_size = static_cast<std::size_t>(k) * 16;
+    std::vector<float> packed(static_cast<std::size_t>(panels) * panel_size + 16);
+    float* packed_aligned = reinterpret_cast<float*>(
+        (reinterpret_cast<std::uintptr_t>(packed.data()) + 63U) & ~std::uintptr_t(63U));
+    team.run(static_cast<std::size_t>(panels), 1, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t p = begin; p < end; ++p) {
+            const auto token = static_cast<std::int32_t>(p) * 16;
+            const auto width = std::min<std::int32_t>(16, tokens - token);
+            kernels.pack_panel(x.row(0), static_cast<std::size_t>(tokens), k, token, width,
+                               packed_aligned + p * panel_size);
         }
+    });
+    const std::int32_t groups = (n + 11) / 12;
+    team.run(static_cast<std::size_t>(groups), 2, [&](std::size_t begin, std::size_t end) {
+        const auto row  = static_cast<std::int32_t>(begin) * 12;
+        const auto rows = std::min(n, static_cast<std::int32_t>(end) * 12) - row;
+        kernels.gemm_packed_bias(w.data() + static_cast<std::size_t>(row) * k,
+                                 static_cast<std::size_t>(k), bias.data() + row, rows, k,
+                                 packed_aligned, tokens, y.row(row),
+                                 static_cast<std::size_t>(y.cols));
     });
 }
 
 // Per-token LayerNorm over the feature rows, eps inside the square root as on the device.
 void layer_norm(const Matrix& x, const std::vector<float>& weight, const std::vector<float>& bias,
                 Matrix& y, Team& team) {
+    const auto& kernels = cpu_vision::kernels();
     const std::int32_t features = x.rows;
     team.run(static_cast<std::size_t>(x.cols), 64, [&](std::size_t begin, std::size_t end) {
-        const auto first = static_cast<std::int32_t>(begin);
-        const auto count = static_cast<std::int32_t>(end - begin);
-        std::vector<float> mean(static_cast<std::size_t>(count), 0.0F);
-        std::vector<float> variance(static_cast<std::size_t>(count), 0.0F);
-        for (std::int32_t r = 0; r < features; ++r) {
-            const float* xs = x.row(r) + first;
-            for (std::int32_t t = 0; t < count; ++t) { mean[t] += xs[t]; }
-        }
-        for (float& value : mean) { value /= static_cast<float>(features); }
-        for (std::int32_t r = 0; r < features; ++r) {
-            const float* xs = x.row(r) + first;
-            for (std::int32_t t = 0; t < count; ++t) {
-                const float centered = xs[t] - mean[t];
-                variance[t] += centered * centered;
-            }
-        }
-        for (float& value : variance) {
-            value = 1.0F / std::sqrt(value / static_cast<float>(features) + kNormEpsilon);
-        }
-        for (std::int32_t r = 0; r < features; ++r) {
-            const float* xs = x.row(r) + first;
-            float* ys       = y.row(r) + first;
-            for (std::int32_t t = 0; t < count; ++t) {
-                ys[t] = (xs[t] - mean[t]) * variance[t] * weight[r] + bias[r];
-            }
-        }
+        kernels.layer_norm_cols(x.row(0), static_cast<std::size_t>(x.cols), features,
+                                weight.data(), bias.data(), static_cast<std::int32_t>(begin),
+                                static_cast<std::int32_t>(end - begin), kNormEpsilon, y.row(0));
     });
 }
 
 void add_into(Matrix& x, const Matrix& delta, Team& team) {
-    team.run(x.data.size(), 1U << 16U, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t i = begin; i < end; ++i) { x.data[i] += delta.data[i]; }
+    const auto& kernels = cpu_vision::kernels();
+    team.run((x.data.size() + 7U) / 8U, 8192U, [&](std::size_t begin, std::size_t end) {
+        const std::size_t first = begin * 8U;
+        const std::size_t last  = std::min(x.data.size(), end * 8U);
+        kernels.add_into(x.data.data() + first, delta.data.data() + first, last - first);
     });
 }
 
 void gelu_tanh(Matrix& x, Team& team) {
-    constexpr float kScale = 0.7978845608028654F; // sqrt(2 / pi)
-    team.run(x.data.size(), 1U << 16U, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t i = begin; i < end; ++i) {
-            const float value = x.data[i];
-            x.data[i] = 0.5F * value *
-                        (1.0F + std::tanh(kScale * (value + 0.044715F * value * value * value)));
-        }
+    const auto& kernels = cpu_vision::kernels();
+    team.run((x.data.size() + 7U) / 8U, 8192U, [&](std::size_t begin, std::size_t end) {
+        const std::size_t first = begin * 8U;
+        const std::size_t last  = std::min(x.data.size(), end * 8U);
+        kernels.gelu_tanh(x.data.data() + first, last - first);
     });
 }
 
@@ -299,6 +246,7 @@ void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads,
         }
     }
     // Queries occupy rows [0, hidden) and keys [hidden, 2 * hidden).
+    const auto& kernels = cpu_vision::kernels();
     team.run(static_cast<std::size_t>(2 * heads), 1, [&](std::size_t begin, std::size_t end) {
         for (auto head = static_cast<std::int32_t>(begin); head < static_cast<std::int32_t>(end);
              ++head) {
@@ -308,12 +256,7 @@ void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads,
                 float* second        = qkv.row(base + pair + kRotaryPairs);
                 const float* cosines = cosine.data() + static_cast<std::size_t>(pair) * tokens;
                 const float* sines   = sine.data() + static_cast<std::size_t>(pair) * tokens;
-                for (std::int32_t t = 0; t < tokens; ++t) {
-                    const float a = first[t];
-                    const float b = second[t];
-                    first[t]      = a * cosines[t] - b * sines[t];
-                    second[t]     = b * cosines[t] + a * sines[t];
-                }
+                kernels.rope_pair(first, second, cosines, sines, tokens);
             }
         }
     });
@@ -325,15 +268,14 @@ void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads,
 void segment_attention(const Matrix& qkv, std::int32_t hidden, std::int32_t heads,
                        std::int32_t segment, Matrix& out, Team& team) {
     constexpr std::int32_t kQueries = 32;
-    constexpr std::int32_t kKeys    = 256;
     const std::int32_t tokens       = qkv.cols;
     const std::int32_t segments     = tokens / segment;
     const std::int32_t blocks       = (segment + kQueries - 1) / kQueries;
     const float scale       = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHeadDim)));
     const std::size_t tasks = static_cast<std::size_t>(heads) * segments * blocks;
+    const auto& kernels     = cpu_vision::kernels();
     team.run(tasks, 1, [&](std::size_t begin, std::size_t end) {
         std::vector<float> scores(static_cast<std::size_t>(kQueries) * segment);
-        std::vector<float> result(static_cast<std::size_t>(kQueries) * kHeadDim);
         for (std::size_t task = begin; task < end; ++task) {
             const auto head        = static_cast<std::int32_t>(task / (segments * blocks));
             const auto rest        = static_cast<std::int32_t>(task % (segments * blocks));
@@ -341,63 +283,9 @@ void segment_attention(const Matrix& qkv, std::int32_t hidden, std::int32_t head
             const std::int32_t q0  = s0 + (rest % blocks) * kQueries;
             const std::int32_t qn  = std::min(kQueries, s0 + segment - q0);
             const std::int32_t row = head * kHeadDim;
-            for (std::int32_t k0 = 0; k0 < segment; k0 += kKeys) {
-                const std::int32_t kn = std::min(kKeys, segment - k0);
-                for (std::int32_t q = 0; q < qn; ++q) {
-                    std::fill_n(scores.data() + static_cast<std::size_t>(q) * segment + k0, kn,
-                                0.0F);
-                }
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    const float* queries = qkv.row(row + d) + q0;
-                    const float* keys    = qkv.row(hidden + row + d) + s0 + k0;
-                    for (std::int32_t q = 0; q < qn; ++q) {
-                        const float coefficient = queries[q] * scale;
-                        float* line = scores.data() + static_cast<std::size_t>(q) * segment + k0;
-                        for (std::int32_t key = 0; key < kn; ++key) {
-                            line[key] += coefficient * keys[key];
-                        }
-                    }
-                }
-            }
-            for (std::int32_t q = 0; q < qn; ++q) {
-                float* line   = scores.data() + static_cast<std::size_t>(q) * segment;
-                const float m = *std::max_element(line, line + segment);
-                float sum     = 0.0F;
-                for (std::int32_t key = 0; key < segment; ++key) {
-                    line[key] = std::exp(line[key] - m);
-                    sum += line[key];
-                }
-                const float inverse = 1.0F / sum;
-                for (std::int32_t key = 0; key < segment; ++key) { line[key] *= inverse; }
-            }
-            std::fill(result.begin(), result.end(), 0.0F);
-            for (std::int32_t k0 = 0; k0 < segment; k0 += kKeys) {
-                const std::int32_t kn = std::min(kKeys, segment - k0);
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    const float* values = qkv.row(2 * hidden + row + d) + s0 + k0;
-                    for (std::int32_t q = 0; q < qn; ++q) {
-                        const float* line =
-                            scores.data() + static_cast<std::size_t>(q) * segment + k0;
-                        float lanes[8]{};
-                        std::int32_t key = 0;
-                        for (; key + 8 <= kn; key += 8) {
-                            for (int lane = 0; lane < 8; ++lane) {
-                                lanes[lane] += line[key + lane] * values[key + lane];
-                            }
-                        }
-                        float sum = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) +
-                                    ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
-                        for (; key < kn; ++key) { sum += line[key] * values[key]; }
-                        result[static_cast<std::size_t>(q) * kHeadDim + d] += sum;
-                    }
-                }
-            }
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                float* target = out.row(row + d) + q0;
-                for (std::int32_t q = 0; q < qn; ++q) {
-                    target[q] = result[static_cast<std::size_t>(q) * kHeadDim + d];
-                }
-            }
+            kernels.segment_attention_block(qkv.row(0), static_cast<std::size_t>(tokens), hidden,
+                                            row, s0, q0, qn, segment, scale, scores.data(),
+                                            out.row(0), static_cast<std::size_t>(tokens));
         }
     });
 }
@@ -413,7 +301,8 @@ std::mutex& encode_turn() {
 std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
                                                 std::span<const std::uint16_t> patches,
                                                 const VisionItemControl& control, unsigned threads,
-                                                const std::atomic<bool>* cancelled) {
+                                                const std::atomic<bool>* cancelled,
+                                                int cuda_device) {
     const auto count   = static_cast<std::int32_t>(control.patch_count);
     const auto merged  = static_cast<std::int32_t>(control.merged_count);
     const auto hidden  = weights.hidden;
@@ -426,7 +315,12 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
         control.position_table_weights.size() != static_cast<std::size_t>(count) * 4) {
         throw std::invalid_argument("CPU Vision item does not match its control");
     }
-    Team team(threads != 0 ? threads : std::max(1U, std::thread::hardware_concurrency()));
+    const auto worker_cpus = select_worker_cpus(device_numa_node(cuda_device), threads);
+    const unsigned default_threads =
+        !worker_cpus.empty() ? static_cast<unsigned>(worker_cpus.size())
+                             : std::max(1U, std::thread::hardware_concurrency());
+    const unsigned team_threads = threads != 0 ? threads : default_threads;
+    Team team(team_threads, worker_cpus);
     const auto stop = [&] { return cancelled != nullptr && cancelled->load(); };
 
     Matrix input(weights.patch_width, count);
@@ -506,14 +400,18 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
     for (std::int32_t o = 0; o < weights.output_hidden; ++o) {
         const float* source = result.row(o);
         for (std::int32_t v = 0; v < merged; ++v) {
+            if (!std::isfinite(source[v])) {
+                throw std::runtime_error("CPU Vision: nonfinite output");
+            }
             out[static_cast<std::size_t>(v) * weights.output_hidden + o] = f32_to_bf16(source[v]);
         }
     }
     return out;
 }
 
-CpuVisionSession::CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights)
-    : weights_(std::move(weights)) {
+CpuVisionSession::CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights,
+                                   int cuda_device)
+    : weights_(std::move(weights)), cuda_device_(cuda_device) {
     if (!weights_) { throw std::invalid_argument("CPU Vision session has no weights"); }
 }
 
@@ -535,8 +433,8 @@ void CpuVisionSession::submit_item(std::shared_ptr<const PreparedMediaPayload> p
         try {
             const std::lock_guard turn(encode_turn());
             const auto started = std::chrono::steady_clock::now();
-            results_[slot] =
-                encode_vision_on_cpu(*weights_, payload->span(), control, 0, &cancelled_);
+            results_[slot] = encode_vision_on_cpu(*weights_, payload->span(), control, 0,
+                                                  &cancelled_, cuda_device_);
             worker_seconds_ =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         } catch (...) { error_ = std::current_exception(); }

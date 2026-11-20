@@ -146,7 +146,7 @@ The default configuration is Release. Ninja links and archives share the single-
 | `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
 
 The opt-in kernel, build and platform options (`NINFER_SM120_NATIVE`, `NINFER_PDL`,
-`NINFER_MULTICALL`, the SFU and Windows options, and the rest) are listed in the
+`NINFER_MULTICALL`, `NINFER_GGML_CPU_AVX2`, the SFU and Windows options, and the rest) are listed in the
 [Linux build guide](../build-linux.md#build-options).
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,

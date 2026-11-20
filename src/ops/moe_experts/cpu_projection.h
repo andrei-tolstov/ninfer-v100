@@ -22,6 +22,11 @@ struct Activations {
 using Project = void (*)(const Weight&, const Activations&, bool, float*);
 void project_scalar(const Weight&, const Activations&, bool, float*);
 #if defined(NINFER_CPU_EXPERT_X86)
+void project_avx(const Weight&, const Activations&, bool, float*);
+void prepare_input_avx(const std::uint16_t* x, std::size_t count, float* values,
+                       std::int8_t* codes, float* scales, bool a8);
+void swiglu_quantize_avx(const float* gate, float* middle, std::size_t count,
+                         std::int8_t* codes, float* scales, bool a8);
 void project_avx2(const Weight&, const Activations&, bool, float*);
 void project_avx512(const Weight&, const Activations&, bool, float*);
 #endif
@@ -52,7 +57,7 @@ float decode32(const Weight& weight, int row, int block, std::int8_t* decoded) {
     const int groups = weight.k / group_size;
     const int group = block * 32 / group_size, start = block * 32 % group_size;
     const std::size_t record = weight.layout == QuantLayout::RowSplitPanel
-        ? (std::size_t(row / 64) * groups + group) * 64 + row % 64
+        ? (std::size_t(row / kRowSplitPanelRows) * groups + group) * kRowSplitPanelRows + row % kRowSplitPanelRows
         : std::size_t(row) * groups + group;
     const auto* low = static_cast<const std::uint8_t*>(weight.qdata) +
                       record * (Bits == 2 ? 16 : 32);

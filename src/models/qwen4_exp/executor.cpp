@@ -28,6 +28,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
+#include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 #include "ninfer/ops/ngram_rows.h"
 #include "ninfer/ops/ple_inject.h"
 #include "ninfer/ops/qsa_indexer.h"
@@ -755,6 +756,11 @@ struct Executor::Impl {
             (residency != ExpertResidency::Host || native_host)) {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
         }
+        if (options.hybrid_experts.cpu_ggml && !ops::gguf_ggml_cpu_available()) {
+            throw std::invalid_argument(
+                "--expert-cpu-arithmetic ggml: this build's ggml kernels need instructions "
+                "which this CPU lacks; use exact or a build with NINFER_GGML_CPU_AVX2=OFF");
+        }
         plan_segments();
         allocate_ranks();
         allocate_vision();
@@ -1102,8 +1108,10 @@ struct Executor::Impl {
             rank.slot_ids = DeviceBuffer(std::size_t(options.sequences) * 4);
             rank.slot_ids.copy_from_host(identity.data(), std::size_t(options.sequences) * 4);
             // ids, positions, RoPE positions, scatter columns, three-axis RoPE positions, rows.
+            const int rank_node = device_numa_node(device.rank(r).device);
             rank.staging = std::make_unique<PinnedHostBuffer>(
-                round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b));
+                round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b),
+                rank_node, rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, cudaEventDisableTiming));
@@ -1344,7 +1352,9 @@ struct Executor::Impl {
             options.prefill_chunk, std::uint64_t(verify_width) * options.sequences);
         mtp_ids       = DeviceBuffer(cells * 4);
         mtp_positions = DeviceBuffer(cells * 4);
-        mtp_staging   = std::make_unique<PinnedHostBuffer>(cells * 8);
+        const int head_node = device_numa_node(device.rank(head).device);
+        mtp_staging   = std::make_unique<PinnedHostBuffer>(
+            cells * 8, head_node, head_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
         if (options.draft_min_p > 0) {
             mtp_logprobs = DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
         }
@@ -1393,8 +1403,12 @@ struct Executor::Impl {
             route_records.push_back(static_cast<std::byte*>(route_blocks[plan->rank].p) +
                                     on_rank[plan->rank]++ * pairs * sizeof(std::int32_t));
         }
+        const int head_node = device_numa_node(device.rank(model.head_rank()).device);
         route_host =
-            std::make_unique<PinnedHostBuffer>(expert.size() * pairs * sizeof(std::int32_t));
+            std::make_unique<PinnedHostBuffer>(expert.size() * pairs * sizeof(std::int32_t),
+                                               head_node,
+                                               head_node >= 0 ? NumaPlacement::Bind
+                                                              : NumaPlacement::Default);
         const ExpertResidency residency = model.options().experts;
         const bool native_host = residency == ExpertResidency::Host &&
             std::any_of(expert.begin(), expert.end(), [](const auto& item) { return item.first->moe.native.has_value(); });
@@ -1428,7 +1442,8 @@ struct Executor::Impl {
                 }
             }
             hybrid = std::make_unique<HybridExperts>(device, std::move(host_layers),
-                options.prefill_chunk, options.expert_cache_bytes, options.hybrid_experts);
+                options.prefill_chunk, options.expert_cache_bytes, options.hybrid_experts,
+                std::function<void()>{}, model.numa_plan());
             for (std::size_t r = 0; r < ranks.size(); ++r) {
                 memory.ranks[r].expert_cache_bytes += hybrid->cache_bytes(r);
                 memory.ranks[r].workspace_bytes += hybrid->working_bytes(r);
@@ -1553,6 +1568,8 @@ struct Executor::Impl {
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.cpu_ggml       = options.hybrid_experts.cpu_ggml;
+        miss.numa_policy    = options.hybrid_experts.numa_policy;
+        miss.numa_plan      = model.numa_plan();
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         misses              = std::make_unique<ExpertMisses>(
@@ -1597,7 +1614,12 @@ struct Executor::Impl {
                 memory.ranks[r].workspace_bytes += buffer.storage.bytes + buffer.tables.bytes;
             }
         }
-        slot_entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
+        const int cache_node = !layers.empty()
+                                   ? device_numa_node(device.rank(layers.front().rank).device)
+                                   : device_numa_node(device.rank(0).device);
+        slot_entries = std::make_unique<PinnedHostBuffer>(
+            3 * experts * sizeof(void*), cache_node,
+            cache_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
         prefetches.resize(device.size());
         for (std::size_t r = 0; r < device.size(); ++r) {
             if (slot_pools[r].slots == 0) { continue; }
@@ -1610,7 +1632,10 @@ struct Executor::Impl {
                     cudaEventCreateWithFlags(&prefetch.buffers[b].free, cudaEventDisableTiming));
             }
             for (auto& entries : prefetch.entries) {
-                entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
+                const int rank_node = device_numa_node(device.rank(r).device);
+                entries = std::make_unique<PinnedHostBuffer>(
+                    3 * experts * sizeof(void*), rank_node,
+                    rank_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
             }
             for (cudaEvent_t& copied : prefetch.copied) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
@@ -3924,6 +3949,7 @@ void Executor::bind_cancellation(const std::atomic<bool>* cancelled) noexcept {
     // can die. Normal pass/draft boundaries have already drained and propagated any failure.
     if (!cancelled && impl_->hybrid) { try { impl_->hybrid->finish(); } catch (...) {} }
     impl_->cancelled = cancelled;
+    if (impl_->misses) { impl_->misses->set_cancellation(cancelled); }
 }
 
 void Executor::raise_service_failure() {

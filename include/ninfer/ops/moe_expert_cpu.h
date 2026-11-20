@@ -16,7 +16,7 @@ struct CpuExpertCancelled final : std::runtime_error {
 
 // Execution resource, selected once by the Program. Explicit choices allow every available
 // production implementation to be qualified against the same independent oracle.
-enum class CpuExpertBackend { Automatic, Scalar, Avx2, Avx512Vnni };
+enum class CpuExpertBackend { Automatic, Scalar, Avx, Avx2, Avx512Vnni };
 [[nodiscard]] bool cpu_expert_backend_available(CpuExpertBackend backend) noexcept;
 [[nodiscard]] const char* cpu_expert_backend_name(CpuExpertBackend backend) noexcept;
 

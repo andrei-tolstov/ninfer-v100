@@ -9,6 +9,7 @@
 #include "artifact/reader.h"
 #include "core/startup.h"
 #include "core/vmm.h"
+#include "core/wide_math.h"
 
 #include <cuda_runtime.h>
 
@@ -467,8 +468,31 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         throw ArtifactError("pinned Host backing exceeds size_t");
     }
     if (!plan.pinned_objects.empty()) {
-        out.pinned_ = std::make_unique<PinnedHostBuffer>(
-            static_cast<std::size_t>(plan.pinned_capacity_bytes));
+        const auto pinned_bytes = static_cast<std::size_t>(plan.pinned_capacity_bytes);
+        if (!options.pinned_shards.empty()) {
+            out.pinned_ = std::make_unique<PinnedHostBuffer>(pinned_bytes, options.pinned_shards);
+        } else if (options.pinned_numa_placement != NumaPlacement::Default ||
+                   options.pinned_numa_node >= 0) {
+            out.pinned_ = std::make_unique<PinnedHostBuffer>(
+                pinned_bytes, options.pinned_numa_node, options.pinned_numa_placement);
+        } else {
+            const NumaTopology topo = host_numa_topology();
+            const int gpu_node      = device_numa_node(device.rank(0).device);
+            const auto plan_numa    = plan_host_numa(
+                topo, gpu_node, pinned_bytes, /*requested_threads=*/0,
+                topo.multi_node() ? options.pinned_numa_policy : NumaPolicy::Isolate);
+            if (plan_numa.pinned_shards.size() > 1) {
+                std::vector<PinnedShardRange> shards = plan_numa.pinned_shards;
+                out.pinned_ = std::make_unique<PinnedHostBuffer>(pinned_bytes, shards);
+            } else {
+                const int target_node = plan_numa.pinned_shards.empty()
+                                            ? gpu_node
+                                            : plan_numa.pinned_shards.front().numa_node;
+                out.pinned_ = std::make_unique<PinnedHostBuffer>(
+                    pinned_bytes, target_node,
+                    target_node >= 0 ? NumaPlacement::Bind : NumaPlacement::Default);
+            }
+        }
         auto* const block          = static_cast<std::byte*>(out.pinned_->data());
         std::uint64_t previous_end = 0;
         for (const auto& placement : plan.pinned_objects) {
@@ -495,6 +519,19 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.stats_.pinned_bytes        = plan.pinned_capacity_bytes;
         out.stats_.pinned_object_count = plan.pinned_objects.size();
     }
+    // Registered host_objects (native host-resident MoE) distribute across active NUMA shards when
+    // multi-node shards are provided, matching pinned_buffer sharding (P1-8).
+    std::uint64_t total_registered_host = 0;
+    std::uint64_t total_shard_bytes     = 0;
+    for (const auto& placement : plan.host_objects) {
+        if (placement.registered) {
+            reader.validate_object(placement.object);
+            total_registered_host += object_bytes(reader.directory().object(placement.object));
+        }
+    }
+    for (const auto& s : options.pinned_shards) { total_shard_bytes += s.bytes; }
+    std::uint64_t registered_cursor = 0;
+
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
@@ -510,10 +547,43 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         storage.host_data = std::move(placement.data);
         if (placement.registered) {
+            int target_node = options.pinned_numa_node >= 0
+                                  ? options.pinned_numa_node
+                                  : device_numa_node(device.rank(0).device);
+            if (options.pinned_shards.size() > 1 && total_registered_host > 0 &&
+                total_shard_bytes > 0) {
+                const std::uint64_t mid =
+                    registered_cursor + storage.host_data.size() / 2ULL;
+                const core::Uint128 scaled = core::wide_multiply(mid, total_shard_bytes);
+                std::uint64_t rem          = scaled.high % total_registered_host;
+                std::uint64_t shard_pos    = 0;
+                for (int bit = 63; bit >= 0; --bit) {
+                    const std::uint64_t bbit = (scaled.low >> bit) & 1ULL;
+                    const bool carry         = (rem >> 63) != 0ULL;
+                    rem                      = (rem << 1) | bbit;
+                    if (carry || rem >= total_registered_host) {
+                        rem -= total_registered_host;
+                        shard_pos |= (1ULL << bit);
+                    }
+                }
+                std::uint64_t acc = 0;
+                for (const auto& s : options.pinned_shards) {
+                    acc += s.bytes;
+                    if (shard_pos < acc && s.numa_node >= 0) {
+                        target_node = s.numa_node;
+                        break;
+                    }
+                }
+            }
+            registered_cursor += storage.host_data.size();
+            if (target_node >= 0) {
+                (void)bind_memory_to_node(storage.host_data.data(), storage.host_data.size(),
+                                          target_node, /*move_pages=*/true);
+            }
             storage.registration = std::make_unique<HostMemoryRegistration>(
                 storage.host_data.data(), storage.host_data.size());
             out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, storage.host_data.size(),
-                                                "registered Host bytes");
+                                                  "registered Host bytes");
             ++out.stats_.pinned_object_count;
         }
         out.stats_.retained_host_bytes =

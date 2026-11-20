@@ -1,13 +1,17 @@
 #include "models/qwen4_exp/read_pool.h"
 
+#include "core/numa.h"
+
 #include <stdexcept>
 #include <utility>
 
 namespace ninfer::models::qwen4_exp {
 
-ReadPool::ReadPool(std::size_t threads) {
+ReadPool::ReadPool(std::size_t threads, std::span<const int> cpu_ids) {
+    workers_.reserve(threads);
     for (std::size_t i = 0; i < threads; ++i) {
-        workers_.emplace_back([this] { work(); });
+        const int cpu_id = i < cpu_ids.size() ? cpu_ids[i] : -1;
+        workers_.emplace_back([this, cpu_id] { work(cpu_id); });
     }
 }
 
@@ -69,7 +73,8 @@ void ReadPool::drain() {
     }
 }
 
-void ReadPool::work() {
+void ReadPool::work(int cpu_id) {
+    if (cpu_id >= 0) { bind_thread_to_cpu(cpu_id); }
     std::uint64_t seen = 0;
     for (;;) {
         {

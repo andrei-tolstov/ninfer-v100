@@ -75,8 +75,10 @@ struct Bank {
             const unsigned scale = choices[(row * 7 + g) % 5];
             const std::size_t s = (std::size_t(row) * groups + g) * 2;
             scales[s] = scale & 255; scales[s + 1] = scale >> 8;
-            const std::size_t record = panel ? (std::size_t(row / 64) * groups + g) * 64 + row % 64 :
-                                               std::size_t(row) * groups + g;
+            const std::size_t record = panel ? (std::size_t(row / kRowSplitPanelRows) * groups + g) *
+                                                       kRowSplitPanelRows +
+                                                   row % kRowSplitPanelRows
+                                             : std::size_t(row) * groups + g;
             for (int lane = 0; lane < group; ++lane) {
                 const unsigned u = random() & ((1U << bits) - 1);
                 if (bits == 2) { data[record * 16 + lane / 4] |= u << (2 * (lane % 4)); }
@@ -139,7 +141,7 @@ void run_case(QType gate_type, QType up_type, QType down_type, bool panel) {
         expected[variant] = oracle(gate, up, down, input[variant]);
     }
     CpuExpertWorkspace workspace(16);
-    for (const auto backend : {CpuExpertBackend::Scalar, CpuExpertBackend::Avx2, CpuExpertBackend::Avx512Vnni}) {
+    for (const auto backend : {CpuExpertBackend::Scalar, CpuExpertBackend::Avx, CpuExpertBackend::Avx2, CpuExpertBackend::Avx512Vnni}) {
         if (!cpu_expert_backend_available(backend)) { continue; }
         for (const bool a8 : {false, true}) {
             if (a8 && gate_type == QType::BF16 && up_type == QType::BF16 && down_type == QType::BF16) { continue; }
@@ -157,6 +159,16 @@ void run_case(QType gate_type, QType up_type, QType down_type, bool panel) {
                     moe_expert_cpu(x, weights, workspace, repeat, backend);
                     require(std::memcmp(actual.data(), repeat.data(), actual.size() * sizeof(float)) == 0,
                             "CPU fixed-mode repeat differs");
+                    // T-07: token_count_determinism — running each token with T=1 must match its
+                    // slice inside the T=3 batch bit for bit.
+                    std::vector<float> single_out(H);
+                    for (int t = 0; t < 3; ++t) {
+                        moe_expert_cpu(std::span<const std::uint16_t>(x.data() + std::size_t(t) * H, H),
+                                       weights, workspace, single_out, backend);
+                        require(std::memcmp(single_out.data(), actual.data() + std::size_t(t) * H,
+                                            std::size_t(H) * sizeof(float)) == 0,
+                                "CPU expert T=1 output differs from T=3 slice");
+                    }
                     std::atomic<bool> cancelled{true};
                     bool stopped = false;
                     try { moe_expert_cpu(x, weights, workspace, repeat, backend, &cancelled); }

@@ -15,12 +15,14 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/numa.h"
 #include "core/weight.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/model.h"
 #include "ninfer/ops/moe_experts.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -58,14 +60,19 @@ struct MissOptions {
     // Instead of a fixed share, each request gives the CPU the experts that make its copies and
     // its CPU products end soonest, by times fitted to the earlier requests.
     bool cpu_balance             = false;
-    std::uint32_t cpu_threads    = 0;    // 0: half the usable logical CPUs less two, at most 16
+    std::uint32_t cpu_threads    = 0;    // 0: min(phys - 2, 16) on primary socket, + min(phys_i - 1, 16) per remote socket, capped at 32 total
     std::uint64_t staging_bytes  = 128ULL << 20; // device staging per rank, two halves
     // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
     // of their top ten (lossy); 0 serves every miss.
     std::uint32_t tail_skip_rank = 0;
     // The CPU's host experts run on ggml-cpu's vecdot kernels (faster, not bit for bit) where its
     // kernels cover the stored format; other stored formats keep the exact q8_1 products.
-    bool cpu_ggml           = false;
+    bool cpu_ggml          = false;
+    NumaPolicy numa_policy = NumaPolicy::Auto;
+    // The NUMA plan resolved at load (pinned-buffer shards + per-node CPU pools). When present,
+    // ExpertMisses adopts it verbatim instead of re-planning from its own byte estimate, so the
+    // CPU pool sockets match the pinned buffer's socket layout.
+    std::optional<HostNumaPlan> numa_plan;
 };
 
 struct MissStats {
@@ -118,6 +125,9 @@ public:
     // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it
     // before its first layer. Rethrows a service failure.
     void keep_alive();
+    // Binds an active request cancellation flag; pass nullptr to unbind and drain any in-flight
+    // service call before the caller destroys its flag.
+    void set_cancellation(const std::atomic<bool>* cancelled) noexcept;
     // Rethrows a failure the service recorded while serving a call. A failed call released the
     // GPU with its missing experts left out, so a pass checks this once it has completed, before
     // anything it computed is used.

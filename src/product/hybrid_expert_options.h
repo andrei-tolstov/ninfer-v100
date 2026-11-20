@@ -36,7 +36,9 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
     "                                changes the CPU/GPU arithmetic partition\n"
     "  --expert-profile FILE         fill the host expert cache from recorded counts\n"
-    "  --expert-profile-out FILE     record expert counts for this artifact after requests\n";
+    "  --expert-profile-out FILE     record expert counts for this artifact after requests\n"
+    "  --numa-policy P               multi-socket host NUMA policy: auto (default), isolate,\n"
+    "                                sharded, or mirror\n";
 
 template<class Value>
 bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& out, Value&& value) {
@@ -101,6 +103,20 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument(std::string(option) + " takes a file path"); }
         (option == "--expert-profile" ? out.routing_profile : out.record_profile) = path;
+    } else if (option == "--numa-policy") {
+        const std::string_view mode(value());
+        if (mode == "auto") {
+            out.numa_policy = NumaPolicy::Auto;
+        } else if (mode == "isolate") {
+            out.numa_policy = NumaPolicy::Isolate;
+        } else if (mode == "sharded") {
+            out.numa_policy = NumaPolicy::Sharded;
+        } else if (mode == "mirror") {
+            out.numa_policy = NumaPolicy::Mirror;
+        } else {
+            throw std::invalid_argument(
+                "--numa-policy takes auto, isolate, sharded or mirror");
+        }
     } else { return false; }
     return true;
 }

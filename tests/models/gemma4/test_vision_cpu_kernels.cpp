@@ -125,11 +125,63 @@ void test_geglu(const cv::Kernels& kernels, std::mt19937& rng) {
     expect(worst <= 1e-6, std::string(kernels.name) + " geglu: error " + std::to_string(worst));
 }
 
+void test_packed_and_norm(const cv::Kernels& kernels, std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-2.0F, 2.0F);
+    for (const int n : {35, 32}) {
+        const int k = 19, tokens = 29;
+        std::vector<float> w(std::size_t(n) * k), x(std::size_t(k) * tokens);
+        for (float& v : w) { v = dist(rng); }
+        for (float& v : x) { v = dist(rng); }
+        std::vector<float> y_gemm(std::size_t(n) * tokens), y_pack(std::size_t(n) * tokens);
+        kernels.gemm(w.data(), std::size_t(k), n, k, x.data(), std::size_t(tokens), tokens,
+                     y_gemm.data(), std::size_t(tokens));
+        const int panels = (tokens + 15) / 16;
+        std::vector<float> packed(std::size_t(panels) * k * 16);
+        for (int p = 0; p < panels; ++p) {
+            const int tok = p * 16, width = std::min(16, tokens - tok);
+            kernels.pack_panel(x.data(), std::size_t(tokens), k, tok, width,
+                               packed.data() + std::size_t(p) * k * 16);
+        }
+        kernels.gemm_packed(w.data(), std::size_t(k), n, k, packed.data(), tokens, y_pack.data(),
+                            std::size_t(tokens));
+        for (std::size_t i = 0; i < y_gemm.size(); ++i) {
+            expect(std::abs(y_gemm[i] - y_pack[i]) <= 1e-5F,
+                   std::string(kernels.name) + " gemm_packed mismatch");
+        }
+    }
+    const int k = 19, tokens = 29;
+    std::vector<float> x(std::size_t(k) * tokens), scale(tokens), out(tokens), inout(tokens),
+        ref_inout(tokens);
+    for (float& v : x) { v = dist(rng); }
+    for (int t = 0; t < tokens; ++t) { scale[t] = 0.5F + 0.01F * t; inout[t] = dist(rng); }
+    ref_inout = inout;
+    std::vector<double> sums(tokens, 0.0), ref_sums(tokens, 0.0);
+    for (int r = 0; r < k; ++r) {
+        const float* row = x.data() + std::size_t(r) * tokens;
+        kernels.rms_accum_sq(row, tokens, sums.data());
+        for (int t = 0; t < tokens; ++t) { ref_sums[t] += double(row[t]) * row[t]; }
+    }
+    for (int t = 0; t < tokens; ++t) {
+        expect(std::abs(sums[t] - ref_sums[t]) <= 1e-12,
+               std::string(kernels.name) + " rms_accum_sq mismatch");
+    }
+    kernels.scale_mul_row(x.data(), scale.data(), 1.25F, tokens, out.data());
+    kernels.add_scaled_row(x.data(), scale.data(), 1.25F, tokens, inout.data());
+    for (int t = 0; t < tokens; ++t) {
+        const float ref = x[t] * scale[t] * 1.25F;
+        ref_inout[t] += ref;
+        expect(std::abs(out[t] - ref) <= 1e-6F, std::string(kernels.name) + " scale_mul_row");
+        expect(std::abs(inout[t] - ref_inout[t]) <= 1e-6F,
+               std::string(kernels.name) + " add_scaled_row");
+    }
+}
+
 void test(const cv::Kernels& kernels) {
     std::mt19937 rng(20261011);
     test_gemm(kernels, rng);
     test_softmax(kernels, rng);
     test_geglu(kernels, rng);
+    test_packed_and_norm(kernels, rng);
 }
 
 } // namespace
@@ -138,6 +190,9 @@ int main() {
     test(cv::portable_kernels());
     std::cout << "selected kernels: " << cv::kernels().name << '\n';
 #if defined(NINFER_VISION_CPU_X86)
+    if (&cv::kernels() == &cv::avx_kernels() || &cv::kernels() == &cv::avx2_kernels()) {
+        test(cv::avx_kernels());
+    }
     if (&cv::kernels() == &cv::avx2_kernels()) { test(cv::avx2_kernels()); }
 #endif
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " gemma4 vision CPU kernels\n";

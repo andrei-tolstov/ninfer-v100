@@ -18,6 +18,10 @@ enum class GgmlActLayout { Q8K, Q8_0 };
 
 [[nodiscard]] bool gguf_ggml_supported(QType format) noexcept;
 
+// Whether this build's ggml vec-dot kernels can run on this CPU (AVX2 + FMA when built with
+// NINFER_GGML_CPU_AVX2, otherwise AVX + F16C).
+[[nodiscard]] bool gguf_ggml_cpu_available() noexcept;
+
 // BF16 activations quantized into ggml's Q8_K / Q8_0 row layouts, one row per token.
 class GgmlCpuActivation {
 public:
@@ -27,12 +31,17 @@ public:
     // Quantizes `tokens` BF16 columns, `stride` values apart, into the given layout.
     void prepare_bf16(GgmlActLayout layout, const std::uint16_t* values, std::size_t stride,
                       int tokens);
+    // Split preparation for parallel/deduplicated callers across disjoint token indices.
+    void prepare_bf16_start(GgmlActLayout layout, int tokens);
+    void prepare_bf16_token(int token, const std::uint16_t* values);
+    void copy_token_from(int dst_token, const GgmlCpuActivation& src, int src_token);
 
     [[nodiscard]] int tokens() const noexcept { return tokens_; }
     [[nodiscard]] int k() const noexcept { return k_; }
     [[nodiscard]] GgmlActLayout layout() const noexcept { return layout_; }
     [[nodiscard]] const void* codes(int token) const noexcept;
     [[nodiscard]] std::size_t row_bytes() const noexcept;
+    [[nodiscard]] bool all_prepared() const noexcept;
 
 private:
     int capacity_ = 0;
@@ -42,6 +51,7 @@ private:
     std::size_t row_bytes_ = 0;
     std::vector<std::uint8_t> data_;
     std::vector<float> scratch_;
+    std::vector<std::uint8_t> prepared_;
 };
 
 // y[t * y_stride + r] = row r . x[t] for rows [row_begin, row_end) and all prepared tokens.

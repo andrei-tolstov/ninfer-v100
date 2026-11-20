@@ -12,6 +12,8 @@ include(models/gemma4/tests.cmake)
 include(ops/tests.cmake)
 
 ninfer_finalize_bundle(ninfer_tests)
+get_property(_ninfer_standalone_tests GLOBAL PROPERTY NINFER_STANDALONE_TEST_TARGETS)
+add_custom_target(ninfer_all_tests DEPENDS ninfer_tests ${_ninfer_standalone_tests})
 
 # Exit code 77 is a skip for every test (tests/cuda_availability.h). Without a usable CUDA device --
 # no GPU, no driver, or only the toolkit's stub driver, as on a CI runner -- a test that has no check

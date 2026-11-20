@@ -27,8 +27,9 @@
 
 namespace ninfer::ops {
 
-// Automatic takes AVX2 (with FMA and F16C) where the CPU has it; both give the same bits.
-enum class GgufCpuBackend { Automatic, Scalar, Avx2 };
+// Automatic takes AVX2 (with FMA and F16C), else AVX (with F16C, SSSE3, SSE4.1) where the CPU
+// has it; all give the same bits.
+enum class GgufCpuBackend { Automatic, Scalar, Avx, Avx2 };
 [[nodiscard]] bool gguf_cpu_backend_available(GgufCpuBackend backend) noexcept;
 [[nodiscard]] const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept;
 [[nodiscard]] GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept;
@@ -52,6 +53,11 @@ public:
     GgufCpuActivation(int token_capacity, int k);
     // Quantizes `tokens` BF16 columns of k values (column-major, `stride` apart) for `format`.
     void prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride, int tokens);
+    // Split preparation for parallel/deduplicated callers: start() configures metadata, then
+    // prepare_bf16_token() or copy_token_from() fills disjoint token indices safely across threads.
+    void prepare_bf16_start(QType format, int tokens);
+    void prepare_bf16_token(int token, const std::uint16_t* values);
+    void copy_token_from(int dst_token, const GgufCpuActivation& src, int src_token);
     [[nodiscard]] int tokens() const noexcept { return tokens_; }
     [[nodiscard]] int k() const noexcept { return k_; }
     [[nodiscard]] QType format() const noexcept { return format_; }
@@ -66,6 +72,7 @@ public:
     [[nodiscard]] const std::int32_t* sums(int token) const noexcept {
         return sums_.data() + std::size_t(token) * groups_;
     }
+    [[nodiscard]] bool all_prepared() const noexcept;
 
 private:
     void quantize(QType format, int token, const float* values);
@@ -74,6 +81,7 @@ private:
     std::vector<std::int8_t> codes_;
     std::vector<float> scales_, scratch_;
     std::vector<std::int32_t> sums_;
+    std::vector<std::uint8_t> prepared_;
 };
 
 // y[t * y_stride + r] = row r . x[t] for rows [row_begin, row_end) and every prepared token.
@@ -82,15 +90,29 @@ void gguf_cpu_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_b
 // out[i] = BF16(silu(gate[i]) * up[i]) for i < count, as the GPU's up kernels store the middle.
 void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                           GgufCpuBackend backend);
+// Fast non-exact AVX1/AVX2 SwiGLU for ggml host-expert mode (standard mul+add without Dekker FMA).
+void gguf_cpu_swiglu_bf16_fast(const float* gate, const float* up, std::size_t count,
+                               std::uint16_t* out, GgufCpuBackend backend);
 
 namespace gguf_cpu_detail {
 using Rows = void (*)(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*,
                       std::size_t);
 void rows_scalar(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
+void swiglu_fast_scalar(const float*, const float*, std::size_t, std::uint16_t*);
+float silu_fast_scalar(float x) noexcept;
 #if defined(NINFER_CPU_EXPERT_X86)
+void rows_avx(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
+void swiglu_avx(const float*, const float*, std::size_t, std::uint16_t*);
+void swiglu_fast_avx(const float*, const float*, std::size_t, std::uint16_t*);
+void prepare_bf16_avx(QType format, const std::uint16_t* values, std::size_t stride, int tokens,
+                      int k, std::int8_t* codes, float* scales, std::int32_t* sums);
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
+void swiglu_fast_avx2(const float*, const float*, std::size_t, std::uint16_t*);
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+void fma_avx(const float* a, const float* b, const float* c, float* out, std::size_t count);
 #endif
 // Q2_0 activations are stored in the lane order of the vector decoders: within each 64-value
 // block, position L * 16 + i holds value 4 * i + L, so a lane's first 8 positions belong to the

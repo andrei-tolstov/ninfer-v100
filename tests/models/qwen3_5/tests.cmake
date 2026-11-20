@@ -130,6 +130,13 @@ ninfer_add_test(ninfer_qwen3_5_vision_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_cpu.cpp"
   LIBRARIES ninfer_model_runtime)
 
+ninfer_add_test(ninfer_qwen3_5_vision_cpu_kernels_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_cpu_kernels.cpp"
+  LIBRARIES ninfer_model_runtime)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  target_compile_definitions(ninfer_qwen3_5_vision_cpu_kernels_test PRIVATE NINFER_VISION_CPU_X86=1)
+endif()
+
 ninfer_add_test(ninfer_qwen3_5_vision_cpu_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_cpu_real.cpp"
   LIBRARIES ninfer_engine)
